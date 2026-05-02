@@ -46,7 +46,9 @@ CHANNEL_VERSION = "1.0.2"
 
 # Long-poll: server holds up to 35s; client gives 38s before tripping.
 GETUPDATES_TIMEOUT_S = 38.0
-DEFAULT_TIMEOUT_S = 15.0
+# Status polls can be slow (Tencent → CN routing). Bridge.mjs has no explicit
+# GET timeout (Node fetch default ~30s); match that.
+DEFAULT_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -161,9 +163,17 @@ class OpenclawClient:
     def poll_qr_status(self, qrcode: str) -> dict[str, Any]:
         """One-shot status poll. Status values observed: wait / scaned /
         expired / confirmed. On confirmed, response includes `bot_token`,
-        `baseurl`, `ilink_bot_id`, `ilink_user_id`."""
+        `baseurl`, `ilink_bot_id`, `ilink_user_id`.
+
+        ⚠️ This is actually a long-poll: the server holds the connection
+        for ~30s on `wait` before returning. Use a generous timeout (>30s).
+        """
         from urllib.parse import quote
-        return self._get(f"ilink/bot/get_qrcode_status?qrcode={quote(qrcode)}")
+        url = f"{self.base_url}/ilink/bot/get_qrcode_status?qrcode={quote(qrcode)}"
+        # 60s = 30s server-hold + ample headroom for round-trip latency.
+        r = self._http.get(url, timeout=60.0)
+        r.raise_for_status()
+        return r.json()
 
     # ---- messaging -----------------------------------------------------
 
@@ -253,9 +263,20 @@ def login_interactive(
     qrcode, qr_url = client.request_qr()
     on_qr(qr_url)
     refreshes = 0
+    transient_errors = 0
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        resp = client.poll_qr_status(qrcode)
+        try:
+            resp = client.poll_qr_status(qrcode)
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            # Tencent's CN routing is occasionally slow; eat a few transient
+            # failures rather than aborting login.
+            transient_errors += 1
+            if transient_errors > 10:
+                raise RuntimeError(f"too many poll errors: {e}") from e
+            logger.warning("poll #{} failed ({}); retrying", transient_errors, e)
+            time.sleep(poll_interval_s)
+            continue
         status = resp.get("status")
         if status == "wait":
             pass
@@ -285,26 +306,43 @@ def login_interactive(
 
 
 def render_qr_to_terminal(url: str) -> None:
-    """Save a PNG of the QR to a temp file and print the path. Trying to
-    print Unicode block-character QR to Windows console blows up under
-    cp936/GBK, so we don't bother — a PNG you can double-click is safer
-    cross-platform anyway. Falls back to bare URL if `qrcode` not installed.
+    """Render the QR right in the terminal as ASCII. Uses qrcode's print_ascii
+    which writes Unicode block chars (▀▄█) — fine on any UTF-8 terminal, but
+    Windows' default cp936/GBK chokes. We force stdout to UTF-8 first; if that
+    fails too we fall back to a pure-ASCII '## ' renderer (chunkier but works
+    anywhere). No PNG, no temp files.
     """
     try:
         import qrcode  # type: ignore[import-not-found]
-        from PIL import Image  # type: ignore[import-not-found]  # qrcode dep
-        del Image  # only need to verify it's installed
     except ImportError:
-        print(
-            "\n[`qrcode[pil]` not installed. Paste this URL into any QR "
-            "generator and scan with WeChat:]"
-        )
-        print(f"\n  {url}\n")
+        print("\n[qrcode not installed; paste this URL into any QR generator:]")
+        print(f"\n  {url}\n", flush=True)
         return
 
-    import tempfile, os
-    img = qrcode.make(url)
-    fd, path = tempfile.mkstemp(suffix=".png", prefix="wo-openclaw-qr-")
-    os.close(fd)
-    img.save(path)
-    print(f"\n[QR saved] Open this PNG and scan in WeChat (the QR code icon at top-right):\n   {path}\n")
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(url)
+    qr.make(fit=True)
+
+    # Try the nice Unicode block render. Reconfigure stdout to UTF-8 first
+    # (Python 3.7+); harmless on POSIX where it's already UTF-8.
+    import sys as _sys
+    try:
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    print()  # blank line before QR
+    try:
+        qr.print_ascii(out=_sys.stdout, invert=True)
+        _sys.stdout.flush()
+        return
+    except (UnicodeEncodeError, OSError):
+        pass
+
+    # Fallback: pure-ASCII renderer using '##' (black) and '  ' (white).
+    # Chunkier but bulletproof — no encoding issues on any terminal.
+    matrix = qr.get_matrix()
+    for row in matrix:
+        line = "".join("##" if cell else "  " for cell in row)
+        print(line, flush=True)
+    print(flush=True)

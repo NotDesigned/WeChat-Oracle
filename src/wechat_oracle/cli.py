@@ -139,13 +139,13 @@ def openclaw_login() -> None:
     settings.ensure_dirs()
     token_path = settings.data_dir / "openclaw-token.json"
     if token_path.exists():
-        typer.echo(f"⚠️  token already exists at {token_path}. Re-login will overwrite.")
+        typer.echo(f"[!] token already exists at {token_path}. Re-login will overwrite.")
         if not typer.confirm("Continue?", default=False):
             raise typer.Abort()
     with OpenclawClient() as client:
         session = login_interactive(client, on_qr=render_qr_to_terminal)
         session.to_json(token_path)
-    typer.echo(f"✅ logged in as bot_id={session.bot_id!r}, saved to {token_path}")
+    typer.echo(f"[OK] logged in as bot_id={session.bot_id!r}, saved to {token_path}")
 
 
 @openclaw_app.command("probe")
@@ -164,7 +164,7 @@ def openclaw_probe(
     token_path = settings.data_dir / "openclaw-token.json"
     session = OpenclawSession.from_json(token_path)
     if not session:
-        typer.echo(f"❌ no token at {token_path}; run `openclaw login` first")
+        typer.echo(f"[ERR] no token at {token_path}; run `openclaw login` first")
         raise typer.Exit(1)
     deadline = _time.time() + minutes * 60
     typer.echo(f"polling /getupdates as bot_id={session.bot_id!r} for {minutes}m. Ctrl+C to stop early.")
@@ -179,7 +179,7 @@ def openclaw_probe(
                 seen += 1
                 typer.echo(f"=== msg #{seen} ===")
                 typer.echo(json.dumps(m, ensure_ascii=False, indent=2))
-                typer.echo(f"  → extracted text: {extract_text_from_msg(m)!r}")
+                typer.echo(f"  -> extracted text: {extract_text_from_msg(m)!r}")
                 # Critical fields for the experiment:
                 gid = m.get("group_id")
                 fuid = m.get("from_user_id")
@@ -203,18 +203,18 @@ def openclaw_send(
     group send path; pass --to-user for the confirmed-working DM path."""
     from .openclaw import OpenclawClient, OpenclawSession
     if not (to_user or group_id):
-        typer.echo("❌ pass either --to-user or --group-id"); raise typer.Exit(1)
+        typer.echo("[ERR] pass either --to-user or --group-id"); raise typer.Exit(1)
     session = OpenclawSession.from_json(settings.data_dir / "openclaw-token.json")
     if not session:
-        typer.echo("❌ no token; run `openclaw login` first"); raise typer.Exit(1)
+        typer.echo("[ERR] no token; run `openclaw login` first"); raise typer.Exit(1)
     with OpenclawClient(session) as client:
         try:
             cid = client.send_text(
                 to_user_id=to_user, group_id=group_id, text=text, context_token=context_token,
             )
         except Exception as e:
-            typer.echo(f"❌ send failed: {e}"); raise typer.Exit(2)
-    typer.echo(f"✅ sent client_id={cid!r}")
+            typer.echo(f"[ERR] send failed: {e}"); raise typer.Exit(2)
+    typer.echo(f"[OK] sent client_id={cid!r}")
 
 
 @app.command("status")
