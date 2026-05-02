@@ -369,7 +369,20 @@ uv run wechat-oracle status   # DB 路径 / 总条数 / 按状态分布 / 按群
 uv sync
 uv run wechat-oracle init-db
 uv run wechat-oracle <subcommand>
+
+# Enable the project's pre-commit hooks (one-time per clone):
+git config core.hooksPath .githooks
 ```
+
+Pre-commit gates（见 `.githooks/pre-commit`）：
+
+1. **Doc-sync 契约**——dispatcher.py / schema.sql / config.py / cli.py 中任何一项命中 marker（命令类常量、CREATE TABLE、Settings 字段、@app.command），README.md 必须在同一 commit 一起改
+2. **schema.sql 必须能 parse**——`sqlite3 :memory:` dry-run
+3. **Python 语法**——staged `.py` 跑 `py_compile`
+4. **API key 防泄露**——staged diff 里出现 `sk-...` 串直接拒
+5. **`.env` / `*.key` / `*.pem`** 一律不准 staged
+
+紧急绕过：`git commit --no-verify`（别养成习惯）。
 
 代码组织：
 

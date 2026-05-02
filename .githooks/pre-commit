@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# WeChat-Oracle pre-commit gate. Each check exits non-zero → commit aborted.
+#
+# To enable (one-time per clone):
+#   git config core.hooksPath .githooks
+#
+# To bypass for an emergency (don't make a habit of it):
+#   git commit --no-verify
+#
+# Why a custom dir instead of .git/hooks/: .git/ isn't tracked, so a hook
+# placed there ships with no other clones. .githooks/ is in the repo and
+# every collaborator opts in via `git config core.hooksPath .githooks`.
+
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+fail() { printf '\n❌ %s\n' "$*" >&2; exit 1; }
+
+# 1. Doc-sync contracts (CLAUDE.md「易漂移点 F1-F5」). Same logic as the
+#    Claude Code PostToolUse hook but operating on staged-only diffs.
+python "$ROOT/.claude/hooks/check_doc_sync.py" --pre-commit \
+  || fail "doc-sync contract violated; see message above. Bypass: --no-verify"
+
+# 2. schema.sql parses (only when staged). Catches typos that would brick
+#    `init-db` for fresh clones.
+if git diff --cached --name-only | grep -qx "src/wechat_oracle/schema.sql"; then
+  python -c "
+import sqlite3, sys
+sql = open(r'''$ROOT/src/wechat_oracle/schema.sql''', encoding='utf-8').read()
+sqlite3.connect(':memory:').executescript(sql)
+" || fail "schema.sql doesn't parse — fix DDL before committing"
+fi
+
+# 3. Python syntax check on every staged .py file. Fast: pure parser, no
+#    import resolution. Catches the obvious oops.
+staged_py=$(git diff --cached --name-only --diff-filter=AM | grep '\.py$' || true)
+if [ -n "$staged_py" ]; then
+  echo "$staged_py" | (cd "$ROOT" && xargs -r python -m py_compile) \
+    || fail "syntax error in a staged .py file"
+fi
+
+# 4. No API-key-shaped strings in staged content. Pattern matches DeepSeek,
+#    OpenAI, Anthropic. False positives → --no-verify after eyeballing.
+if git diff --cached -U0 | grep -E '^\+' | grep -qE '(sk-[a-zA-Z0-9_-]{20,}|sk-ant-[a-zA-Z0-9_-]{20,})'; then
+  fail "an API-key-looking string ('sk-...') appears in your staged diff"
+fi
+
+# 5. Block secret files entirely. Even with --force-add, this catches it.
+if git diff --cached --name-only | grep -qiE '(\.env($|\.)|\.key$|\.pem$|^secrets\.|/secrets\.)'; then
+  fail "secret file (.env / *.key / *.pem / secrets.*) is staged — unstage and put values in .env (gitignored)"
+fi
+
+exit 0

@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: enforce CLAUDE.md drift contracts.
+"""Doc-sync hook: enforce CLAUDE.md drift contracts.
 
-Watches edits to several "spec" files. If a spec changed in a way that
-encodes a fact also stored elsewhere, require the paired files to also be
-dirty in the working tree (vs HEAD). Emits a system reminder via stderr
-(exit 2) so Claude course-corrects.
+Two run modes share the same rule table:
 
-Each rule is a small dataclass: which file's edit triggers it, what marker
-in the diff signals a contract change, and which paired files must show
-dirty state. Rules are independent; multiple may fire for one edit.
+  PostToolUse (default)
+      Reads JSON from stdin (Claude Code passes tool_use info), checks
+      against `git diff HEAD` (working tree). Exit 2 surfaces stderr to
+      Claude as a system reminder so it course-corrects mid-session.
 
-This is a backstop, not a gatekeeper — an agent can suppress it by editing
-both files (which is the desired outcome) or by stashing/reordering work.
-The CLAUDE.md "易漂移点速查" table is the normative source; this hook just
-tries to catch the easy misses.
+  --pre-commit
+      Iterates over `git diff --cached --name-only` (staged-only view),
+      checks against `git diff --cached` for each rule. Exit 1 aborts
+      `git commit`. Use as a backstop when the PostToolUse hook didn't
+      fire (manual edit, rebase, different agent, etc.).
+
+Each rule: which trigger file, which `+`-line markers signal a contract
+change, which paired files must also be dirty (working) or staged
+(pre-commit) for the rule to be satisfied.
+
+This is a backstop, not a gatekeeper — agents/users can comply by editing
+the paired file, or bypass with --no-verify. CLAUDE.md「易漂移点速查」is
+the normative source; this hook just catches the easy misses.
 """
 from __future__ import annotations
 
@@ -135,15 +142,21 @@ RULES: tuple[Rule, ...] = (
 
 # --- runner ----------------------------------------------------------------
 
-def _git_diff(repo: Path, path: str) -> str:
-    """Diff `path` against HEAD. Force UTF-8 decode (Windows default cp936
-    chokes on Chinese in our diffs); replace undecodable bytes so we never
-    return None and crash downstream regex.
+def _git_diff(repo: Path, path: str, *, staged: bool = False) -> str:
+    """Diff `path`. `staged=True` → `git diff --cached --` (only staged
+    changes, used by pre-commit). `staged=False` → `git diff HEAD --`
+    (working tree + staged, used by PostToolUse).
+
+    UTF-8 decode forced; Windows default cp936 chokes on Chinese in diffs.
+    Errors replaced rather than raised so downstream regex never sees None.
     """
-    res = subprocess.run(
-        ["git", "-C", str(repo), "diff", "HEAD", "--", path],
-        capture_output=True, encoding="utf-8", errors="replace",
-    )
+    cmd = ["git", "-C", str(repo), "diff"]
+    if staged:
+        cmd.append("--cached")
+    else:
+        cmd.append("HEAD")
+    cmd.extend(["--", path])
+    res = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
     return res.stdout or ""
 
 
@@ -163,44 +176,69 @@ def _markers_hit(added: list[str], markers: tuple[re.Pattern, ...]) -> bool:
     return any(p.search(blob) for p in markers)
 
 
-def main() -> int:
+def _check_one_path(repo: Path, fp: str, *, staged: bool) -> list[str]:
+    """Run all matching rules for a single edited path. Returns list of
+    fired-rule messages (empty = no violation)."""
+    fired: list[str] = []
+    for rule in RULES:
+        if not fp.endswith(rule.trigger_suffix):
+            continue
+        diff = _git_diff(repo, rule.trigger_suffix, staged=staged)
+        added = _added_lines(diff)
+        if not _markers_hit(added, rule.markers):
+            continue
+        if any(_git_diff(repo, p, staged=staged).strip() for p in rule.require_any_dirty):
+            continue
+        fired.append(
+            f"{rule.message}\n  - 同步目标（任一即可）: {', '.join(rule.require_any_dirty)}"
+        )
+    return fired
+
+
+def _emit(fired: list[str], stream) -> None:
+    """Write fired-rule messages to a stream with consistent formatting."""
+    if not fired:
+        return
+    stream.write("文档同步契约提醒：\n")
+    for msg in fired:
+        stream.write(f"\n• {msg}\n")
+    stream.write(
+        "\n查 CLAUDE.md「易漂移点速查」段了解全部冗余存储位置。"
+        "hook 只是 backstop，最终一致性以契约为准。\n"
+    )
+
+
+def main_post_tool() -> int:
+    """PostToolUse mode: read tool_input JSON from stdin, check working tree."""
     try:
         data = json.load(sys.stdin)
     except Exception:
         return 0
-
     fp = ((data.get("tool_input") or {}).get("file_path") or "").replace("\\", "/")
     if not fp:
         return 0
-
     repo = Path(__file__).resolve().parents[2]
+    fired = _check_one_path(repo, fp, staged=False)
+    _emit(fired, sys.stderr)
+    return 2 if fired else 0
 
-    fired_messages: list[str] = []
-    for rule in RULES:
-        if not fp.endswith(rule.trigger_suffix):
-            continue
-        diff = _git_diff(repo, rule.trigger_suffix)
-        added = _added_lines(diff)
-        if not _markers_hit(added, rule.markers):
-            continue
-        if any(_git_diff(repo, p).strip() for p in rule.require_any_dirty):
-            continue  # at least one paired file is dirty → contract honored
-        fired_messages.append(
-            f"{rule.message}\n  - 同步目标（任一即可）: {', '.join(rule.require_any_dirty)}"
-        )
 
-    if fired_messages:
-        sys.stderr.write("文档同步契约提醒：\n")
-        for msg in fired_messages:
-            sys.stderr.write(f"\n• {msg}\n")
-        sys.stderr.write(
-            "\n查 CLAUDE.md「易漂移点速查」段了解全部冗余存储位置。"
-            "hook 只是 backstop，最终一致性以契约为准。\n"
-        )
-        return 2
-
-    return 0
+def main_pre_commit() -> int:
+    """Pre-commit mode: scan all staged paths against staged-only diffs."""
+    repo = Path(__file__).resolve().parents[2]
+    res = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+        capture_output=True, encoding="utf-8", errors="replace",
+    )
+    staged_paths = [p.replace("\\", "/") for p in (res.stdout or "").splitlines() if p]
+    fired: list[str] = []
+    for fp in staged_paths:
+        fired.extend(_check_one_path(repo, fp, staged=True))
+    _emit(fired, sys.stderr)
+    return 1 if fired else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if "--pre-commit" in sys.argv:
+        sys.exit(main_pre_commit())
+    sys.exit(main_post_tool())

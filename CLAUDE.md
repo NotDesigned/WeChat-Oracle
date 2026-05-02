@@ -59,6 +59,12 @@
 
 **新事实进表的判定**：如果你引入了一个事实它**注定要在两个以上文件里出现**（即使本仓库现在只放在了一处），就把它登记到本表，并尽量用单源 + import 替代多处复制。
 
+**两道闸**：
+- `.claude/hooks/check_doc_sync.py`（PostToolUse）——Claude 编辑文件**当下**就反向提醒，看的是 working tree
+- `.githooks/pre-commit`（git）——`git commit` 时**最后一道**关，看的是 staged-only 视图，挡掉手工编辑 / rebase / 不同 agent 漏掉的情况；额外还跑 schema parse / Python 语法 / API key 扫描 / `.env` 防泄露
+
+PostToolUse 是 prompt 时机的提醒（可被忽略 / 可继续编辑修复），pre-commit 是**真硬拦**（exit 1 直接 abort commit）。两个共用同一份 `RULES` 表。
+
 ## 命令体系维护契约
 
 `dispatcher.py` 里的 `Command` 子类（`FindCommand`、`ChatCommand`、`HelpCommand` 等）改动时，**这三处必须保持一致，否则用户拿到的帮助就是骗人的**：
