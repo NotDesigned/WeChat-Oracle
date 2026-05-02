@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local data (DB, media cache, exports)
+data/
+.env
+
+# Claude Code local state
+.claude/
+
+# wx4py drops a log + send-audit jsonl next to the cwd when imported
+wx4py.log
+wx4py_send_audit.jsonl

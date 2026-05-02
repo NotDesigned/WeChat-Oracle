@@ -1,0 +1,25 @@
+[project]
+name = "wechat-oracle"
+version = "0.1.0"
+description = "Personal WeChat group chat assistant: ingest, summarize topics, answer questions with citations"
+readme = "README.md"
+authors = [
+    { name = "TheAdscn", email = "theadscn@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "openai>=1.50.0",
+    "pydantic>=2.13.3",
+    "pydantic-settings>=2.14.0",
+    "typer>=0.25.1",
+    "wx4py",  # UI-automation backend for sending replies; supports WeChat 4.1.x (Qt)
+]
+
+[project.scripts]
+wechat-oracle = "wechat_oracle:main"
+
+[build-system]
+requires = ["uv_build>=0.10.7,<0.11.0"]
+build-backend = "uv_build"
