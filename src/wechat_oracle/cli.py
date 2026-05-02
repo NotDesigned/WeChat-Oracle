@@ -151,6 +151,7 @@ def openclaw_login() -> None:
 @openclaw_app.command("probe")
 def openclaw_probe(
     minutes: int = typer.Option(5, "--minutes", "-m", help="Stop after this many minutes"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet", help="Print one line per long-poll round trip (heartbeat)"),
 ) -> None:
     """Long-poll getupdates and dump every inbound message verbatim. Use this
     to discover (a) whether group_id is populated in actual messages, and
@@ -168,28 +169,41 @@ def openclaw_probe(
         raise typer.Exit(1)
     deadline = _time.time() + minutes * 60
     typer.echo(f"polling /getupdates as bot_id={session.bot_id!r} for {minutes}m. Ctrl+C to stop early.")
-    typer.echo("--- every message will be dumped with ALL fields ---\n")
+    typer.echo("--- every long-poll round-trip prints a heartbeat; messages dumped in full ---\n")
     buf = ""
     seen = 0
+    rounds = 0
     with OpenclawClient(session) as client:
         while _time.time() < deadline:
+            t0 = _time.time()
             resp = client.get_updates(buf)
-            buf = resp.get("get_updates_buf", buf)
-            for m in resp.get("msgs") or []:
+            dt = _time.time() - t0
+            rounds += 1
+            msgs = resp.get("msgs") or []
+            new_buf = resp.get("get_updates_buf") or buf  # truthy-only update; mirrors bridge.mjs
+            buf_changed = new_buf != buf
+            buf = new_buf
+            if verbose:
+                ret = resp.get("ret")
+                typer.echo(
+                    f"[round {rounds}] dt={dt:.1f}s  ret={ret}  msgs={len(msgs)}  "
+                    f"buf_changed={buf_changed}  buf_head={buf[:40]!r}  full_keys={sorted(resp.keys())}"
+                )
+            for m in msgs:
                 seen += 1
                 typer.echo(f"=== msg #{seen} ===")
                 typer.echo(json.dumps(m, ensure_ascii=False, indent=2))
                 typer.echo(f"  -> extracted text: {extract_text_from_msg(m)!r}")
-                # Critical fields for the experiment:
                 gid = m.get("group_id")
                 fuid = m.get("from_user_id")
+                tuid = m.get("to_user_id")
                 ctok = m.get("context_token")
                 typer.echo(
-                    f"  group_id={gid!r}  from_user_id={fuid!r}  "
+                    f"  group_id={gid!r}  from_user_id={fuid!r}  to_user_id={tuid!r}  "
                     f"has_context_token={ctok is not None}"
                 )
                 typer.echo("")
-    typer.echo(f"\nstopped after {seen} message(s). buf cursor: {buf[:60]!r}...")
+    typer.echo(f"\nstopped: {rounds} round-trip(s), {seen} message(s). final buf head: {buf[:60]!r}")
 
 
 @openclaw_app.command("send")

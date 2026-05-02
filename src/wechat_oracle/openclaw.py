@@ -179,7 +179,13 @@ class OpenclawClient:
 
     def get_updates(self, buf: str = "") -> dict[str, Any]:
         """Long-poll. Returns dict with `msgs` list and `get_updates_buf`
-        (cursor to pass next call). Empty {ret:0, msgs:[]} on timeout."""
+        (cursor to pass next call). Empty {ret:0, msgs:[]} on timeout.
+
+        Note on buf: bridge.mjs uses `?? buf` (truthy-only update); we mirror
+        that — caller should do `buf = resp.get("get_updates_buf") or buf`.
+        Don't use `dict.get(k, default)` for this: if server returns the key
+        with a null value, that overwrites your real buf with None.
+        """
         resp = self._post(
             "ilink/bot/getupdates",
             {"get_updates_buf": buf},
