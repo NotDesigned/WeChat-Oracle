@@ -293,6 +293,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点 |
 | `WO_DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名 |
 | `WO_REPLY` | `True` | 是否自动回群里 |
+| `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `openclaw`（HTTP API，**实验性**——群聊 send 未验证）/ `stdout`（不发） |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `5000` | 自由问答上下文窗口 |
@@ -351,6 +352,35 @@ uv run wechat-oracle status   # DB 路径 / 总条数 / 按状态分布 / 按群
 ```
 
 ---
+
+## 实验性：openclaw HTTP 回复后端
+
+腾讯通过 OpenClaw 开放了官方的 [iLink Bot HTTP API](https://github.com/hao-ji-xing/openclaw-weixin)。如果它**支持群聊发送**（协议层有 `group_id` 字段，但客户端 SDK 把 `ChatType` 硬编码成 `"direct"`，群聊未在 demo 里证实），就能彻底替掉 wx4py：跨平台、零封号风险、不要求微信窗口可见。
+
+```powershell
+# 1. 用一个测试小号扫码登录 ClawBot（token 存到 data/openclaw-token.json）
+uv run wechat-oracle openclaw login
+
+# 2. 把这个 bot 拉进一个测试群，跑 probe 5 分钟
+uv run wechat-oracle openclaw probe --minutes 5
+#    在群里发条消息触发推送，看 dump 出来的 message 字段里 group_id 有没有值
+
+# 3. 试着用 group_id 发回去（替换成 probe 看到的实际 ID）
+uv run wechat-oracle openclaw send --group-id <从 probe 看到的> "test from openclaw"
+
+# 4. 如果群发成功：把映射写到 data/openclaw-groups.json
+#    {"林辉米粉店": "<openclaw group_id>"}
+#    然后 .env 里加 WO_REPLY_BACKEND=openclaw，重启 dispatcher
+```
+
+四种结果对应的下一步：
+
+| Probe 结果 | 含义 | 下一步 |
+|---|---|---|
+| `group_id` 字段填了，send --group-id 成功 | 群聊全通 | 替换 wx4py，加上 @-mention 测试 |
+| `group_id` 填了，但 send 失败 | 只能监听 | 双栈：openclaw 收，wx4py 发 |
+| `group_id` 始终 null | bot 收不到群消息 | 这条路堵死，留 wx4py |
+| 登录直接被拒 | 资质问题 | 留 wx4py |
 
 ## 已知边界 / 限制
 

@@ -25,8 +25,10 @@ from .ingest.writer import write_messages
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 ingest_app = typer.Typer(no_args_is_help=True)
 weflow_app = typer.Typer(no_args_is_help=True, help="Inspect what WeFlow's HTTP API exposes (diagnose WO_GROUPS issues, etc.)")
+openclaw_app = typer.Typer(no_args_is_help=True, help="Tencent iLink Bot API experiments (verifying group_id support).")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
+app.add_typer(openclaw_app, name="openclaw")
 
 
 @app.command("init-db")
@@ -128,6 +130,91 @@ def weflow_sessions(
             kind = s.get("sessionType") or "?"
             user = s.get("username") or "?"
             typer.echo(f"  {kind:8s}  {display!r:40s}  {user}")
+
+
+@openclaw_app.command("login")
+def openclaw_login() -> None:
+    """One-time QR login to Tencent iLink Bot. Saves token to data/openclaw-token.json."""
+    from .openclaw import OpenclawClient, login_interactive, render_qr_to_terminal
+    settings.ensure_dirs()
+    token_path = settings.data_dir / "openclaw-token.json"
+    if token_path.exists():
+        typer.echo(f"⚠️  token already exists at {token_path}. Re-login will overwrite.")
+        if not typer.confirm("Continue?", default=False):
+            raise typer.Abort()
+    with OpenclawClient() as client:
+        session = login_interactive(client, on_qr=render_qr_to_terminal)
+        session.to_json(token_path)
+    typer.echo(f"✅ logged in as bot_id={session.bot_id!r}, saved to {token_path}")
+
+
+@openclaw_app.command("probe")
+def openclaw_probe(
+    minutes: int = typer.Option(5, "--minutes", "-m", help="Stop after this many minutes"),
+) -> None:
+    """Long-poll getupdates and dump every inbound message verbatim. Use this
+    to discover (a) whether group_id is populated in actual messages, and
+    (b) what the group_id looks like for groups your bot is in.
+
+    Have someone send a message in a test group while this runs.
+    """
+    import time as _time
+    from .openclaw import OpenclawClient, OpenclawSession, extract_text_from_msg
+
+    token_path = settings.data_dir / "openclaw-token.json"
+    session = OpenclawSession.from_json(token_path)
+    if not session:
+        typer.echo(f"❌ no token at {token_path}; run `openclaw login` first")
+        raise typer.Exit(1)
+    deadline = _time.time() + minutes * 60
+    typer.echo(f"polling /getupdates as bot_id={session.bot_id!r} for {minutes}m. Ctrl+C to stop early.")
+    typer.echo("--- every message will be dumped with ALL fields ---\n")
+    buf = ""
+    seen = 0
+    with OpenclawClient(session) as client:
+        while _time.time() < deadline:
+            resp = client.get_updates(buf)
+            buf = resp.get("get_updates_buf", buf)
+            for m in resp.get("msgs") or []:
+                seen += 1
+                typer.echo(f"=== msg #{seen} ===")
+                typer.echo(json.dumps(m, ensure_ascii=False, indent=2))
+                typer.echo(f"  → extracted text: {extract_text_from_msg(m)!r}")
+                # Critical fields for the experiment:
+                gid = m.get("group_id")
+                fuid = m.get("from_user_id")
+                ctok = m.get("context_token")
+                typer.echo(
+                    f"  group_id={gid!r}  from_user_id={fuid!r}  "
+                    f"has_context_token={ctok is not None}"
+                )
+                typer.echo("")
+    typer.echo(f"\nstopped after {seen} message(s). buf cursor: {buf[:60]!r}...")
+
+
+@openclaw_app.command("send")
+def openclaw_send(
+    text: str = typer.Argument(..., help="Body to send"),
+    to_user: str = typer.Option(None, "--to-user", help="WeChat user id (xxx@im.wechat)"),
+    group_id: str = typer.Option(None, "--group-id", help="Openclaw group id (from a probe session)"),
+    context_token: str = typer.Option(None, "--context-token", help="Optional thread context"),
+) -> None:
+    """Send a single test message. Pass --group-id to test the unconfirmed
+    group send path; pass --to-user for the confirmed-working DM path."""
+    from .openclaw import OpenclawClient, OpenclawSession
+    if not (to_user or group_id):
+        typer.echo("❌ pass either --to-user or --group-id"); raise typer.Exit(1)
+    session = OpenclawSession.from_json(settings.data_dir / "openclaw-token.json")
+    if not session:
+        typer.echo("❌ no token; run `openclaw login` first"); raise typer.Exit(1)
+    with OpenclawClient(session) as client:
+        try:
+            cid = client.send_text(
+                to_user_id=to_user, group_id=group_id, text=text, context_token=context_token,
+            )
+        except Exception as e:
+            typer.echo(f"❌ send failed: {e}"); raise typer.Exit(2)
+    typer.echo(f"✅ sent client_id={cid!r}")
 
 
 @app.command("status")

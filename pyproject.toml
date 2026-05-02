@@ -13,6 +13,7 @@ dependencies = [
     "openai>=1.50.0",
     "pydantic>=2.13.3",
     "pydantic-settings>=2.14.0",
+    "qrcode[pil]>=8.2",
     "typer>=0.25.1",
     "wx4py",  # UI-automation backend for sending replies; supports WeChat 4.1.x (Qt)
 ]

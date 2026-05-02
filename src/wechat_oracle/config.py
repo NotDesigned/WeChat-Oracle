@@ -53,10 +53,17 @@ class Settings(BaseSettings):
     dispatcher_candidate_limit: int = 500   # /find candidates per call
     dispatcher_context_chat: int = 5000     # @<bot> free-text context window
 
-    # Send the dispatcher's result back into the WeChat group via wx4py (UI
-    # automation). False = local-only (stdout + log). Requires WeChat main
-    # window to be visible (not minimized to tray).
+    # Send the dispatcher's result back into the WeChat group. False = local-
+    # only (stdout + log). True = use the backend below.
     reply: bool = True
+
+    # Reply backend choice. See replier.py for trade-offs.
+    #   wx4py    — UI automation. Requires Windows + WeChat main window visible.
+    #   openclaw — Experimental HTTP API via Tencent iLink Bot. Cross-platform.
+    #              Group send is UNCONFIRMED — only enable after a successful
+    #              `wechat-oracle openclaw probe` + `send` experiment.
+    #   stdout   — No-op. Equivalent to reply=False.
+    reply_backend: str = "wx4py"
 
     @field_validator("groups", mode="before")
     @classmethod

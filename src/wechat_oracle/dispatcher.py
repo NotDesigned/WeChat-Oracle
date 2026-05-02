@@ -42,6 +42,7 @@ from openai import OpenAI
 
 from .config import settings
 from .db import get_conn, init_db, transaction
+from .replier import Replier, build_replier
 
 
 # ---------- Shared types ----------
@@ -787,57 +788,6 @@ def _build_llm_client() -> OpenAI:
     return OpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
 
 
-def _build_wx_client():
-    """Connect via wx4py and verify per-group identity. Returns connected client
-    or None (reply disabled). See module docstring on prerequisites.
-    """
-    if not settings.reply:
-        logger.info("WO_REPLY=0; reply path disabled")
-        return None
-    try:
-        from wx4py import WeChatClient
-        wx = WeChatClient()
-        wx.connect()
-    except Exception as e:
-        logger.warning(
-            "wx4py connect failed ({}); replies disabled this run. "
-            "Open WeChat's main window (not in tray) and restart dispatcher.",
-            e,
-        )
-        return None
-
-    for group_name in settings.groups:
-        try:
-            nick = wx.group_manager.get_group_nickname(group_name)
-        except Exception as e:
-            logger.warning("identity check for group {!r} failed: {}", group_name, e)
-            continue
-        if nick == settings.bot_name:
-            logger.info("group {!r}: bot nickname={!r} matches WO_BOT_NAME", group_name, nick)
-        else:
-            logger.warning(
-                "group {!r}: my nickname here is {!r} but WO_BOT_NAME={!r}. "
-                "Replies will appear under {!r}. Verify you're on the right account.",
-                group_name, nick, settings.bot_name, nick,
-            )
-    return wx
-
-
-# WeChat treats `@<nickname>` followed by U+2005 (four-per-em space) as an @-mention.
-_AT_SEP = " "
-
-
-def _send_reply(wx, group_name: str | None, requester: str | None, text: str) -> None:
-    """Best-effort send via wx4py. Failure logs and returns; doesn't raise."""
-    if wx is None or not group_name:
-        return
-    body = f"@{requester}{_AT_SEP}{text}" if requester else text
-    try:
-        wx.chat_window.send_to(group_name, body, target_type="group")
-    except Exception as e:
-        logger.warning("wx4py send_to failed (group={!r}): {}", group_name, e)
-
-
 def _append_log(log_path: Path, command_t: int, block: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     when = datetime.fromtimestamp(command_t).strftime("%Y-%m-%d %H:%M:%S")
@@ -848,7 +798,7 @@ def _append_log(log_path: Path, command_t: int, block: str) -> None:
 def _process(
     conn: sqlite3.Connection,
     llm: OpenAI,
-    wx,
+    replier: "Replier",
     row: sqlite3.Row,
     log_path: Path,
     llm_log_path: Path | None,
@@ -867,7 +817,7 @@ def _process(
         text = parsed.chat()
         print(text, flush=True)
         _append_log(log_path, row["t"], text)
-        _send_reply(wx, row["group_name"], requester, text)
+        replier.send(row["group_name"], requester, text)
         _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
         return
 
@@ -890,13 +840,13 @@ def _process(
         msg = f"⚠️ /{parsed.name} 执行失败：{e}"
         print(msg, flush=True)
         _append_log(log_path, row["t"], msg)
-        _send_reply(wx, row["group_name"], requester, msg)
+        replier.send(row["group_name"], requester, msg)
         _finalize(conn, msg_id, "error", str(e))
         return
 
     print(result.stdout, flush=True)
     _append_log(log_path, row["t"], result.stdout)
-    _send_reply(wx, row["group_name"], requester, result.chat)
+    replier.send(row["group_name"], requester, result.chat)
     _finalize(conn, msg_id, "ok", result.summary)
 
 
@@ -938,13 +888,13 @@ def run_dispatcher() -> None:
     log_path = settings.data_dir / "dispatcher.log"
     llm_log_path = settings.data_dir / "llm_debug.log"
     llm = _build_llm_client()
-    wx = _build_wx_client()
+    replier = build_replier()
     interval = settings.dispatcher_poll_interval
 
     logger.info(
-        "dispatcher: bot={!r} model={} interval={}s reply={} commands={} log={} llm_log={}",
+        "dispatcher: bot={!r} model={} interval={}s replier={} commands={} log={} llm_log={}",
         settings.bot_name, settings.deepseek_model, interval,
-        wx is not None, list(COMMANDS), log_path, llm_log_path,
+        type(replier).__name__, list(COMMANDS), log_path, llm_log_path,
     )
 
     with get_conn() as conn:
@@ -958,7 +908,7 @@ def run_dispatcher() -> None:
                     if not _claim(conn, row["msg_id"]):
                         continue
                     try:
-                        _process(conn, llm, wx, row, log_path, llm_log_path)
+                        _process(conn, llm, replier, row, log_path, llm_log_path)
                     except Exception as e:
                         logger.exception("dispatcher crashed on msg_id={}", row["msg_id"])
                         _finalize(conn, row["msg_id"], "error", f"crashed: {e}")
@@ -967,8 +917,4 @@ def run_dispatcher() -> None:
         except KeyboardInterrupt:
             logger.info("dispatcher stopped by user")
         finally:
-            if wx is not None:
-                try:
-                    wx.disconnect()
-                except Exception as e:
-                    logger.warning("wx4py disconnect failed: {}", e)
+            replier.disconnect()
