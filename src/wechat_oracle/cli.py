@@ -12,6 +12,7 @@ Plus `weflow find` / `weflow sessions` for diagnosing WO_GROUPS resolution.
 Adding a subcommand: also update README「快速上手」段 + 「三进程」表
 (CLAUDE.md「易漂移点 F5」; the doc-sync hook will remind you).
 """
+import json
 from pathlib import Path
 
 import typer
@@ -223,12 +224,23 @@ def openclaw_send(
         typer.echo("[ERR] no token; run `openclaw login` first"); raise typer.Exit(1)
     with OpenclawClient(session) as client:
         try:
-            cid = client.send_text(
+            cid, resp = client.send_text(
                 to_user_id=to_user, group_id=group_id, text=text, context_token=context_token,
             )
         except Exception as e:
-            typer.echo(f"[ERR] send failed: {e}"); raise typer.Exit(2)
-    typer.echo(f"[OK] sent client_id={cid!r}")
+            typer.echo(f"[ERR] send failed: {e}")
+            # httpx raises HTTPStatusError on non-2xx; print response body if any
+            r = getattr(e, "response", None)
+            if r is not None:
+                try:
+                    typer.echo(f"  status: {r.status_code}")
+                    typer.echo(f"  body:   {r.text[:1000]}")
+                except Exception:
+                    pass
+            raise typer.Exit(2)
+    typer.echo(f"[OK] HTTP 2xx; client_id={cid!r}")
+    typer.echo(f"  server response body:")
+    typer.echo(json.dumps(resp, ensure_ascii=False, indent=2))
 
 
 @app.command("status")

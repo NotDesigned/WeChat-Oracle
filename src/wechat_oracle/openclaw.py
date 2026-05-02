@@ -200,37 +200,45 @@ class OpenclawClient:
         group_id: str | None = None,
         text: str,
         context_token: str | None = None,
-    ) -> str:
+    ) -> tuple[str, dict[str, Any] | None]:
         """Send a text message. EXPERIMENTAL on group_id.
 
-        Upstream demo only ever passes `to_user_id`. The proto type
-        (`api/types.ts WeixinMessage`) admits a `group_id?: string` field
-        but the client SDK doesn't use it. We're trying both routes here:
-
-        - to_user_id only → confirmed working for 1-on-1
-        - group_id only or both → unknown; experiment will tell
-
-        Returns the client_id we sent (useful for echo dedup if we ever
-        observe our own outgoing messages in getupdates).
+        Returns `(client_id, raw_response)`. raw_response is whatever the
+        server returned (may be None on long-poll timeout, but sendmessage
+        shouldn't long-poll in practice). For experiments, inspect the
+        response body — even on HTTP 200 the body's `ret` / `error_msg`
+        fields tell you whether the message was actually accepted.
         """
         if not (to_user_id or group_id):
             raise ValueError("need to_user_id or group_id")
         client_id = f"wo-{uuid.uuid4()}"
+        now_ms = int(time.time() * 1000)
+        # Match bridge.mjs payload shape exactly so we don't false-negative
+        # the experiment due to a missing field the server requires.
         msg: dict[str, Any] = {
-            "from_user_id": "",  # server fills from token
+            "from_user_id": "",          # server fills from token
+            "to_user_id": to_user_id or "",
             "client_id": client_id,
-            "message_type": 2,   # BOT
-            "message_state": 2,  # FINISH
-            "item_list": [{"type": 1, "text_item": {"text": text}}],
+            "create_time_ms": now_ms,
+            "update_time_ms": now_ms,
+            "delete_time_ms": 0,
+            "session_id": "",
+            "group_id": group_id or "",
+            "message_type": 2,           # BOT
+            "message_state": 2,          # FINISH
+            "item_list": [{
+                "type": 1,
+                "create_time_ms": now_ms,
+                "update_time_ms": now_ms,
+                "is_completed": True,
+                "button_item_list": [],
+                "text_item": {"text": text},
+            }],
         }
-        if to_user_id is not None:
-            msg["to_user_id"] = to_user_id
-        if group_id is not None:
-            msg["group_id"] = group_id
         if context_token is not None:
             msg["context_token"] = context_token
-        self._post("ilink/bot/sendmessage", {"msg": msg})
-        return client_id
+        resp = self._post("ilink/bot/sendmessage", {"msg": msg})
+        return client_id, resp
 
 
 # --- helpers --------------------------------------------------------------

@@ -353,34 +353,38 @@ uv run wechat-oracle status   # DB 路径 / 总条数 / 按状态分布 / 按群
 
 ---
 
-## 实验性：openclaw HTTP 回复后端
+## 实验进行中：openclaw 群聊回发可行性
 
-腾讯通过 OpenClaw 开放了官方的 [iLink Bot HTTP API](https://github.com/hao-ji-xing/openclaw-weixin)。如果它**支持群聊发送**（协议层有 `group_id` 字段，但客户端 SDK 把 `ChatType` 硬编码成 `"direct"`，群聊未在 demo 里证实），就能彻底替掉 wx4py：跨平台、零封号风险、不要求微信窗口可见。
+腾讯通过 OpenClaw 开放了官方的 [iLink Bot HTTP API](https://github.com/hao-ji-xing/openclaw-weixin)，跨平台、零封号风险。一系列实验逐步验证它能不能替掉 wx4py。
+
+**已确认**（2026-05）：
+- ✅ DM 双向通：bot 收 user→bot 私聊，发 bot→user 也成。`from_user_id` 用 `@im.wechat` namespace，`to_user_id` 用 `@im.bot`。
+- ❌ Bot **不能加进群**：登录后 bot 只在微信里表现为一个对话窗口，没有「邀请到群」入口。
+
+**还没确认**：bot 不在群里，**API 层是否仍能向某个具体 group_id 推送消息**？这是我们现在要测的——往 `xxx@chatroom` 发 `sendmessage`，看 server 接不接、群里看不看得到。
+
+CLI 流程：
 
 ```powershell
-# 1. 用一个测试小号扫码登录 ClawBot（token 存到 data/openclaw-token.json）
+# 1. 一次性登录（QR 在终端显示）
 uv run wechat-oracle openclaw login
 
-# 2. 把这个 bot 拉进一个测试群，跑 probe 5 分钟
-uv run wechat-oracle openclaw probe --minutes 5
-#    在群里发条消息触发推送，看 dump 出来的 message 字段里 group_id 有没有值
+# 2. probe 看私聊收到的字段长啥样（确认 token 工作）
+uv run wechat-oracle openclaw probe --minutes 3
 
-# 3. 试着用 group_id 发回去（替换成 probe 看到的实际 ID）
-uv run wechat-oracle openclaw send --group-id <从 probe 看到的> "test from openclaw"
-
-# 4. 如果群发成功：把映射写到 data/openclaw-groups.json
-#    {"林辉米粉店": "<openclaw group_id>"}
-#    然后 .env 里加 WO_REPLY_BACKEND=openclaw，重启 dispatcher
+# 3. 群聊回发实验（拿一个你能控制的小群的 wxid）
+uv run wechat-oracle openclaw send --group-id "<xxx@chatroom>" "test from openclaw"
+uv run wechat-oracle openclaw send --to-user "<xxx@chatroom>" "test alt path"
 ```
 
-四种结果对应的下一步：
+**结果分类**：
 
-| Probe 结果 | 含义 | 下一步 |
+| HTTP 响应 + 群里观察 | 含义 | 下一步 |
 |---|---|---|
-| `group_id` 字段填了，send --group-id 成功 | 群聊全通 | 替换 wx4py，加上 @-mention 测试 |
-| `group_id` 填了，但 send 失败 | 只能监听 | 双栈：openclaw 收，wx4py 发 |
-| `group_id` 始终 null | bot 收不到群消息 | 这条路堵死，留 wx4py |
-| 登录直接被拒 | 资质问题 | 留 wx4py |
+| 2xx + 群里出现消息 | 群发可行 | 把 wx4py 替换计划提上日程 |
+| 2xx + 群里没消息（黑洞） | server 接但不投递 | 留 wx4py |
+| 4xx + `not_in_group` 类错误 | 必须先入群 | 找入群入口；找不到就留 wx4py |
+| 4xx + `invalid_target` 类错误 | bot 不能寻址 group | 路堵，留 wx4py |
 
 ## 已知边界 / 限制
 
