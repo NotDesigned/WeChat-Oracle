@@ -13,8 +13,12 @@ wheels/
 data/
 .env
 
-# Claude Code local state
-.claude/
+# Claude Code: ignore by default, carve out the parts that codify project contracts
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/hooks/__pycache__/
+# settings.local.json (per-user permissions) and skills/ (per-user installs) stay ignored
 
 # wx4py drops a log + send-audit jsonl next to the cwd when imported
 wx4py.log

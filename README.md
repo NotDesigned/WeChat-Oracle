@@ -13,7 +13,7 @@ A local-first WeChat group-chat archiver with an LLM-backed in-group Q&A assista
 - **群内问答机器人**：在群里 @ 小号，触发以下三类操作
   - `/find <描述>` — 语义检索群历史（DeepSeek 精筛 + 关键词兜底）
   - `/help` — 查命令
-  - **自由问答**（无 `/` 命令）：把最近 1000 条群消息当上下文，让 LLM 直接答
+  - **自由问答**（无 `/` 命令）：把最近 2000 条群消息当上下文，让 LLM 直接答
 - **本地优先**：消息、媒体、调试日志全在 `data/`，无云端依赖（除了 LLM API）
 
 ## 整体架构
@@ -145,13 +145,15 @@ uv run wechat-oracle dispatcher
 
 ### 自由问答兜底
 
-不带 `/` 命令的 @ 消息直接进入兜底：把最近 1000 条群消息当上下文，让 LLM 直接回答。
+不带 `/` 命令的 @ 消息直接进入兜底：把最近 2000 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。
 
 ```
 @小号 谁今天提到了股票？
 @小号 帮我总结一下昨晚的讨论
 @小号 张三最近在忙什么
 ```
+
+> `/find` 和自由问答的检索池**包含合并转发包里的子项**（参见 [合并转发](#合并转发-merged-forward)）。即「张三 2024 年说过的话被 2026 年某人转发进群」也搜得到。
 
 ### 错误反馈
 
@@ -201,6 +203,22 @@ uv run wechat-oracle ingest backfill 群聊_xxx\texts\群聊_xxx.json --format w
 
 媒体缺失时（朋友只发 .json）：导入照常成功，`media_path` 留空，`content_text` 标 `[图片缺失]` / `[语音缺失]` 等。
 
+### 合并转发 (merged-forward)
+
+WeFlow 把微信「合并转发的聊天记录」当 `localType = (19 << 32) | 49` 推过来，`rawContent` 里 `<recorditem>` 含完整子消息列表。我们的处理：
+
+- 外层 wrapper 落 `messages` 表，`type='forward'`，`content_text='[聊天记录]'`
+- 子项落独立的 `forwarded_records` 表，每行带 `parent_msg_id` 反指 wrapper
+- **dispatcher 检索时把两表 UNION**，候选 ID 加前缀（`m:` 直发消息 / `f:` 转发子项）区分
+- 子项的 `t` 是**原消息时间**（`<srcMsgCreateTime>`），不是被转发进群的时间——`since:2024` 这类查询能正确命中老内容
+
+不解析的边界（写在前面省得踩坑）：
+- 嵌套合并转发（`<dataitem datatype="17">`）只存占位 `[聊天记录]`，**不递归**
+- 非文本子项（图片 / 视频 / 文件 / 链接）只存占位（`[图片]` 等），不下载媒体
+- 子项的发送者用 `<sourcename>`（显示名），WeChat XML 里的 `<hashusername>` 是 sha256 不可逆，没法回填 wxid
+
+详细字段语义见 `models.py` 里 `ForwardedItem` 的 docstring。
+
 ### 命令调度（`dispatcher`）
 
 ```
@@ -224,6 +242,7 @@ SQLite poll  ──►  parse_command (regex + dispatch)
 - 每 3s 扫 DB 找 `@<bot>` 文本消息（`LIKE %@<bot>%` 粗筛）
 - 命中后 Python 端用 `parse_command` 三态 dispatch：`Command` / `ParseError` / `None`（非命令静默）
 - 命令处理记录在 `command_runs` 表（msg_id 作主键），重启不重跑
+- **启动跳过积压**：dispatcher 启动时把所有未处理的历史 `@<bot>` 一次性写入 `command_runs(status='ok', result='(startup-skip)')`，避免冷启动 / 大批量回灌后向群里灌一通陈年答复。只对启动后新到的消息回复。
 
 ### `/find` 检索流水线
 
@@ -250,7 +269,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 `@<bot> <无 / 命令的文本>` → `ChatCommand`：
 
-- 拉最近 1000 条群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
+- 拉最近 `WO_DISPATCHER_CONTEXT_CHAT` 条（默认 2000）群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
 - 喂 chat-assistant prompt（强调"宁缺勿编、控制 2-6 句、不复制原文"）
 - 直接把 LLM 回复发回群
 
@@ -276,7 +295,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_REPLY` | `True` | 是否自动回群里 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
-| `WO_DISPATCHER_CONTEXT_CHAT` | `1000` | 自由问答上下文窗口 |
+| `WO_DISPATCHER_CONTEXT_CHAT` | `2000` | 自由问答上下文窗口 |
 
 ---
 
@@ -301,7 +320,19 @@ command_runs (
     msg_id PRIMARY KEY,    -- references messages.msg_id
     started_at, finished_at,
     status,                -- running / ok / error
-    result                 -- short summary
+    result                 -- short summary; 启动跳过的消息标 '(startup-skip)'
+)
+
+forwarded_records (
+    id PRIMARY KEY,
+    parent_msg_id,         -- → messages.msg_id (CASCADE on delete)
+    seq,                   -- 0-based 在 wrapper 内的序号
+    sender_display,        -- <sourcename>，无 wxid（<hashusername> 是 sha256）
+    t,                     -- <srcMsgCreateTime>，是源消息的时间，不是 wrapper 的时间
+    datatype,              -- WeChat dataitem 类型；1=文本，其它存占位
+    content,               -- 文本时存正文，其它存 [图片]/[视频]/[聊天记录] 等
+    src_msg_id,            -- <fromnewmsgid>，源群里的原 msg_id（informational）
+    UNIQUE(parent_msg_id, seq)
 )
 ```
 
@@ -353,10 +384,13 @@ src/wechat_oracle/
 └── ingest/
     ├── backfill.py     # WeFlow JSON 导入 + 媒体复制
     ├── live.py         # SSE 订阅 + group-members 富化
+    ├── forwarded.py    # 合并转发 rawContent 解析
     └── writer.py       # 唯一写入路径，UNIQUE dedupe
 ```
 
 新增 dispatcher 命令：在 `dispatcher.py` 里写 `Command` 子类 + `@register`，自动进 `/help` 列表。
+
+> ⚠️ **改命令 / schema / 配置 / CLI 必须同时同步 README**——这些都是双重 / 多重存储的事实，README 是给人看的对外文档，没人帮你校验一致性。详见 `CLAUDE.md` 「易漂移点速查」表 + 「命令体系维护契约」。仓库里 `.claude/hooks/check_doc_sync.py` 是 PostToolUse hook 自动 backstop（覆盖 dispatcher.py / schema.sql / config.py / cli.py 这四个常改文件）。
 
 ---
 

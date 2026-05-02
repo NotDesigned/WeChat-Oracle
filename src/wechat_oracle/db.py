@@ -1,3 +1,14 @@
+"""SQLite connection + schema bootstrap + transaction helper.
+
+WAL mode is essential — the writer process (`ingest live`), the reader
+(`dispatcher`), and any ad-hoc CLI command share the same DB file. WAL
+allows concurrent readers + one writer.
+
+`init_db()` runs `schema.sql` (idempotent thanks to `IF NOT EXISTS`); call
+it from any entry point that touches the DB. `transaction()` is the only
+sanctioned way to write — it manages BEGIN/COMMIT/ROLLBACK explicitly
+because we set `isolation_level=None` (autocommit) on the connection.
+"""
 import sqlite3
 from contextlib import contextmanager
 from importlib.resources import files

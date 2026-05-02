@@ -1,4 +1,15 @@
+"""Normalized data shapes that every importer + writer must produce / consume.
+
+`Message` is the canonical row for the `messages` table; `ForwardedItem` is
+the canonical row for `forwarded_records` (children of 合并转发 wrappers).
+Field semantics are paired with `schema.sql` (DDL comments) and with
+`ingest/writer.py` (INSERT_SQL). See CLAUDE.md「易漂移点 F1/F2」.
+
+`MsgType` / `Status` enums also appear in `schema.sql` CHECK constraints
+and column comments — keep in sync (CLAUDE.md F7/F8).
+"""
 import hashlib
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
@@ -25,6 +36,29 @@ class Status(StrEnum):
     INDEXED = "indexed"
 
 
+@dataclass
+class ForwardedItem:
+    """One child message inside a 合并转发 (merged-forward) bundle.
+
+    Carried alongside the parent `Message` from importer to writer; written into
+    `forwarded_records` after the parent row's msg_id is known.
+
+    `sender_display` is the original author's display name (`<sourcename>` from
+    the WeChat XML) — no wxid is available because `<hashusername>` is a sha256.
+    `t` is `<srcMsgCreateTime>` of the original message in its source group, so
+    forwarded items can be older than the parent message they're packaged in.
+    `datatype` is the WeChat dataitem type: 1=text (we keep `content`), other
+    values get a placeholder string. Nested forwards (datatype=17) are NOT
+    recursed — placeholder only.
+    """
+    seq: int
+    sender_display: str | None
+    t: int
+    datatype: int
+    content: str | None
+    src_msg_id: str | None
+
+
 class Message(BaseModel):
     """Normalized chat message. The single shape that every importer must produce."""
 
@@ -41,6 +75,13 @@ class Message(BaseModel):
     quote_text: str | None = None
     source: Literal["live", "backfill"]
     status: Status = Status.RAW
+
+    # Out-of-band side payload for type='forward' messages. Excluded from
+    # serialization; the writer reads this attribute directly and persists into
+    # `forwarded_records` after the parent row is inserted.
+    forwarded_items: list[ForwardedItem] = Field(default_factory=list, exclude=True)
+
+    model_config = {"arbitrary_types_allowed": True}
 
     def compute_dedupe_key(self) -> str:
         """A stable per-source key.

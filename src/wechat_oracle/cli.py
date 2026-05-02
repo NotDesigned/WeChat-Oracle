@@ -1,3 +1,17 @@
+"""Typer CLI entry point: `wechat-oracle <subcommand>`.
+
+Three production subcommands (each is a long-running process or one-shot job):
+  - `init-db`           — create schema (idempotent)
+  - `ingest backfill`   — one-shot import of historical export files
+  - `ingest live`       — long-running SSE subscriber → DB writer
+  - `dispatcher`        — long-running DB poller → LLM → wx4py reply
+  - `status`            — quick row count health check
+
+Plus `weflow find` / `weflow sessions` for diagnosing WO_GROUPS resolution.
+
+Adding a subcommand: also update README「快速上手」段 + 「三进程」表
+(CLAUDE.md「易漂移点 F5」; the doc-sync hook will remind you).
+"""
 from pathlib import Path
 
 import typer

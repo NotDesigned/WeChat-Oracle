@@ -23,6 +23,7 @@ from typing import Any
 from loguru import logger
 
 from ..models import Message, MsgType
+from .forwarded import FORWARD_LOCAL_TYPE, base_local_type, parse_record_xml
 
 
 def read_normalized_jsonl(path: Path, data_dir: Path) -> Iterator[Message]:
@@ -80,10 +81,18 @@ _MEDIA_MISSING_TAGS: dict[MsgType, str] = {
 
 
 def _classify(raw: dict[str, Any]) -> MsgType | None:
-    """Quotes/replies override the localType-based mapping."""
+    """Quotes/replies override the localType-based mapping.
+
+    WeFlow encodes appmsg subtype in the high 32 bits of localType. We mask
+    those off for the type table lookup, but preserve subtype 19 (合并转发)
+    by mapping it explicitly to MsgType.FORWARD before the generic 49→LINK fall.
+    """
     if raw.get("quotedContent") or raw.get("replyToMessageId"):
         return MsgType.QUOTE
-    return _WEFLOW_LOCAL_TYPE_MAP.get(raw.get("localType"))
+    lt = raw.get("localType")
+    if lt == FORWARD_LOCAL_TYPE:
+        return MsgType.FORWARD
+    return _WEFLOW_LOCAL_TYPE_MAP.get(base_local_type(lt))
 
 
 def _parse_media_ref(content: str | None) -> Path | None:
@@ -152,6 +161,15 @@ def _convert_weflow_message(
     if create_time is None:
         return None
 
+    forwarded_items = (
+        parse_record_xml(raw.get("rawContent"))
+        if msg_type is MsgType.FORWARD else []
+    )
+    if msg_type is MsgType.FORWARD and not content_text:
+        # WeFlow's `parsedContent` for record-msg is empty; show a sane preview
+        # so the parent row isn't blank in the DB.
+        content_text = "[聊天记录]"
+
     return Message(
         wx_msg_id=str(raw["platformMessageId"]) if raw.get("platformMessageId") else None,
         group_id=group_id,
@@ -165,6 +183,7 @@ def _convert_weflow_message(
         reply_to_wx_msg_id=str(raw["replyToMessageId"]) if raw.get("replyToMessageId") else None,
         quote_text=raw.get("quotedContent"),
         source="backfill",
+        forwarded_items=forwarded_items,
     )
 
 

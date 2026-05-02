@@ -1,3 +1,13 @@
+"""All `WO_*` runtime configuration.
+
+Single source of truth for env-var defaults. `Settings()` is instantiated
+once at import (see bottom of file) and importable as `settings` everywhere.
+Values come from `.env` in the project root, plus any `WO_*` env vars
+overriding it.
+
+When adding a field: also update README.md「配置参考」table — they are paired
+in CLAUDE.md「易漂移点 F3」 and the doc-sync hook will remind you.
+"""
 from pathlib import Path
 from typing import Annotated
 
@@ -41,7 +51,7 @@ class Settings(BaseSettings):
     # Dispatcher loop tunables.
     dispatcher_poll_interval: float = 3.0
     dispatcher_candidate_limit: int = 500   # /find candidates per call
-    dispatcher_context_chat: int = 1000     # @<bot> free-text context window
+    dispatcher_context_chat: int = 2000     # @<bot> free-text context window
 
     # Send the dispatcher's result back into the WeChat group via wx4py (UI
     # automation). False = local-only (stdout + log). Requires WeChat main

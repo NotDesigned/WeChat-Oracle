@@ -37,6 +37,27 @@ CREATE TABLE IF NOT EXISTS group_state (
     last_live_dedupe    TEXT
 );
 
+-- Children of WeChat 合并转发 (merged-forward) messages. The wrapper itself lives
+-- in `messages` as type='forward'; this table holds each `<dataitem>` from its
+-- `<recordinfo>` XML, flattened one level (nested forwards are placeholder only).
+-- sender_display comes from `<sourcename>` (no wxid available; `<hashusername>`
+-- is sha256 and not invertible). timestamp is `<srcMsgCreateTime>` of the
+-- original message in its source group, NOT the time of the forward.
+CREATE TABLE IF NOT EXISTS forwarded_records (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_msg_id   INTEGER NOT NULL REFERENCES messages(msg_id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,    -- 0-based ordinal within the bundle
+    sender_display  TEXT,                -- sourcename (display name; no wxid)
+    t               INTEGER NOT NULL,    -- srcMsgCreateTime (Unix sec)
+    datatype        INTEGER NOT NULL,    -- 1=text; others get placeholder content
+    content         TEXT,                -- html-unescaped datadesc, or "[图片]" etc.
+    src_msg_id      TEXT,                -- fromnewmsgid (informational; not joined)
+    UNIQUE(parent_msg_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_fwd_records_parent ON forwarded_records(parent_msg_id);
+CREATE INDEX IF NOT EXISTS idx_fwd_records_t      ON forwarded_records(t);
+CREATE INDEX IF NOT EXISTS idx_fwd_records_sender ON forwarded_records(sender_display);
+
 -- Tracks dispatcher runs: which incoming command messages have been processed.
 -- Decoupled from `messages.status` so the message lifecycle stays clean.
 CREATE TABLE IF NOT EXISTS command_runs (

@@ -48,7 +48,14 @@ from .db import get_conn, init_db, transaction
 
 @dataclass(frozen=True)
 class Candidate:
-    msg_id: int
+    """One LLM-visible row. `cand_id` is a tagged string so messages and
+    forwarded-record items live in one ID space:
+        "m:<messages.msg_id>"   — original group message
+        "f:<forwarded_records.id>" — child of a 合并转发 wrapper
+    The LLM echoes these back verbatim in `hits`; we look them up by exact
+    string match (no integer conversion).
+    """
+    cand_id: str
     t: int
     sender: str
     content: str
@@ -247,8 +254,8 @@ class FindCommand(Command):
     def _target_label(self) -> str:
         return f"@{self.target}" if self.target else "全员"
 
-    def _format_stdout(self, cands: list[Candidate], hits: list[int], reason: str) -> str:
-        by_id = {c.msg_id: c for c in cands}
+    def _format_stdout(self, cands: list[Candidate], hits: list[str], reason: str) -> str:
+        by_id = {c.cand_id: c for c in cands}
         head = f"/find {self._target_label()} :: {self.description}"
         if self.since_t:
             head += f"  [since:{datetime.fromtimestamp(self.since_t):%Y-%m-%d}]"
@@ -268,11 +275,11 @@ class FindCommand(Command):
                 body += f"\n  -> {reason}"
         return f"{head}\n{body}"
 
-    def _format_chat(self, cands: list[Candidate], hits: list[int], reason: str) -> str:
+    def _format_chat(self, cands: list[Candidate], hits: list[str], reason: str) -> str:
         if not hits:
             tail = f"（{reason}）" if reason else ""
             return f"没找到关于「{self.description}」的相关消息{tail}"
-        by_id = {c.msg_id: c for c in cands}
+        by_id = {c.cand_id: c for c in cands}
         lines = [f"找到 {len(hits)} 条相关消息："]
         # When target is unspecified, hits may come from different senders — show sender
         # so the reader can tell who said what. When target is specified, sender is
@@ -301,7 +308,11 @@ class FindCommand(Command):
 class ChatCommand(Command):
     name = "(chat)"
     usage = "@<bot> <任意问题或话题>"
-    description = "兜底：直接 @ 机器人 + 提问，把最近 1000 条群消息当上下文，由 LLM 自由回答"
+    # f-string at class-load time pulls the live default from settings, so
+    # changing WO_DISPATCHER_CONTEXT_CHAT (or its default in config.py) doesn't
+    # leave this string lying about a stale number — kills a drift point
+    # between dispatcher.py help text and config.py default.
+    description = f"兜底：直接 @ 机器人 + 提问，把最近 {settings.dispatcher_context_chat} 条群消息当上下文，由 LLM 自由回答"
     examples = [
         "@<bot> 谁今天提到了股票？",
         "@<bot> 帮我总结一下昨晚的讨论",
@@ -382,7 +393,7 @@ class HelpCommand(Command):
 def _help_overview() -> str:
     parts = ["可用命令："]
     parts.extend(cls.help() for cls in COMMANDS.values())
-    parts.append("不带 / 命令时（如 `@<bot> 谁今天提到了股票？`）→ 进入通用兜底，把最近 1000 条群消息当上下文，由 LLM 自由回答。")
+    parts.append(f"不带 / 命令时（如 `@<bot> 谁今天提到了股票？`）→ 进入通用兜底，把最近 {settings.dispatcher_context_chat} 条群消息当上下文，由 LLM 自由回答。")
     return "\n\n".join(parts)
 
 
@@ -448,41 +459,76 @@ def fetch_candidates(
 ) -> list[Candidate]:
     """Recent text messages from `group_id`, most recent first capped at `limit`.
 
+    Unions two sources behind one ID-tagged Candidate stream:
+      - direct group messages (`messages`), ID prefixed `m:`
+      - children of 合并转发 wrappers (`forwarded_records`), ID prefixed `f:`
+
     `target=None` returns messages from every sender (chat-fallback context).
-    Otherwise matches `sender_display` or `sender_wxid` exactly.
+    Otherwise matches `sender_display` (and for messages also `sender_wxid`)
+    exactly. Forwarded items only have a display name; no wxid available.
+
+    `since_t` filters on each row's own timestamp — for forwarded items that is
+    the original source-group time (`<srcMsgCreateTime>`), so a message
+    forwarded into the group keeps its true age.
 
     When `bot_name` is given, also excludes:
-      - messages where sender_display equals the bot (bot's own captured replies)
-      - messages whose body contains `@<bot_name>` followed somewhere by `/`
-        (command messages — those address the bot, not the conversation topic)
+      - messages where sender equals the bot (bot's own captured replies)
+      - messages whose body contains `@<bot_name>` followed by `/` (command
+        messages — they address the bot, not the conversation topic)
+
+    The bot-shape filters are not applied to forwarded items: their content
+    came from elsewhere and a literal `@bot_name` substring is coincidence.
     """
-    sql = """
-        SELECT msg_id, t, COALESCE(sender_display, sender_wxid, '?') AS sender,
-               content_text
+    main_sql = """
+        SELECT 'm:' || msg_id AS cand_id, t,
+               COALESCE(sender_display, sender_wxid, '?') AS sender,
+               content_text AS content
           FROM messages
          WHERE group_id = ?
            AND type = 'text'
            AND content_text IS NOT NULL AND content_text <> ''
     """
-    params: list[object] = [group_id]
+    main_params: list[object] = [group_id]
     if target is not None:
-        sql += " AND (sender_display = ? OR sender_wxid = ?)"
-        params.extend([target, target])
+        main_sql += " AND (sender_display = ? OR sender_wxid = ?)"
+        main_params.extend([target, target])
     if since_t is not None:
-        sql += " AND t >= ?"
-        params.append(since_t)
+        main_sql += " AND t >= ?"
+        main_params.append(since_t)
     if bot_name:
-        sql += " AND sender_display != ?"
-        params.append(bot_name)
-        sql += " AND content_text NOT LIKE ?"
-        params.append(f"%@{bot_name}%/%")
-    sql += " ORDER BY t DESC LIMIT ?"
-    params.append(limit)
+        main_sql += " AND sender_display != ? AND content_text NOT LIKE ?"
+        main_params.extend([bot_name, f"%@{bot_name}%/%"])
+
+    fwd_sql = """
+        SELECT 'f:' || f.id AS cand_id, f.t,
+               COALESCE(f.sender_display, '?') AS sender,
+               f.content
+          FROM forwarded_records f
+          JOIN messages m ON m.msg_id = f.parent_msg_id
+         WHERE m.group_id = ?
+           AND f.content IS NOT NULL AND f.content <> ''
+    """
+    fwd_params: list[object] = [group_id]
+    if target is not None:
+        fwd_sql += " AND f.sender_display = ?"
+        fwd_params.append(target)
+    if since_t is not None:
+        fwd_sql += " AND f.t >= ?"
+        fwd_params.append(since_t)
+
+    sql = f"""
+        SELECT cand_id, t, sender, content FROM (
+            {main_sql}
+            UNION ALL
+            {fwd_sql}
+        ) ORDER BY t DESC LIMIT ?
+    """
+    params = main_params + fwd_params + [limit]
     rows = conn.execute(sql, params).fetchall()
     rows.reverse()  # chronological for the LLM
     return [
         Candidate(
-            msg_id=r["msg_id"], t=r["t"], sender=r["sender"], content=r["content_text"]
+            cand_id=r["cand_id"], t=r["t"], sender=r["sender"], content=r["content"]
         )
         for r in rows
     ]
@@ -503,25 +549,25 @@ _SYSTEM_PROMPT = """你是聊天记录精筛助手。根据「查询描述」从
 
 返回 JSON（只输出 JSON，不要前后文）：
 {
-  "hits": [<msg_id>, ...],         // 按相关度从高到低，最多 5 条
+  "hits": ["<msg_id>", ...],       // 按相关度从高到低，最多 5 条；msg_id 是字符串，照抄候选行 [] 里的 token
   "keywords": ["<核心检索词>", ...], // 从查询里提取的 1-3 个核心实体/概念，用作 fallback 关键词
   "reason": "<一句话说明>"
 }
 
-严禁编造 ID，只能从候选中挑。"""
+严禁编造 ID，只能从候选中挑。注意 msg_id 形如 "m:123" 或 "f:456"，必须原样保留前缀。"""
 
 
 def _format_candidates_for_llm(cands: list[Candidate]) -> str:
     lines = []
     for c in cands:
         ts = datetime.fromtimestamp(c.t).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"[{c.msg_id}] ({ts}) {c.sender}:{c.content}")
+        lines.append(f"[{c.cand_id}] ({ts}) {c.sender}:{c.content}")
     return "\n".join(lines)
 
 
 @dataclass
 class LLMFilterResult:
-    hits: list[int]
+    hits: list[str]
     keywords: list[str]
     reason: str
 
@@ -617,8 +663,9 @@ def llm_filter(
         _dump_llm_call(log_path, f"{label}  ::  {description}",
                        _SYSTEM_PROMPT, user, raw, payload)
 
-    valid_ids = {c.msg_id for c in cands}
-    hits = [int(x) for x in (payload.get("hits") if isinstance(payload, dict) else []) if int(x) in valid_ids]
+    valid_ids = {c.cand_id for c in cands}
+    raw_hits = (payload.get("hits") if isinstance(payload, dict) else []) or []
+    hits = [str(x) for x in raw_hits if str(x) in valid_ids]
     raw_keywords = (payload.get("keywords") if isinstance(payload, dict) else []) or []
     keywords = [str(k).strip() for k in raw_keywords if str(k).strip()]
     reason_text = str((payload.get("reason") if isinstance(payload, dict) else "") or "")
@@ -670,17 +717,17 @@ def chat_assistant(
     return raw
 
 
-def keyword_fallback(cands: list[Candidate], keywords: list[str], cap: int = 5) -> list[int]:
+def keyword_fallback(cands: list[Candidate], keywords: list[str], cap: int = 5) -> list[str]:
     """Substring search across candidates as a safety net for over-strict LLM
     rejection. Matches if ANY keyword appears in `content` (case-sensitive on
-    Chinese, no folding needed). Returns msg_ids in chronological order, capped.
+    Chinese, no folding needed). Returns cand_ids in chronological order, capped.
     """
     if not keywords:
         return []
-    hits: list[int] = []
+    hits: list[str] = []
     for c in cands:
         if any(k in c.content for k in keywords):
-            hits.append(c.msg_id)
+            hits.append(c.cand_id)
             if len(hits) >= cap:
                 break
     return hits
@@ -853,6 +900,33 @@ def _process(
     _finalize(conn, msg_id, "ok", result.summary)
 
 
+def _skip_backlog(conn: sqlite3.Connection, bot_name: str) -> int:
+    """Mark every existing un-claimed `@<bot>` message as already-processed
+    (status='ok', result='startup-skip'). Run once at dispatcher startup so a
+    cold start doesn't flood the group with replies to historical questions —
+    backlogs may arise from a long downtime, a fresh DB import, or restarting
+    after a one-shot historical re-pull. Future messages stream through
+    `_next_unprocessed` normally.
+    """
+    now = int(time.time())
+    needle = f"%@{bot_name}%"
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO command_runs (msg_id, started_at, finished_at, status, result)
+            SELECT m.msg_id, ?, ?, 'ok', '(startup-skip)'
+              FROM messages m
+         LEFT JOIN command_runs r ON r.msg_id = m.msg_id
+             WHERE m.source = 'live'
+               AND m.type = 'text'
+               AND m.content_text LIKE ?
+               AND r.msg_id IS NULL
+            """,
+            (now, now, needle),
+        )
+    return cur.rowcount or 0
+
+
 def run_dispatcher() -> None:
     if not settings.bot_name:
         raise RuntimeError(
@@ -874,6 +948,9 @@ def run_dispatcher() -> None:
     )
 
     with get_conn() as conn:
+        skipped = _skip_backlog(conn, settings.bot_name)
+        if skipped:
+            logger.info("startup: skipped {} pre-existing @-mentions (won't reply to backlog)", skipped)
         try:
             while True:
                 rows = _next_unprocessed(conn, settings.bot_name)

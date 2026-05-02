@@ -34,8 +34,9 @@ from loguru import logger
 
 from ..config import settings
 from ..db import get_conn
-from ..models import Message
+from ..models import Message, MsgType
 from .backfill import _MEDIA_TYPES, _WEFLOW_LOCAL_TYPE_MAP
+from .forwarded import FORWARD_LOCAL_TYPE, base_local_type, parse_record_xml
 from .writer import write_messages
 
 
@@ -53,7 +54,11 @@ def _api_msg_to_normalized(
     startup) supplies the missing display name; falls back to wxid when missing.
     Quote/reply detection is deferred (would need to parse `rawContent` XML).
     """
-    msg_type = _WEFLOW_LOCAL_TYPE_MAP.get(raw.get("localType"))
+    lt = raw.get("localType")
+    if lt == FORWARD_LOCAL_TYPE:
+        msg_type: MsgType | None = MsgType.FORWARD
+    else:
+        msg_type = _WEFLOW_LOCAL_TYPE_MAP.get(base_local_type(lt))
     if msg_type is None:
         return None
     create_time = raw.get("createTime")
@@ -65,10 +70,16 @@ def _api_msg_to_normalized(
 
     content_text: str | None = None
     media_path: str | None = None
+    forwarded_items = []
     if msg_type in _MEDIA_TYPES:
         media_path = raw.get("mediaLocalPath") or raw.get("mediaUrl")
         if not media_path:
             content_text = raw.get("content")
+    elif msg_type is MsgType.FORWARD:
+        forwarded_items = parse_record_xml(raw.get("rawContent"))
+        # `parsedContent` is empty for record-msg; show a sane preview
+        # so the parent row isn't blank.
+        content_text = raw.get("content") or "[聊天记录]"
     else:
         content_text = raw.get("content")
 
@@ -86,6 +97,7 @@ def _api_msg_to_normalized(
         content_text=content_text,
         media_path=media_path,
         source="live",
+        forwarded_items=forwarded_items,
     )
 
 
