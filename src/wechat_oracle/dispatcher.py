@@ -813,7 +813,7 @@ def chat_assistant(
             {"role": "user", "content": user},
         ],
         temperature=0.3,
-        max_tokens=600,  # hard cap; prompt asks for 2-6 句, this allows ~300 中文 chars
+        max_tokens=1000,  # hard cap; prompt asks for 2-6 句, this allows ~300 中文 chars
     )
     raw = (resp.choices[0].message.content or "").strip()
     if log_path:
