@@ -56,7 +56,7 @@
 | F12 | 媒体子目录布局 (`images`/`voices`/`videos`/`stickers`) | `ingest/backfill.py:_MEDIA_SUBDIR` + `README.md` 媒体处理段 | — | 改字典等于把已有 `data/media/<旧>/` 全部弃用 |
 | F13 | dispatcher `_skip_backlog` 启动行为 | `dispatcher.py:_skip_backlog` + `README.md` 数据流细节段 | — | 改默认行为（比如改成处理积压）必须同步 README + 给个 flag |
 | F14 | 本 hook 的 marker 列表 | `.claude/hooks/check_doc_sync.py:_*_MARKERS` + 本文件「命令体系维护契约」判定标准段 | — | 改 marker 时把 prose 描述也改了，否则 hook 和契约说的不是一回事 |
-| F15 | `WO_REPLY_BACKEND` 取值集 | `replier.py:build_replier` if-chain + `config.py:reply_backend` 注释 + `README.md` 配置参考表 | hook (config.py 改触发) | 加新 backend 时把这三处都同步；新建一个 `XxxReplier` 类实现 `Replier` 协议即可，不动 dispatcher |
+| F15 | `WO_REPLY_BACKEND` 取值集 (`wx4py` / `stdout`) | `replier.py:build_replier` if-chain + `config.py:reply_backend` 注释 + `README.md` 配置参考表 | hook (config.py 改触发) | 加新 backend 时把这三处都同步；新建一个 `XxxReplier` 类实现 `Replier` 协议即可，不动 dispatcher。**openclaw 不在列表里**——实测不可群发，见 README「实验记录」 |
 
 **新事实进表的判定**：如果你引入了一个事实它**注定要在两个以上文件里出现**（即使本仓库现在只放在了一处），就把它登记到本表，并尽量用单源 + import 替代多处复制。
 

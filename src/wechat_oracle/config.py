@@ -58,11 +58,10 @@ class Settings(BaseSettings):
     reply: bool = True
 
     # Reply backend choice. See replier.py for trade-offs.
-    #   wx4py    — UI automation. Requires Windows + WeChat main window visible.
-    #   openclaw — Experimental HTTP API via Tencent iLink Bot. Cross-platform.
-    #              Group send is UNCONFIRMED — only enable after a successful
-    #              `wechat-oracle openclaw probe` + `send` experiment.
-    #   stdout   — No-op. Equivalent to reply=False.
+    #   wx4py  — UI automation. Requires Windows + WeChat main window visible.
+    #   stdout — No-op. Equivalent to reply=False.
+    # (openclaw was prototyped + rejected; ClawBots can't deliver group msgs.
+    #  See README "实验记录" if you're tempted to try again.)
     reply_backend: str = "wx4py"
 
     @field_validator("groups", mode="before")

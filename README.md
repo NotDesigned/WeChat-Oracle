@@ -293,7 +293,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点 |
 | `WO_DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名 |
 | `WO_REPLY` | `True` | 是否自动回群里 |
-| `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `openclaw`（HTTP API，**实验性**——群聊 send 未验证）/ `stdout`（不发） |
+| `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `stdout`（不发）。openclaw 实测不可用，见下方「实验记录」段 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `5000` | 自由问答上下文窗口 |
@@ -353,38 +353,28 @@ uv run wechat-oracle status   # DB 路径 / 总条数 / 按状态分布 / 按群
 
 ---
 
-## 实验进行中：openclaw 群聊回发可行性
+## 实验记录：openclaw 群聊不可行（结论锁定，2026-05）
 
-腾讯通过 OpenClaw 开放了官方的 [iLink Bot HTTP API](https://github.com/hao-ji-xing/openclaw-weixin)，跨平台、零封号风险。一系列实验逐步验证它能不能替掉 wx4py。
+腾讯通过 OpenClaw 开放了官方的 [iLink Bot HTTP API](https://github.com/hao-ji-xing/openclaw-weixin)，跨平台、零封号风险。本来期望它能替掉 wx4py，但跑下来三层全堵：
 
-**已确认**（2026-05）：
-- ✅ DM 双向通：bot 收 user→bot 私聊，发 bot→user 也成。`from_user_id` 用 `@im.wechat` namespace，`to_user_id` 用 `@im.bot`。
-- ❌ Bot **不能加进群**：登录后 bot 只在微信里表现为一个对话窗口，没有「邀请到群」入口。
+1. **微信 UI 层**：登录后 bot 只表现为一个 1-on-1 对话窗口，**没有「加入群聊」/「分享到群」入口**——ClawBot 设计上就不是普通联系人。
+2. **SDK 层**：上游 `messaging/inbound.ts` 把 `ChatType` 硬编码成 `"direct"`；`messaging/send.ts` 的 `sendMessageWeixin` 函数签名只接受 `to: string`（→ `to_user_id`），从来不用 `group_id`。
+3. **server 层**：实测 `sendmessage` 直接发 `group_id="22810000897@chatroom"`，server 返回 `{"ret": -2}` 拒绝。
 
-**还没确认**：bot 不在群里，**API 层是否仍能向某个具体 group_id 推送消息**？这是我们现在要测的——往 `xxx@chatroom` 发 `sendmessage`，看 server 接不接、群里看不看得到。
+✅ 唯一确认能用的：**1-on-1 DM**（user → bot → user）。`from_user_id` namespace `@im.wechat`，`to_user_id` namespace `@im.bot`，发送时必须带 `context_token`。
 
-CLI 流程：
+**所以 `WO_REPLY_BACKEND=openclaw` 不存在**——`OpenclawReplier` adapter 已删除。但底层 `openclaw.py` 模块 + `wechat-oracle openclaw {login,probe,send}` 三条 CLI 子命令保留，作为：
+
+- 诊断工具（万一 Tencent 后续放开了群聊，复跑实验只要 5 分钟）
+- 未来如果做「私聊 bot 问知识库」之类 DM-only 场景，HTTP 通道现成
+
+实验复跑命令（仅供后人参考）：
 
 ```powershell
-# 1. 一次性登录（QR 在终端显示）
-uv run wechat-oracle openclaw login
-
-# 2. probe 看私聊收到的字段长啥样（确认 token 工作）
-uv run wechat-oracle openclaw probe --minutes 3
-
-# 3. 群聊回发实验（拿一个你能控制的小群的 wxid）
-uv run wechat-oracle openclaw send --group-id "<xxx@chatroom>" "test from openclaw"
-uv run wechat-oracle openclaw send --to-user "<xxx@chatroom>" "test alt path"
+uv run wechat-oracle openclaw login                              # QR 登录
+uv run wechat-oracle openclaw probe --minutes 3                  # 看 DM 字段
+uv run wechat-oracle openclaw send --group-id "<x@chatroom>" "x" # 群发实验
 ```
-
-**结果分类**：
-
-| HTTP 响应 + 群里观察 | 含义 | 下一步 |
-|---|---|---|
-| 2xx + 群里出现消息 | 群发可行 | 把 wx4py 替换计划提上日程 |
-| 2xx + 群里没消息（黑洞） | server 接但不投递 | 留 wx4py |
-| 4xx + `not_in_group` 类错误 | 必须先入群 | 找入群入口；找不到就留 wx4py |
-| 4xx + `invalid_target` 类错误 | bot 不能寻址 group | 路堵，留 wx4py |
 
 ## 已知边界 / 限制
 
