@@ -86,6 +86,11 @@ class CommandContext:
     candidate_limit: int        # /find
     candidate_limit_chat: int   # @<bot> free-text fallback
     llm_log_path: Path | None  # if set, every LLM call is dumped here
+    # The triggering message itself was a 引用回复 — these mirror messages.quote_text /
+    # reply_to_wx_msg_id. ChatCommand uses `quoted_text` to inline the quoted snippet
+    # into the LLM prompt; FindCommand ignores them.
+    quoted_text: str | None = None
+    quoted_msg_id: str | None = None
 
 
 @dataclass
@@ -331,8 +336,11 @@ class ChatCommand(Command):
         return cls(message=msg)
 
     def execute(self, ctx: CommandContext) -> ExecResult:
-        # Reuse fetch_candidates with target=None to get recent group context
-        # (text only, exclude bot/commands, chronological).
+        # Chat context: include EVERY message type (link cards, files, video
+        # shares, transfers, system events, image/voice placeholders, etc.)
+        # so the LLM sees the full timeline. `for_chat=True` widens the SQL
+        # filter and substitutes type-based placeholders for NULL content_text.
+        # See CLAUDE.md F7.
         context = fetch_candidates(
             ctx.conn,
             group_id=ctx.group_id,
@@ -340,9 +348,16 @@ class ChatCommand(Command):
             since_t=None,
             limit=ctx.candidate_limit_chat,
             bot_name=ctx.bot_name,
+            for_chat=True,
         )
+        # When the user 引用ed a message and addressed the bot, inline the
+        # quoted snippet so the LLM treats it as the topic of the question
+        # without having to fish it out of the context window.
+        message = self.message
+        if ctx.quoted_text:
+            message = f"[用户引用了一条消息：{ctx.quoted_text}]\n{message}"
         reply = chat_assistant(
-            ctx.llm, ctx.model, self.message, context,
+            ctx.llm, ctx.model, message, context,
             log_path=ctx.llm_log_path,
         )
         if not reply:
@@ -457,48 +472,93 @@ def fetch_candidates(
     since_t: int | None,
     limit: int,
     bot_name: str | None = None,
+    *,
+    for_chat: bool = False,
 ) -> list[Candidate]:
-    """Recent text messages from `group_id`, most recent first capped at `limit`.
+    """Recent messages from `group_id`, most recent first capped at `limit`.
 
     Unions two sources behind one ID-tagged Candidate stream:
       - direct group messages (`messages`), ID prefixed `m:`
       - children of 合并转发 wrappers (`forwarded_records`), ID prefixed `f:`
 
-    `target=None` returns messages from every sender (chat-fallback context).
-    Otherwise matches `sender_display` (and for messages also `sender_wxid`)
-    exactly. Forwarded items only have a display name; no wxid available.
+    All message types pass through. NULL content_text for media (image / voice
+    / video / sticker) gets replaced by a typed placeholder via SQL CASE so
+    every message at least appears as an event in the timeline. Link cards /
+    files / video shares / transfers / red-packets carry their formatted
+    preview (built by `format_appmsg_content` at ingest time). The LLM is
+    trusted to recognise placeholders like `[图片]` as opaque events vs
+    user-typed text. (See CLAUDE.md F7.)
 
-    `since_t` filters on each row's own timestamp — for forwarded items that is
-    the original source-group time (`<srcMsgCreateTime>`), so a message
+    The only behaviour `for_chat` controls is whether to keep `@<bot> /xxx`
+    slash-command messages in the candidate set:
+      - `False` (DEFAULT — `/find` etc.): excludes them. Other users' earlier
+        `/find` calls are not topical signal for the current query.
+      - `True` (ChatCommand free-form): keeps them, since "我刚才让 bot 查了
+        X 然后..." is part of the conversation flow.
+
+    `target=None` returns messages from every sender. Otherwise matches
+    `sender_display` (and for messages also `sender_wxid`) exactly.
+    Forwarded items only have a display name.
+
+    `since_t` filters on each row's own timestamp — for forwarded items that
+    is the original source-group time (`<srcMsgCreateTime>`), so a message
     forwarded into the group keeps its true age.
 
-    When `bot_name` is given, also excludes:
-      - messages where sender equals the bot (bot's own captured replies)
-      - messages whose body contains `@<bot_name>` followed by `/` (command
-        messages — they address the bot, not the conversation topic)
+    When `bot_name` is given, excludes the bot's own captured replies in both
+    modes (the bot's output isn't useful as candidate or as context).
 
-    The bot-shape filters are not applied to forwarded items: their content
-    came from elsewhere and a literal `@bot_name` substring is coincidence.
+    Quote-reply rendering: we unify the LLM-visible shape so live and backfill
+    look identical. backfill's content_text is already
+    `"<reply>[引用 <orig>:<quoted>]"` (WeFlow file-export pre-parsed). For
+    live, content_text is just `"<reply>"` and `quote_text` is separate; the
+    CASE below appends the `[引用 ...]` suffix and resolves the original
+    sender via LEFT JOIN on `wx_msg_id (== refermsg.svrid)`.
     """
+    # SQL note: SQLite WHERE can't reference SELECT aliases, so the `content`
+    # NULL/empty filter happens at the outer UNION level (see `sql` below).
     main_sql = """
-        SELECT 'm:' || msg_id AS cand_id, t,
-               COALESCE(sender_display, sender_wxid, '?') AS sender,
-               content_text AS content
-          FROM messages
-         WHERE group_id = ?
-           AND type = 'text'
-           AND content_text IS NOT NULL AND content_text <> ''
+        SELECT 'm:' || m.msg_id AS cand_id, m.t,
+               COALESCE(m.sender_display, m.sender_wxid, '?') AS sender,
+               CASE
+                   WHEN m.type = 'quote'
+                        AND m.quote_text IS NOT NULL AND m.quote_text <> ''
+                        AND COALESCE(m.content_text, '') NOT LIKE '%[引用%'
+                   THEN COALESCE(m.content_text, '')
+                        || '[引用 '
+                        || COALESCE(orig.sender_display, orig.sender_wxid, '?')
+                        || '：' || m.quote_text || ']'
+                   WHEN m.content_text IS NOT NULL AND m.content_text <> ''
+                   THEN m.content_text
+                   ELSE CASE m.type
+                       WHEN 'image'   THEN '[图片]'
+                       WHEN 'voice'   THEN '[语音]'
+                       WHEN 'video'   THEN '[视频]'
+                       WHEN 'sticker' THEN '[表情]'
+                       ELSE NULL
+                   END
+               END AS content
+          FROM messages m
+          LEFT JOIN messages orig
+                 ON orig.wx_msg_id = m.reply_to_wx_msg_id
+                AND orig.group_id  = m.group_id
+         WHERE m.group_id = ?
     """
     main_params: list[object] = [group_id]
     if target is not None:
-        main_sql += " AND (sender_display = ? OR sender_wxid = ?)"
+        main_sql += " AND (m.sender_display = ? OR m.sender_wxid = ?)"
         main_params.extend([target, target])
     if since_t is not None:
-        main_sql += " AND t >= ?"
+        main_sql += " AND m.t >= ?"
         main_params.append(since_t)
     if bot_name:
-        main_sql += " AND sender_display != ? AND content_text NOT LIKE ?"
-        main_params.extend([bot_name, f"%@{bot_name}%/%"])
+        main_sql += " AND m.sender_display != ?"
+        main_params.append(bot_name)
+        if not for_chat:
+            # /find: drop slash-command messages from the candidate pool —
+            # other users' earlier `/find ...` calls aren't topical signal.
+            # chat: keep them; they're part of the conversation flow.
+            main_sql += " AND m.content_text NOT LIKE ?"
+            main_params.append(f"%@{bot_name}%/%")
 
     fwd_sql = """
         SELECT 'f:' || f.id AS cand_id, f.t,
@@ -517,12 +577,16 @@ def fetch_candidates(
         fwd_sql += " AND f.t >= ?"
         fwd_params.append(since_t)
 
+    # Outer SELECT lets us filter NULL/empty content (the inner CASE returns
+    # NULL for unknown types whose content_text is also empty — these would be
+    # useless to the LLM).
     sql = f"""
         SELECT cand_id, t, sender, content FROM (
             {main_sql}
             UNION ALL
             {fwd_sql}
-        ) ORDER BY t DESC LIMIT ?
+        ) WHERE content IS NOT NULL AND content <> ''
+        ORDER BY t DESC LIMIT ?
     """
     params = main_params + fwd_params + [limit]
     rows = conn.execute(sql, params).fetchall()
@@ -760,19 +824,25 @@ def _finalize(conn: sqlite3.Connection, msg_id: int, status: str, result: str) -
 def _next_unprocessed(
     conn: sqlite3.Connection, bot_name: str, batch: int = 20
 ) -> list[sqlite3.Row]:
-    """Live text rows that ping the bot (any `@<bot>...`, slash command or
-    free-form question) and have no command_runs row yet. Final dispatch is in
-    Python (parse_command).
+    """Live text-or-quote rows that ping the bot (any `@<bot>...`, slash command
+    or free-form question) and have no command_runs row yet. Final dispatch is
+    in Python (parse_command).
+
+    Quote rows are included because a user can right-click → 引用 a previous
+    message and add `@<bot> ...` to it. The reply text (which is what addresses
+    the bot) lives in `content_text` exactly the same as for plain text. See
+    CLAUDE.md F4 / F7.
     """
     needle = f"%@{bot_name}%"
     return conn.execute(
         """
         SELECT m.msg_id, m.group_id, m.group_name, m.t, m.content_text,
-               m.sender_display, m.sender_wxid
+               m.sender_display, m.sender_wxid,
+               m.quote_text, m.reply_to_wx_msg_id
           FROM messages m
      LEFT JOIN command_runs r ON r.msg_id = m.msg_id
          WHERE m.source = 'live'
-           AND m.type = 'text'
+           AND m.type IN ('text', 'quote')
            AND m.content_text LIKE ?
            AND r.msg_id IS NULL
          ORDER BY m.t ASC
@@ -821,6 +891,16 @@ def _process(
         _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
         return
 
+    # Row may carry quote-reply info; pass through so ChatCommand can inline
+    # what the user 引用ed into the LLM prompt. Other commands ignore it.
+    quoted_text = None
+    quoted_msg_id = None
+    try:
+        quoted_text = row["quote_text"]
+        quoted_msg_id = row["reply_to_wx_msg_id"]
+    except (KeyError, IndexError):
+        pass  # older code path / non-quote source — fields absent
+
     ctx = CommandContext(
         conn=conn,
         llm=llm,
@@ -832,6 +912,8 @@ def _process(
         candidate_limit=settings.dispatcher_candidate_limit,
         candidate_limit_chat=settings.dispatcher_context_chat,
         llm_log_path=llm_log_path,
+        quoted_text=quoted_text,
+        quoted_msg_id=quoted_msg_id,
     )
     try:
         result = parsed.execute(ctx)
@@ -868,7 +950,7 @@ def _skip_backlog(conn: sqlite3.Connection, bot_name: str) -> int:
               FROM messages m
          LEFT JOIN command_runs r ON r.msg_id = m.msg_id
              WHERE m.source = 'live'
-               AND m.type = 'text'
+               AND m.type IN ('text', 'quote')
                AND m.content_text LIKE ?
                AND r.msg_id IS NULL
             """,

@@ -36,7 +36,14 @@ from ..config import settings
 from ..db import get_conn
 from ..models import Message, MsgType
 from .backfill import _MEDIA_TYPES, _WEFLOW_LOCAL_TYPE_MAP
-from .forwarded import FORWARD_LOCAL_TYPE, base_local_type, parse_record_xml
+from .forwarded import (
+    FORWARD_LOCAL_TYPE,
+    appmsg_subtype,
+    base_local_type,
+    format_appmsg_content,
+    parse_quote_reply_xml,
+    parse_record_xml,
+)
 from .writer import write_messages
 
 
@@ -48,15 +55,27 @@ def _api_msg_to_normalized(
 ) -> Message | None:
     """Convert one WeFlow `/api/v1/messages` row to our normalized `Message`.
 
-    The HTTP API response shape (from `toApiMessage`) is intentionally smaller than
-    WeFlow's file-export JSON: no senderDisplayName, no platformMessageId, no quote
-    fields. `members` (wxid -> display name, loaded from /api/v1/group-members at
-    startup) supplies the missing display name; falls back to wxid when missing.
-    Quote/reply detection is deferred (would need to parse `rawContent` XML).
+    WeFlow's HTTP API doesn't pre-parse appmsg-family messages — `content` is
+    the raw XML for those. We branch on `appmsg_subtype` and extract the
+    actual user-visible text:
+      19  → MsgType.FORWARD + child rows in forwarded_records
+      57  → MsgType.QUOTE  with reply text in content_text + refermsg in
+            quote_text / reply_to_wx_msg_id
+      4/5/6/8/51/62/2000/2001 → MsgType.LINK with `[label] title\\nurl` preview
+      其他 49.*  → MsgType.LINK, fallback to raw `content`
+    See forwarded.py module docstring for the subtype map.
+
+    `members` (wxid -> display name, loaded from /api/v1/group-members at
+    startup) supplies the missing display name; falls back to wxid.
     """
     lt = raw.get("localType")
-    if lt == FORWARD_LOCAL_TYPE:
+    sub = appmsg_subtype(lt)
+    if sub == 19:
         msg_type: MsgType | None = MsgType.FORWARD
+    elif sub == 57:
+        msg_type = MsgType.QUOTE
+    elif sub is not None:
+        msg_type = MsgType.LINK   # other appmsg cards
     else:
         msg_type = _WEFLOW_LOCAL_TYPE_MAP.get(base_local_type(lt))
     if msg_type is None:
@@ -70,16 +89,29 @@ def _api_msg_to_normalized(
 
     content_text: str | None = None
     media_path: str | None = None
-    forwarded_items = []
+    forwarded_items: list = []
+    quote_text: str | None = None
+    reply_to_wx_msg_id: str | None = None
+
     if msg_type in _MEDIA_TYPES:
         media_path = raw.get("mediaLocalPath") or raw.get("mediaUrl")
         if not media_path:
             content_text = raw.get("content")
     elif msg_type is MsgType.FORWARD:
         forwarded_items = parse_record_xml(raw.get("rawContent"))
-        # `parsedContent` is empty for record-msg; show a sane preview
-        # so the parent row isn't blank.
-        content_text = raw.get("content") or "[聊天记录]"
+        content_text = "[聊天记录]"
+    elif msg_type is MsgType.QUOTE:
+        parsed = parse_quote_reply_xml(raw.get("rawContent"))
+        if parsed:
+            content_text = parsed.content or None
+            quote_text = parsed.quote_text
+            reply_to_wx_msg_id = parsed.quote_msg_id
+        else:
+            content_text = raw.get("content")
+    elif sub is not None:
+        # link card / file / video card / etc.
+        content_text = format_appmsg_content(raw.get("rawContent"), sub) \
+            or raw.get("content")
     else:
         content_text = raw.get("content")
 
@@ -96,6 +128,8 @@ def _api_msg_to_normalized(
         type=msg_type,
         content_text=content_text,
         media_path=media_path,
+        reply_to_wx_msg_id=reply_to_wx_msg_id,
+        quote_text=quote_text,
         source="live",
         forwarded_items=forwarded_items,
     )

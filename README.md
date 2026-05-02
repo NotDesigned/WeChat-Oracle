@@ -153,7 +153,7 @@ uv run wechat-oracle dispatcher
 @小号 张三最近在忙什么
 ```
 
-> `/find` 和自由问答的检索池**包含合并转发包里的子项**（参见 [合并转发](#合并转发-merged-forward)）。即「张三 2024 年说过的话被 2026 年某人转发进群」也搜得到。
+> `/find` 和自由问答的检索池**包含**：直发文本 + **引用回复**（用户的回复正文）+ **合并转发包里的子项**（详见 [appmsg 子类型](#appmsg-子类型-localtype49-family)）。即「张三 2024 年的话被 2026 年某人转发进群」、「李四引用某人发言后说了啥」都搜得到。
 
 ### 错误反馈
 
@@ -203,12 +203,35 @@ uv run wechat-oracle ingest backfill 群聊_xxx\texts\群聊_xxx.json --format w
 
 媒体缺失时（朋友只发 .json）：导入照常成功，`media_path` 留空，`content_text` 标 `[图片缺失]` / `[语音缺失]` 等。
 
-### 合并转发 (merged-forward)
+### appmsg 子类型 (localType=49 family)
 
-WeFlow 把微信「合并转发的聊天记录」当 `localType = (19 << 32) | 49` 推过来，`rawContent` 里 `<recorditem>` 含完整子消息列表。我们的处理：
+WeChat 把所有 `<appmsg>` 包裹的消息（链接卡片 / 文件 / 视频号 / 红包 / 引用回复 / 合并转发……）都用 `localType=49` 表达，区分靠 XML 里的 `<appmsg>.<type>`。WeFlow 把这个值偷塞进 `localType` 高 32 位：`localType = (appmsg.type << 32) | 49`。
+
+我们对每个 subtype 单独决策（[forwarded.py](src/wechat_oracle/ingest/forwarded.py) 模块 docstring 有完整表）：
+
+| appmsg.type | 含义 | 我们的归类 | content_text |
+|---|---|---|---|
+| 19 | 合并转发的聊天记录 | `forward` + `forwarded_records` 子表 | `[聊天记录]` |
+| **57** | **引用回复**（用户加自己的话回原消息） | **`quote`** | **用户的回复正文（`<title>`）**；`quote_text` 存被引内容、`reply_to_wx_msg_id` 存被引消息的 svrid |
+| 4 / 5 | 链接 / 文章卡片 | `link` | `[链接] 标题\nURL` |
+| 6 | 文件 | `link` | `[文件] 文件名` |
+| 62 | 视频号短视频 | `link` | `[视频号] 标题\nURL` |
+| 51 | 视频号 feed（旧版本不支持） | `link` | `[视频号]` |
+| 8 | 表情商店 / 微信豆 | `link` | `[表情/卡片]` |
+| 2000 | 转账 | `link` | `[转账 ¥99.99] {留言}`（金额 + memo） |
+| 2001 | 红包 | `link` | `[红包: 恭喜发财]`（祝福语） |
+| 其它 | 未识别 appmsg | `link` | `[卡片]` 或 WeFlow 原始 `content` 兜底 |
+
+**`/find` 和 chat 共用一个 `fetch_candidates`，都是全量视野**——所有 type 都进候选池，图片/语音/视频/sticker 缺正文时用 `[图片]`/`[语音]`/`[视频]`/`[表情]` 占位，链接卡片用 `[链接] 标题\nURL`，转账带金额（`[转账 ¥99.99]`），红包带祝福语（`[红包: 恭喜发财]`）。LLM 自己能识别占位符不当作主题词。
+
+唯一差别由 `for_chat` 控制：**chat 模式保留 `@<bot> /xxx` 命令消息**（它们是对话流程的一部分："然后我让 bot 查了 X..."），**`/find` 模式排除**它们（其它人之前的 `/find` 调用不算当前查询的相关信号）。
+
+#### 合并转发的特别处理
+
+合并转发包（appmsg.type=19）的子消息会落进独立的 `forwarded_records` 表：
 
 - 外层 wrapper 落 `messages` 表，`type='forward'`，`content_text='[聊天记录]'`
-- 子项落独立的 `forwarded_records` 表，每行带 `parent_msg_id` 反指 wrapper
+- 子项每行带 `parent_msg_id` 反指 wrapper
 - **dispatcher 检索时把两表 UNION**，候选 ID 加前缀（`m:` 直发消息 / `f:` 转发子项）区分
 - 子项的 `t` 是**原消息时间**（`<srcMsgCreateTime>`），不是被转发进群的时间——`since:2024` 这类查询能正确命中老内容
 

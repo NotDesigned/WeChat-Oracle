@@ -62,9 +62,13 @@ class StdoutReplier:
 
 class Wx4pyReplier:
     """UI-automation backend. `_wx` is the connected wx4py.WeChatClient.
-    Cooperates with our `WO_BOT_NAME` invariant: the dispatcher already
-    verified at startup that wx4py's group_nickname matches WO_BOT_NAME for
-    every watched group."""
+
+    We do NOT verify per-group nickname at startup. The previous check
+    (wx4py.group_manager.get_group_nickname per group) cost 5–30s each via
+    UI tab-walk and was only a soft warning. If you logged into the wrong
+    WeChat account, you'll notice from the WeChat sidebar in seconds —
+    cheaper than the startup tax.
+    """
 
     def __init__(self, wx) -> None:
         self._wx = wx
@@ -102,20 +106,6 @@ class Wx4pyReplier:
                 "Open WeChat's main window (not in tray) and restart dispatcher.", e,
             )
             return None
-
-        # Per-group identity check: warn (don't block) if logged-in account's
-        # group_nickname doesn't match WO_BOT_NAME — usually means wrong account.
-        for group_name in settings.groups:
-            try:
-                actual = wx.group_manager.get_group_nickname(group_name)
-            except Exception:
-                continue
-            if actual and actual != settings.bot_name:
-                logger.warning(
-                    "wx4py: in group {!r} the logged-in account's nickname is {!r}, "
-                    "but WO_BOT_NAME={!r}. Did you log into the wrong account?",
-                    group_name, actual, settings.bot_name,
-                )
         return cls(wx)
 
 
