@@ -8,12 +8,14 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "faster-whisper>=1.2.1",
     "httpx>=0.28.1",
     "loguru>=0.7.3",
     "openai>=1.50.0",
     "pydantic>=2.13.3",
     "pydantic-settings>=2.14.0",
     "qrcode[pil]>=8.2",
+    "rapidocr-onnxruntime>=1.4.4",
     "typer>=0.25.1",
     "wx4py",  # UI-automation backend for sending replies; supports WeChat 4.1.x (Qt)
 ]

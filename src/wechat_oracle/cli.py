@@ -27,9 +27,24 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 ingest_app = typer.Typer(no_args_is_help=True)
 weflow_app = typer.Typer(no_args_is_help=True, help="Inspect what WeFlow's HTTP API exposes (diagnose WO_GROUPS issues, etc.)")
 openclaw_app = typer.Typer(no_args_is_help=True, help="Tencent iLink Bot API experiments (verifying group_id support).")
+worker_app = typer.Typer(no_args_is_help=True, help="Background workers that fill in derived data on messages rows.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
 app.add_typer(openclaw_app, name="openclaw")
+app.add_typer(worker_app, name="worker")
+
+
+@worker_app.command("mm")
+def worker_mm() -> None:
+    """OCR images / ASR voice messages → write into messages.transcript.
+
+    Long-running. Polls newest-first. Models lazy-load on first use:
+    rapidocr-onnxruntime for images, faster-whisper (`small` by default; set
+    WO_WHISPER_MODEL=tiny|base|medium|large-v3 to override) for voice. Both
+    run locally on CPU — no data leaves the machine.
+    """
+    from .worker.mm import run_mm_worker
+    run_mm_worker()
 
 
 @app.command("init-db")

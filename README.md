@@ -13,7 +13,7 @@ A local-first WeChat group-chat archiver with an LLM-backed in-group Q&A assista
 - **群内问答机器人**：在群里 @ 小号，触发以下三类操作
   - `/find <描述>` — 语义检索群历史（DeepSeek 精筛 + 关键词兜底）
   - `/help` — 查命令
-  - **自由问答**（无 `/` 命令）：把最近 5000 条群消息当上下文，让 LLM 直接答
+  - **自由问答**（无 `/` 命令）：把最近 2500 条群消息当上下文，让 LLM 直接答
 - **本地优先**：消息、媒体、调试日志全在 `data/`，无云端依赖（除了 LLM API）
 
 ## 整体架构
@@ -38,12 +38,13 @@ WeChat 客户端 ──► WeFlow（解密本地 DB 提供 HTTP API）
                                   wx4py 把回复打回群里
 ```
 
-三个进程相互独立，跑在 WAL 模式的同一份 SQLite 上：
+四个进程相互独立，跑在 WAL 模式的同一份 SQLite 上：
 
 | 进程 | 职责 | 入口 |
 |---|---|---|
 | `ingest live` | SSE 订阅 + 写库 | `uv run wechat-oracle ingest live` |
 | `dispatcher` | 检测命令 → LLM → 群里回复 | `uv run wechat-oracle dispatcher` |
+| `worker mm` | 后台 OCR / ASR，填 `transcript` | `uv run wechat-oracle worker mm` |
 | `ingest backfill` | 一次性导入历史 | `uv run wechat-oracle ingest backfill <file>` |
 
 ---
@@ -145,7 +146,7 @@ uv run wechat-oracle dispatcher
 
 ### 自由问答兜底
 
-不带 `/` 命令的 @ 消息直接进入兜底：把最近 5000 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。
+不带 `/` 命令的 @ 消息直接进入兜底：把最近 2500 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。
 
 ```
 @小号 谁今天提到了股票？
@@ -153,7 +154,26 @@ uv run wechat-oracle dispatcher
 @小号 张三最近在忙什么
 ```
 
-> `/find` 和自由问答的检索池**包含**：直发文本 + **引用回复**（用户的回复正文）+ **合并转发包里的子项**（详见 [appmsg 子类型](#appmsg-子类型-localtype49-family)）。即「张三 2024 年的话被 2026 年某人转发进群」、「李四引用某人发言后说了啥」都搜得到。
+> `/find` 和自由问答的检索池**包含**：直发文本 + **引用回复**（用户的回复正文）+ **合并转发包里的子项**（详见 [appmsg 子类型](#appmsg-子类型-localtype49-family)）+ **图片/语音的 OCR/ASR 文字**（详见 [多媒体识别](#多媒体识别-worker-mm)）。即「张三 2024 年的话被 2026 年某人转发进群」、「李四引用某人发言后说了啥」、「上周谁分享的那张报表显示啥」都搜得到。
+
+### 多媒体识别 (`worker mm`)
+
+后台进程，把图片 / 语音里的文字识别出来填进 `messages.transcript`，让 dispatcher 检索时能看到内容而不只是 `[图片]` 占位：
+
+- **OCR**：[rapidocr-onnxruntime](https://github.com/RapidAI/RapidOCR)（PP-OCRv4 ONNX，中文友好），CPU 上 ~1s/张
+- **ASR**：[faster-whisper](https://github.com/SYSTRAN/faster-whisper)，默认 `small` 模型，CPU 上接近实时；设 `WO_WHISPER_MODEL=tiny|base|medium|large-v3` 可覆盖
+- 两个模型**全本地跑**，识别内容不出本机
+- 处理顺序：按消息时间倒序（新的优先），队列空时 30s sleep
+- 三种状态：`transcript IS NULL`（待处理）/ `transcript=''`（处理过没识别出文字 / 文件丢了——不重试）/ `transcript='<text>'`（成功）
+- 出口：`fetch_candidates` 的 SQL CASE 优先用 `transcript`，形状 `[图片] <识别文字>` / `[语音] <转录>`，跟 `[链接]` 等占位前缀一脉相承
+
+启动：
+
+```powershell
+uv run wechat-oracle worker mm
+```
+
+> ⚠️ **历史 backfill 行没有 media 文件**：从 WeFlow JSON 导出的图片 / 语音如果没带媒体目录（`media_path IS NULL`），worker 跳过——文件本就在 WeFlow 那边没复制过来，这些行永远空白。**只有 live 抓的（媒体存 WeFlow cache 绝对路径）能识别**。要补全历史，需要重新跑一次带 `media=1` 的 backfill。
 
 ### 错误反馈
 
@@ -292,7 +312,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 `@<bot> <无 / 命令的文本>` → `ChatCommand`：
 
-- 拉最近 `WO_DISPATCHER_CONTEXT_CHAT` 条（默认 5000）群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
+- 拉最近 `WO_DISPATCHER_CONTEXT_CHAT` 条（默认 2500）群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
 - 喂 chat-assistant prompt（强调"宁缺勿编、控制 2-6 句、不复制原文"）
 - 直接把 LLM 回复发回群
 
@@ -319,7 +339,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `stdout`（不发）。openclaw 实测不可用，见下方「实验记录」段 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
-| `WO_DISPATCHER_CONTEXT_CHAT` | `5000` | 自由问答上下文窗口 |
+| `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | 自由问答上下文窗口 |
 
 ---
 
@@ -332,8 +352,9 @@ messages (
     t,              -- unix seconds
     type,           -- text/image/voice/video/link/forward/quote/sticker/system
     content_text,
-    media_path,     -- 相对 data_dir
+    media_path,     -- 相对 data_dir 或绝对（live 走 WeFlow cache）
     reply_to_wx_msg_id, quote_text,
+    transcript,     -- worker mm 写入的 OCR/ASR 文字；NULL=待处理 / ''=处理过没结果 / '<text>'=成功
     source,         -- live / backfill
     status,         -- raw / mm_pending / mm_done / assigned / indexed
     dedupe_key,     -- UNIQUE

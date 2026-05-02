@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS messages (
     media_path          TEXT,           -- relative path under media/ (content-addressed)
     reply_to_wx_msg_id  TEXT,           -- parent's wx_msg_id when this is a quote/reply
     quote_text          TEXT,           -- snippet of quoted msg, when wxauto can't resolve parent id
+    transcript          TEXT,           -- OCR/ASR output for media (image/voice). NULL = not yet processed; '' = processed, no text found
     source              TEXT NOT NULL CHECK (source IN ('live', 'backfill')),
     status              TEXT NOT NULL DEFAULT 'raw'
                         CHECK (status IN ('raw', 'mm_pending', 'mm_done', 'assigned', 'indexed')),

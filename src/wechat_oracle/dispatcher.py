@@ -359,6 +359,7 @@ class ChatCommand(Command):
         reply = chat_assistant(
             ctx.llm, ctx.model, message, context,
             log_path=ctx.llm_log_path,
+            requester=ctx.requester,
         )
         if not reply:
             reply = "（模型没返回内容，再问一次试试）"
@@ -527,6 +528,18 @@ def fetch_candidates(
                         || '[引用 '
                         || COALESCE(orig.sender_display, orig.sender_wxid, '?')
                         || '：' || m.quote_text || ']'
+                   -- OCR/ASR transcript wins for media when worker has filled it.
+                   -- The `·OCR`/`·ASR` suffix tells the LLM "this text was machine-
+                   -- transcribed, not user-typed" — distinct from the bare `[图片]`
+                   -- placeholder which means we don't have content. (See CLAUDE.md F15.)
+                   WHEN m.transcript IS NOT NULL AND m.transcript <> ''
+                   THEN CASE m.type
+                            WHEN 'image'   THEN '[图片·OCR] '
+                            WHEN 'voice'   THEN '[语音·ASR] '
+                            WHEN 'video'   THEN '[视频·识别] '
+                            WHEN 'sticker' THEN '[表情·OCR] '
+                            ELSE '[' || m.type || '·识别] '
+                        END || m.transcript
                    WHEN m.content_text IS NOT NULL AND m.content_text <> ''
                    THEN m.content_text
                    ELSE CASE m.type
@@ -602,6 +615,13 @@ def fetch_candidates(
 # ---------- LLM filter ----------
 
 _SYSTEM_PROMPT = """你是聊天记录精筛助手。根据「查询描述」从「候选消息」里挑出相关条目。
+
+候选行格式约定：
+- 普通文字：正文就是该用户打出来的字
+- `[图片·OCR] 文字内容` / `[语音·ASR] 文字内容` —— 中点后是机器识别出来的内容，**视同该 sender 通过图片/语音表达**，要参与匹配
+- 仅 `[图片]` / `[语音]`（没有 ·OCR / ·ASR 后缀） —— 该消息还没识别或无文字可识别，按"事件"算，匹配不到具体内容
+- `...[引用 X：Y]` —— Y 是被引用消息的内容，连同前面的回复一起匹配
+- `[链接] 标题\\nURL` / `[聊天记录]` / `[卡片消息]` 等 —— 按字面意义理解
 
 排除规则（先判断，命中即跳过该候选）：
 - 命令消息：形如 `@<某机器人> /xxx ...` 这种向机器人发指令的消息，属于操作指令而非被查询者的发言，一律忽略
@@ -739,13 +759,23 @@ def llm_filter(
 
 _CHAT_SYSTEM_PROMPT = """你是这个微信群里的小助手。用户 @ 了你并问了问题/提了话题，你需要结合下面提供的「最近群聊上下文」来作答。
 
-要求：
-- 直接回答，不要说"根据上下文…"、"我看到群里…"这类废话开头
-- 上下文不足时如实说"群里没出现过相关讨论/信息"，不要编
-- 控制在 2-6 句话，避免长篇；可以转述/概括，但别复制大段聊天原文
+上下文行的格式约定（必须读懂，否则会忽略真实内容）：
+- 普通文字：`[id] (时间) 用户:正文`，正文就是该用户打出来的字
+- 引用回复：`...回复正文[引用 原作者：原内容]`，方括号是被引用消息的 sender + 正文
+- **图片识别**：`[图片·OCR] <文字>` —— 中点后的内容是机器从这张图片里识别出来的字（可能是文章截图、表情包字幕、表格、聊天记录截图等）。**视同该 sender 用图片表达**，可以转述、复读、引用。
+- **语音识别**：`[语音·ASR] <文字>` —— 同上，机器从语音里转出来的字。可能不准、可能很短，但**就是用户当时说的话**，应直接转述。
+- 仅 `[图片]` / `[语音]`（不带 ·OCR / ·ASR 后缀）—— 该消息还没识别（图里没字 / 语音太短失败），按"事件"看，不要假设内容。
+- 系统消息：`[id] (时间) ?:对方撤回了一条消息`、入群退群提示等，可作时间线感知；通常不直接回应。
+- 其他来源标签：`[链接] 标题\\nURL`、`[聊天记录]`（合并转发，子项另列）、`[卡片消息]`、`[转账]` 等，按字面意义理解。
+
+回答要求：
+- **直接答**，不要"根据上下文…"、"我看到群里…"这类废话开头
+- 上下文不足或没相关信息时如实说"群里没出现过相关讨论"，不要编
+- **控制 2–6 句**；可转述/概括、可复读 OCR/ASR 出来的文字（这不算"复制聊天原文"——那段字本就是用户通过图片/语音表达的，需要时一字一句念出来也没问题），但**不要**贴大段普通发言原文
 - 中文回答（除非问题明显是英文）
-- 不要在回答里 @ 任何人；不要用 markdown 语法
-- 如果问题本身就跟群无关（"今天天气怎么样"），直接答即可，不要硬扯群聊"""
+- 不要 @ 任何人；不要用 markdown 语法（不要 `**` `#` `-` 这些）
+- 如果问题本身就跟群无关（"今天天气怎么样"），直接答即可，不要硬扯群聊
+- 提到"刚才/刚刚/最近"时，参考下方提供的"当前时间"做时间锚定；用户说"我"/"我刚才说了什么"等指代自己时，参考"提问者"字段定位他在群里的发言"""
 
 
 def chat_assistant(
@@ -754,13 +784,28 @@ def chat_assistant(
     question: str,
     context: list[Candidate],
     log_path: Path | None = None,
+    requester: str | None = None,
 ) -> str:
-    """Free-form group-chat-assistant call. Returns plain text reply."""
+    """Free-form group-chat-assistant call. Returns plain text reply.
+
+    `requester` (the sender's display name) gets a dedicated header line so the
+    LLM can resolve "我" / "我刚才说了啥" against the right rows in `context`.
+    """
     if context:
         ctx_text = _format_candidates_for_llm(context)
     else:
         ctx_text = "（无群聊上下文）"
-    user = f"用户问题：{question}\n\n最近群聊（按时间正序，最旧 → 最新）：\n{ctx_text}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    requester_line = (
+        f"提问者：{requester}（即上下文里 sender == {requester!r} 的那位是「我」）\n"
+        if requester else ""
+    )
+    user = (
+        f"当前时间：{now_str}\n"
+        f"{requester_line}"
+        f"用户问题：{question}\n\n"
+        f"最近群聊（按时间正序，最旧 → 最新）：\n{ctx_text}"
+    )
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -768,6 +813,7 @@ def chat_assistant(
             {"role": "user", "content": user},
         ],
         temperature=0.3,
+        max_tokens=600,  # hard cap; prompt asks for 2-6 句, this allows ~300 中文 chars
     )
     raw = (resp.choices[0].message.content or "").strip()
     if log_path:

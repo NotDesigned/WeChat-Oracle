@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     # Dispatcher loop tunables.
     dispatcher_poll_interval: float = 3.0
     dispatcher_candidate_limit: int = 500   # /find candidates per call
-    dispatcher_context_chat: int = 5000     # @<bot> free-text context window
+    dispatcher_context_chat: int = 2500     # @<bot> free-text context window
 
     # Send the dispatcher's result back into the WeChat group. False = local-
     # only (stdout + log). True = use the backend below.

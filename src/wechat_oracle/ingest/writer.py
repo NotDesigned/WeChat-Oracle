@@ -23,11 +23,11 @@ INSERT_SQL = """
 INSERT OR IGNORE INTO messages (
     wx_msg_id, group_id, group_name, sender_wxid, sender_display,
     t, type, content_text, media_path, reply_to_wx_msg_id, quote_text,
-    source, status, dedupe_key
+    transcript, source, status, dedupe_key
 ) VALUES (
     :wx_msg_id, :group_id, :group_name, :sender_wxid, :sender_display,
     :t, :type, :content_text, :media_path, :reply_to_wx_msg_id, :quote_text,
-    :source, :status, :dedupe_key
+    :transcript, :source, :status, :dedupe_key
 )
 """
 
@@ -51,6 +51,7 @@ def _row(msg: Message) -> dict:
         "media_path": msg.media_path,
         "reply_to_wx_msg_id": msg.reply_to_wx_msg_id,
         "quote_text": msg.quote_text,
+        "transcript": msg.transcript,
         "source": msg.source,
         "status": msg.status.value,
         "dedupe_key": msg.compute_dedupe_key(),

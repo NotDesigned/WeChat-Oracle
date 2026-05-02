@@ -73,6 +73,10 @@ class Message(BaseModel):
     media_path: str | None = None
     reply_to_wx_msg_id: str | None = None
     quote_text: str | None = None
+    # OCR/ASR output, populated by the `worker mm` job. NULL = not yet processed
+    # (worker will pick it up); '' = processed but no text was found (don't
+    # reprocess); '<text>' = the actual transcript.
+    transcript: str | None = None
     source: Literal["live", "backfill"]
     status: Status = Status.RAW
 
