@@ -13,7 +13,7 @@ A local-first WeChat group-chat archiver with an LLM-backed in-group Q&A assista
 - **群内问答机器人**：在群里 @ 小号，触发以下三类操作
   - `/find <描述>` — 语义检索群历史（DeepSeek 精筛 + 关键词兜底）
   - `/help` — 查命令
-  - **自由问答**（无 `/` 命令）：把最近 2000 条群消息当上下文，让 LLM 直接答
+  - **自由问答**（无 `/` 命令）：把最近 5000 条群消息当上下文，让 LLM 直接答
 - **本地优先**：消息、媒体、调试日志全在 `data/`，无云端依赖（除了 LLM API）
 
 ## 整体架构
@@ -145,7 +145,7 @@ uv run wechat-oracle dispatcher
 
 ### 自由问答兜底
 
-不带 `/` 命令的 @ 消息直接进入兜底：把最近 2000 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。
+不带 `/` 命令的 @ 消息直接进入兜底：把最近 5000 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。
 
 ```
 @小号 谁今天提到了股票？
@@ -269,7 +269,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 `@<bot> <无 / 命令的文本>` → `ChatCommand`：
 
-- 拉最近 `WO_DISPATCHER_CONTEXT_CHAT` 条（默认 2000）群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
+- 拉最近 `WO_DISPATCHER_CONTEXT_CHAT` 条（默认 5000）群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
 - 喂 chat-assistant prompt（强调"宁缺勿编、控制 2-6 句、不复制原文"）
 - 直接把 LLM 回复发回群
 
@@ -295,7 +295,7 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_REPLY` | `True` | 是否自动回群里 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
-| `WO_DISPATCHER_CONTEXT_CHAT` | `2000` | 自由问答上下文窗口 |
+| `WO_DISPATCHER_CONTEXT_CHAT` | `5000` | 自由问答上下文窗口 |
 
 ---
 
