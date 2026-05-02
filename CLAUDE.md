@@ -1,4 +1,45 @@
-# Project notes for Claude
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 架构一句话
+
+三个独立进程（`ingest live` / `dispatcher` / `ingest backfill`）共享一份 WAL 模式的 SQLite (`data/wechat-oracle.db`)。**WeFlow 的 HTTP API 是上游唯一真相源**——live 走 SSE 推流，backfill 导 WeFlow JSON 导出，没有路径直连微信原始 DB。dispatcher 轮询 DB，命中 `@<bot>` 文本后过 DeepSeek，再用 wx4py（Windows UI 自动化）把回复打回群。
+
+数据形态：`messages`（主表）+ `forwarded_records`（合并转发子项，`parent_msg_id` 反指）+ `command_runs`（dispatcher 幂等记录，`msg_id` 主键）。所有写入路径必须走 `ingest/writer.py:write_messages`，靠 `UNIQUE(dedupe_key)` 跨源去重。详细字段语义看 `schema.sql`（DDL 行级注释是主源）+ `models.py` docstring。
+
+## 常用命令
+
+依赖管理 / 装环境（项目用 `uv`，Python ≥ 3.12）：
+
+```bash
+uv sync                                # 装依赖
+uv run wechat-oracle init-db           # 建表（幂等，每次跑前先来一遍也无所谓）
+uv run wechat-oracle status            # 查总条数 / 按 status / 按群分布——快速 health check
+```
+
+三个长跑 / 一次性进程（生产路径上 `live` + `dispatcher` 同时常驻）：
+
+```bash
+uv run wechat-oracle ingest live                                 # SSE 实时抓 → DB
+uv run wechat-oracle dispatcher                                  # DB 轮询 → LLM → wx4py 回群
+uv run wechat-oracle ingest backfill <path.json> --format weflow # 一次性导入 WeFlow JSON 导出
+```
+
+诊断 `WO_GROUPS` 解析（群名找不到对应 wxid 时用）：
+
+```bash
+uv run wechat-oracle weflow find <群名 / 备注 / wxid 片段>   # 同时查 contacts + sessions
+uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chatroom 会话
+```
+
+封装好的 wrapper（POSIX）：`scripts/import.sh <export.json>` / `scripts/track.sh`；Windows 对应 `.bat` 同名文件。
+
+**测试 / lint：本项目当前没有 pytest、ruff、mypy 或任何 CI 配置**——`pyproject.toml` 里没有 dev-dependencies 段，仓库里也没有 `tests/`。改代码要自验，靠跑上面那几条 + 看 `data/dispatcher.log` / `data/llm_debug.log`。要加单测的话先和用户对一下要不要顺便引一套 pytest。
+
+## 平台前提
+
+**生产环境是 Windows + 中文 WeChat 4.1.x（Qt 版）+ WeFlow 桌面端**——wx4py 走 UI 自动化只在 Windows 工作，dispatcher 的「发回群」分支在 macOS/Linux 上跑不起来。但**导入 / 查询 / DB 操作（init-db / backfill / status / weflow find）跨平台**，本仓库的 dev worktree 多半就在 macOS 上。改 dispatcher 时如果 Windows 不在手边，至少要确保 `parse_command` / SQL 构造 / LLM 调用这些纯逻辑路径能在本地手动 invoke 验证。
 
 ## 文档导航（新会话先读这段）
 
