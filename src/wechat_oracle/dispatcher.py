@@ -1116,7 +1116,7 @@ def llm_filter(
     return LLMFilterResult(hits=hits, keywords=keywords, reason=reason_text)
 
 
-_CHAT_SYSTEM_PROMPT = """你是这个微信群里的小助手。用户 @ 了你并问了问题/提了话题，你需要结合下面提供的「最近群聊上下文」来作答。
+_CHAT_SYSTEM_PROMPT_BASE = """你是这个微信群里的小助手。用户 @ 了你并问了问题/提了话题，你需要结合下面提供的「最近群聊上下文」来作答。
 
 上下文行的格式约定（必须读懂，否则会忽略真实内容）：
 - 普通文字：`[id] (时间) 用户:正文`，正文就是该用户打出来的字
@@ -1135,13 +1135,27 @@ _CHAT_SYSTEM_PROMPT = """你是这个微信群里的小助手。用户 @ 了你�
 - 中文回答（除非问题明显是英文）
 - 不要 @ 任何人；不要用 markdown 语法（不要 `**` `#` `-` 这些）
 - 如果问题本身就跟群无关（"今天天气怎么样"），直接答即可，不要硬扯群聊
-- 提到"刚才/刚刚/最近"时，参考下方提供的"当前时间"做时间锚定；用户说"我"/"我刚才说了什么"等指代自己时，参考"提问者"字段定位他在群里的发言
+- 提到"刚才/刚刚/最近"时，参考下方提供的"当前时间"做时间锚定；用户说"我"/"我刚才说了什么"等指代自己时，参考"提问者"字段定位他在群里的发言"""
+
+_CHAT_SYSTEM_PROMPT_VISION_TAIL = """
 
 需要看原图时（仅当 `[图片·OCR]` 文本明显残缺/截断、或仅有 `[图片]` 占位但用户在直接问那张图）：
-- 在你最终回答的**末尾**追加一行：`<NEED_IMAGES>id1,id2</NEED_IMAGES>`，里面填写要看原图的那几条 cand_id（即每行开头方括号里的 `c<数字>`，最多 3 个）
+- 在你最终回答的**末尾**追加一行：`<NEED_IMAGES>id1,id2</NEED_IMAGES>`，里面填写要看原图的那几条 cand_id（即每行开头方括号里的 `m:<数字>`，最多 3 个；`f:<...>` 转发子项的图取不到，不要选）
 - 系统会取出原图喂给一个视觉模型，由它出最终回答覆盖你这一轮
 - OCR 文本已经够回答问题就**不要**输出这个标签——会浪费一次调用
 - 不要无中生有 cand_id；只能从上下文真实出现的方括号 id 里挑"""
+
+# Back-compat: old name kept since other code may still reference it (logs etc.).
+_CHAT_SYSTEM_PROMPT = _CHAT_SYSTEM_PROMPT_BASE + _CHAT_SYSTEM_PROMPT_VISION_TAIL
+
+
+def _build_chat_system_prompt(vision_available: bool) -> str:
+    """Vision off → strip the NEED_IMAGES instructions so the model doesn't
+    promise the user "我看一下原图" and then never deliver (the python side
+    silently drops the sentinel when no vision client is configured)."""
+    if vision_available:
+        return _CHAT_SYSTEM_PROMPT_BASE + _CHAT_SYSTEM_PROMPT_VISION_TAIL
+    return _CHAT_SYSTEM_PROMPT_BASE
 
 
 _NEED_IMAGES_RE = re.compile(r"<NEED_IMAGES>([^<]*)</NEED_IMAGES>")
@@ -1239,9 +1253,11 @@ def chat_assistant(
         f"用户问题：{question}\n\n"
         f"最近群聊（按时间正序，最旧 → 最新）：\n{ctx_text}"
     )
+    vision_available = vision is not None and conn is not None
+    system_prompt = _build_chat_system_prompt(vision_available)
     raw = client.complete_text(
         model=model,
-        system=_CHAT_SYSTEM_PROMPT,
+        system=system_prompt,
         user=user,
         temperature=0.3,
         max_tokens=settings.chat_max_tokens,
@@ -1250,14 +1266,14 @@ def chat_assistant(
         _dump_llm_call(
             log_path,
             label=f"chat  ::  {question}",
-            system=_CHAT_SYSTEM_PROMPT,
+            system=system_prompt,
             user=user,
             raw=raw,
             parsed=None,
         )
 
     cleaned, requested_ids = _extract_need_images(raw)
-    if not (vision and conn is not None and requested_ids):
+    if not (vision_available and requested_ids):
         return cleaned
 
     paths = _resolve_image_paths(conn, requested_ids)[:vision_max_images]
