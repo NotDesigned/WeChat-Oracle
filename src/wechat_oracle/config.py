@@ -56,6 +56,25 @@ class Settings(BaseSettings):
     dispatcher_candidate_limit: int = 500   # /find candidates per call
     dispatcher_context_chat: int = 2500     # @<bot> free-text context window
 
+    # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
+    # long-context chat/summaries breathe while keeping short utility commands cheap.
+    llm_max_tokens: int = 1000
+    llm_chat_max_tokens: int | None = None
+    llm_sum_max_tokens: int | None = None
+    llm_short_max_tokens: int | None = None
+
+    @property
+    def chat_max_tokens(self) -> int:
+        return self.llm_chat_max_tokens or self.llm_max_tokens
+
+    @property
+    def sum_max_tokens(self) -> int:
+        return self.llm_sum_max_tokens or self.llm_max_tokens
+
+    @property
+    def short_max_tokens(self) -> int:
+        return self.llm_short_max_tokens or min(self.llm_max_tokens, 800)
+
     # Send the dispatcher's result back into the WeChat group. False = local-
     # only (stdout + log). True = use the backend below.
     reply: bool = True

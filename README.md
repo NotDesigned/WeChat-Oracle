@@ -89,6 +89,7 @@ WO_BOT_NAME=<小号在群里的群昵称>
 WO_LLM_API_KEY=sk-...
 # WO_LLM_ENDPOINT=https://api.deepseek.com
 # WO_LLM_MODEL=deepseek-v4-pro
+# WO_LLM_MAX_TOKENS=1000               # 默认输出上限；chat/sum/short 可分别覆盖
 # WO_REPLY=0                           # 默认 1 = 自动回到群里；0 = 只本地输出
 ```
 
@@ -397,6 +398,10 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_LLM_ENDPOINT` | `https://api.deepseek.com` | OpenAI 兼容端点；供应商要求时带 `/v1` |
 | `WO_LLM_MODEL` | `deepseek-v4-pro` | 模型名 |
 | `WO_LLM_JSON_MODE` | `native` | `/find` JSON 返回模式：`native` 传 `response_format`，`prompt` 只靠 prompt 约束 |
+| `WO_LLM_MAX_TOKENS` | `1000` | LLM 输出 token 上限默认值 |
+| `WO_LLM_CHAT_MAX_TOKENS` | — | 自由问答输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
+| `WO_LLM_SUM_MAX_TOKENS` | — | `/sum` 输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
+| `WO_LLM_SHORT_MAX_TOKENS` | — | `/ask` / `/explain` 输出上限；不设则用 `min(WO_LLM_MAX_TOKENS, 800)` |
 | `WO_REPLY` | `True` | 是否自动回群里 |
 | `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `stdout`（不发）。openclaw 实测不可用，见下方「实验记录」段 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |

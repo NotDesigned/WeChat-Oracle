@@ -425,7 +425,7 @@ class AskCommand(Command):
             system=_ASK_SYSTEM_PROMPT,
             user=user,
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=settings.short_max_tokens,
         )
         if not reply:
             reply = "（模型没返回内容，再问一次试试）"
@@ -646,7 +646,7 @@ class ExplainCommand(Command):
             system=_EXPLAIN_SYSTEM_PROMPT,
             user=user,
             temperature=0.2,
-            max_tokens=800,
+            max_tokens=settings.short_max_tokens,
         )
         if not reply:
             reply = "（模型没返回内容，再问一次试试）"
@@ -1134,7 +1134,7 @@ def chat_assistant(
         system=_CHAT_SYSTEM_PROMPT,
         user=user,
         temperature=0.3,
-        max_tokens=1000,  # hard cap; prompt asks for 2-6 句, this allows ~300 中文 chars
+        max_tokens=settings.chat_max_tokens,
     )
     if log_path:
         _dump_llm_call(
@@ -1165,7 +1165,7 @@ def summarize_chat(
         system=_SUM_SYSTEM_PROMPT,
         user=user,
         temperature=0.2,
-        max_tokens=1200,
+        max_tokens=settings.sum_max_tokens,
     )
     if log_path:
         _dump_llm_call(
