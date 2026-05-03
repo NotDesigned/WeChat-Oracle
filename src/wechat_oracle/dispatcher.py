@@ -430,7 +430,14 @@ class AskCommand(Command):
     def execute(self, ctx: CommandContext) -> ExecResult:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         requester_line = f"提问者：{ctx.requester}\n" if ctx.requester else ""
-        user = f"当前时间：{now_str}\n{requester_line}用户问题：{self.question}"
+        # If the user 引用ed a message while invoking /ask, inline the quoted
+        # text so it's part of the question. Without this the quote is lost
+        # and "/ask 这句话什么意思" gets answered against thin air.
+        quoted_line = (
+            f"用户引用了一条消息：{ctx.quoted_text.strip()}\n"
+            if ctx.quoted_text and ctx.quoted_text.strip() else ""
+        )
+        user = f"当前时间：{now_str}\n{requester_line}{quoted_line}用户问题：{self.question}"
         reply = ctx.llm.complete_text(
             model=ctx.model,
             system=_ASK_SYSTEM_PROMPT,
@@ -449,7 +456,8 @@ class AskCommand(Command):
                 raw=reply,
                 parsed=None,
             )
-        logger.info("ask :: {!r}  reply_len={}", self.question[:60], len(reply))
+        logger.info("ask :: {!r}  quoted={}  reply_len={}",
+                    self.question[:60], bool(quoted_line), len(reply))
         stdout = f"/ask  ::  {self.question}\n  ({len(reply)} chars)\n{reply}"
         return ExecResult(stdout=stdout, chat=reply, summary=f"ask ({len(reply)} chars)")
 
