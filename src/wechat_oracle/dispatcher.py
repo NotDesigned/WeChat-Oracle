@@ -1642,20 +1642,27 @@ def _process_agent_only(
         # via ctx.quoted_text and the agent prompt already inlines it.
         user_question = text or "（用户引用了你之前的话但没说什么）"
     else:  # probability
-        # Frame for stay-silent-by-default. The previous "要不要插一句话" was
-        # a question to the model and biased it toward at least saying
-        # SOMETHING; swap it for an observation + an explicit list of the
-        # only valid reasons to chime in.
+        # You are a member of this group; the dice gave you a chance to chime
+        # in. Permissive framing — the bot decides based on whether the
+        # message gives it something to say, not on a checklist of "valid"
+        # triggers. Earlier "默认你不说话 + 4 个白名单" was over-suppressing
+        # (~91% silent rate) and missed natural participation moments.
         user_question = (
             f"群里出现了一条消息：「{text or '（非文本消息）'}」\n\n"
-            "**默认你不说话**——群友的对话不需要 bot 介入。"
-            " 只在以下情况才考虑回应：\n"
-            "  1. 群里在问的事你恰好知道答案，且没人答上来\n"
-            "  2. 出现明显事实错误你能修正\n"
-            "  3. 是你之前提过 / 关心的话题的延续，且你有新东西要补\n"
-            "  4. 群里出现需要你之前帮过/答过类似问题的延续讨论\n"
-            "其他一律 stay_silent。"
-            " 不确定就 stay_silent——宁可不说，不要刷存在感。"
+            "你是这个群的成员，刚好「看到」了这条消息。判断要不要接茬：\n\n"
+            "**值得说一句**（任何一类都可以）：\n"
+            " - 你恰好知道答案、能补一个事实、能给出有用的角度\n"
+            " - 看到明显错误能修正\n"
+            " - 之前关心 / 提过 / 帮过的话题在延续，你有新东西可补\n"
+            " - 群友的发言能让你想到一个真有信息量的回应、观察、记忆、玩梗\n"
+            " - 群友间的互动里你能加点新的，而不是复读已有内容\n\n"
+            "**不值得说**（这些 stay_silent）：\n"
+            " - 纯反应（同意 / 笑 / 表情接龙 / 复读别人的话）\n"
+            " - 群友间的私事、技术协调、他们自己能搞定的事\n"
+            " - 你想到的内容只是「接个话」而没有实质信息\n"
+            " - 另一个 bot 已经接了，你再说就是叠音\n\n"
+            "判断标准是「我说这句话有没有信息量」，不是「是否被点名」。"
+            "不被 @ 也可以发言，但发言必须值得发——别为了刷存在感占麦。"
         )
 
     if kind == "reply":
