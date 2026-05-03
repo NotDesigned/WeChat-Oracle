@@ -1545,6 +1545,7 @@ def chat_via_agent(
     from .agent.runtime import run_agent
     from .agent.tools import GroupScopedTools
     from .agent.tools_read import register_phase_a_tools
+    from .agent.tools_write import phase_b_system_prompt, register_phase_b_tools
 
     started_at = time.time()
     recent_rows = _fetch_recent_for_agent(
@@ -1590,19 +1591,27 @@ def chat_via_agent(
         bot_name=ctx.bot_name, group_name=ctx.group_name
     )
 
-    # Phase B (write tools) lands in commit 5 — pass write_tools=None so
-    # run_agent skips reflection regardless of WO_AGENT_REFLECTION_ENABLED.
+    write_tools: GroupScopedTools | None = None
+    phase_b_system: str | None = None
+    if settings.agent_reflection_enabled:
+        write_tools = GroupScopedTools(
+            conn=ctx.conn, group_id=ctx.group_id,
+            group_name=ctx.group_name, bot_name=ctx.bot_name,
+        )
+        register_phase_b_tools(write_tools)
+        phase_b_system = phase_b_system_prompt()
+
     result = run_agent(
         llm=ctx.llm,  # type: ignore[arg-type]  # OpenAICompatLLM satisfies ToolingLLM structurally
         model=ctx.model,
         phase_a_system=system_prompt,
         phase_a_user=user_msg,
         read_tools=read_tools,
-        write_tools=None,
-        phase_b_system=None,
+        write_tools=write_tools,
+        phase_b_system=phase_b_system,
         max_steps=settings.agent_max_steps,
         reflect_max_steps=settings.agent_reflect_max_steps,
-        reflection_enabled=False,
+        reflection_enabled=settings.agent_reflection_enabled,
         temperature=0.5,
         max_tokens=settings.chat_max_tokens,
     )
