@@ -92,6 +92,13 @@ WO_LLM_API_KEY=sk-...
 # WO_LLM_MODEL=deepseek-v4-pro
 # WO_LLM_MAX_TOKENS=1000               # 默认输出上限；chat/sum/short 可分别覆盖
 # WO_REPLY=0                           # 默认 1 = 自动回到群里；0 = 只本地输出
+
+# 视觉模型（可选 — 让 chat / /explain / /ask 能读图原文，详见「视觉模型集成」段）
+# WO_VISION_API_KEY=sk-...             # DashScope 兼容 key；空 = 关闭功能，纯 OCR 文本
+# WO_VISION_MODEL=qwen-vl-plus         # 默认；强推荐 qwen3-vl-plus 或 qwen3.6-plus（OCR 更强）
+
+# 多媒体识别（可选 — worker mm 进程的 ASR 模型档位）
+# WO_WHISPER_MODEL=small               # tiny|base|small|medium|large-v3，默认 small
 ```
 
 ### 3. 建库
@@ -102,7 +109,7 @@ uv run wechat-oracle init-db
 
 ### 4. 跑
 
-三个终端分别跑：
+四个终端分别跑（worker mm 可选，但群里图片/语音不少时强烈建议开）：
 
 ```powershell
 # Terminal 1 — 实时抓
@@ -111,12 +118,18 @@ uv run wechat-oracle ingest live
 # Terminal 2 — 命令调度（自动回复）
 uv run wechat-oracle dispatcher
 
-# Terminal 3 — 用大号在群里 @ 小号
+# Terminal 3 — OCR / ASR 后台识别（图片→文字、语音→转录，写进 messages.transcript）
+uv run wechat-oracle worker mm
+
+# Terminal 4 — 用大号在群里 @ 小号
 # @<小号> /help
 # @<小号> 谁今天提到了股票？
+# @<小号> 引用某条图片消息后 → /explain 或 /ask 这是什么
 ```
 
-> 要让自动回复工作，**WeChat 主窗口必须可见**（不能在托盘里）。dispatcher 启动时会用 wx4py 的 `get_group_nickname` 验证当前登录账号在每个群的昵称，跟 `WO_BOT_NAME` 对不上时 warning（不阻断；可能你登错号了）。
+> - **要让自动回复工作，WeChat 主窗口必须可见**（不能在托盘里）。dispatcher 启动时会用 wx4py 的 `get_group_nickname` 验证当前登录账号在每个群的昵称，跟 `WO_BOT_NAME` 对不上时 warning（不阻断；可能你登错号了）。
+> - **`worker mm` 首次跑会下载 RapidOCR / faster-whisper 模型权重**（几十 MB ~ 几 GB，看 `WO_WHISPER_MODEL` 档位），之后启动很快。
+> - **配了 `WO_VISION_API_KEY` 后才有图片直读能力**——chat 自由问答会自动二轮兜底 OCR 残缺的截图，`/explain` 和 `/ask` 引用图片时会把字节直接喂视觉模型。没配也能跑，但群里图片只看得到 OCR 文本（残的就是残的）。
 
 ---
 
@@ -236,20 +249,37 @@ uv run wechat-oracle worker mm
 
 > ⚠️ **历史 backfill 行没有 media 文件**：从 WeFlow JSON 导出的图片 / 语音如果没带媒体目录（`media_path IS NULL`），worker 跳过——文件本就在 WeFlow 那边没复制过来，这些行永远空白。**只有 live 抓的（媒体存 WeFlow cache 绝对路径）能识别**。要补全历史，需要重新跑一次带 `media=1` 的 backfill。
 
-#### 视觉模型二轮兜底（可选）
+#### 视觉模型集成（可选）
 
-`worker mm` 的离线 OCR 是**检索的主索引**——所有历史问答都依赖 `transcript` 文本。但 PP-OCRv4 在截图模糊、表格、手写、复杂版面这些场景下会漏字。开启 `WO_VISION_API_KEY` 后，`@<bot>` 自由问答走**二轮兜底**：
+`worker mm` 的离线 OCR 是**检索的主索引**——所有历史问答都依赖 `transcript` 文本。但 PP-OCRv4 在截图模糊、表格、手写、复杂版面这些场景下会漏字。开启 `WO_VISION_API_KEY` 后，dispatcher **三个入口**都能直接读图：
 
-1. 第一轮：文本主模型（`WO_LLM_MODEL`）按 `transcript` 文本回答；如果 `[图片·OCR] <字>` 残缺/截断，会在回答末尾输出 `<NEED_IMAGES>m:12,m:47</NEED_IMAGES>` 列出要看的图
+**1. chat 自由问答（无 / 命令）→ 二轮 sentinel 协议**
+
+模型自己决定要不要看图：
+1. 第一轮：文本主模型（`WO_LLM_MODEL`）按 `transcript` 文本回答；OCR 残缺/截断时在回答末尾输出 `<NEED_IMAGES>m:12,m:47</NEED_IMAGES>` 列出要看的图
 2. 第二轮：python 解析这些 cand_id → 取文件字节 → 喂视觉模型（默认 Qwen-VL-Plus via DashScope）→ 它的回答覆盖第一轮
 
-特点：
-- **完全可插拔**：`WO_VISION_API_KEY` 为空时整个二轮关闭，行为跟今天一样（纯文本）
-- **决策权在模型**：第一轮模型自己判断 OCR 够不够用——OCR 命中关键字就直答，残缺才挂图
-- **硬上限 `WO_VISION_MAX_IMAGES=3`**：模型多挑也只取前 3 张，防止失控烧钱
-- **降级安全**：图文件不存在 / 视觉调用失败 → 用第一轮答案兜底，用户感知不到
-- **只在 chat 起作用**：`/find` `/sum` `/recent` 不走视觉，永远纯文本（cand_id 列表用不着图）
+适合你不知道用户问的是哪张图、需要模型自己从 2500 条候选里挑的场景。
+
+**2. `/explain` 引用图 → 单轮直读**
+
+用户已经明确指定了哪条消息，跳过 sentinel：图片字节直接喂视觉模型，按 `/explain` 的「简明解释」语气作答。
+
+**3. `/ask` 引用图 → 单轮直读**
+
+同 `/explain` 但走 `/ask` 的「轻量问答」语气；适合「翻译这张图里的文字」「这道题怎么解」「这个截图的报错什么意思」。
+
+**通用特性**：
+- **完全可插拔**：`WO_VISION_API_KEY` 为空时整个 vision 功能关闭，chat / explain / ask 都退化成纯文本（chat 自由问答看到 `[图片·OCR]` 文本，explain / ask 看到 `[图片]` 占位）
+- **硬上限 `WO_VISION_MAX_IMAGES=3`**（仅 chat 二轮）：模型多挑也只取前 3 张，防止失控烧钱
+- **降级安全**：图文件不存在 / 视觉调用失败 → 用第一轮答案 / 兜底文案，用户感知不到
+- **只在用户明确问图时起作用**：`/find` / `/sum` / `/recent` 不走视觉，永远纯文本
 - **`f:` 转发子项不挂图**：合并转发包里的图片不下载到本地，模型挑 `f:N` 会被静默丢弃
+
+**模型选择**（`WO_VISION_MODEL`）：
+- `qwen-vl-plus`（默认，Qwen2.5-VL）— 便宜，普通截图够用
+- `qwen3-vl-plus` — Qwen3-VL，OCR / 文档解析显著更强，**生产推荐**
+- `qwen3.6-plus` — 最新最强，复杂版面 / 数学公式 / 手写时再考虑
 
 ### 错误反馈
 
@@ -392,7 +422,8 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 - 拉最近 `WO_DISPATCHER_CONTEXT_CHAT` 条（默认 2500）群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
 - 喂 chat-assistant prompt（强调"宁缺勿编、控制 2-6 句、不复制原文"）
-- 直接把 LLM 回复发回群
+- 配了 `WO_VISION_API_KEY` 时，prompt 末尾会附加二轮 sentinel 指令；模型判断 OCR 不够用时输出 `<NEED_IMAGES>m:N,...</NEED_IMAGES>`，python 提取 → 取原图字节 → 喂视觉模型重答覆盖第一轮（详见上方「视觉模型集成」段）
+- 直接把最终回复发回群
 
 ### 纯模型问答
 
@@ -400,14 +431,16 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 - 不查 DB，不调用 `fetch_candidates`
 - 不塞最近群聊上下文，只发送当前问题和当前时间
+- 引用文本/链接消息 → 内容前置进 prompt
+- 引用图片 + `WO_VISION_API_KEY` 配着 → 单轮直读（字节喂视觉模型，跳过文本路径）
 - 适合通用知识、翻译、改写、生成短文本，token 成本固定且更低
 
-### 摘要 / 最近消息 / 解释
+### 摘要 / 最近消息 / 余额 / 解释
 
 - `@<bot> /sum ...` → `SumCommand`：复用 `fetch_candidates`，只看当前群，可用 `from:` / `since:` / `limit:` 收窄后让 LLM 总结
 - `@<bot> /recent [N]` → `RecentCommand`：复用 `fetch_candidates`，但不调用 LLM，直接渲染最近消息
 - `@<bot> /balance` → `BalanceCommand`：不调用 LLM，GET `<WO_LLM_ENDPOINT root>/user/balance` 查询账号余额
-- `@<bot> /explain ...` → `ExplainCommand`：不查 DB；优先解释当前引用消息，否则解释命令后文本
+- `@<bot> /explain ...` → `ExplainCommand`：不查 DB；引用图片 + vision 配着走单轮直读（同 `/ask`），否则解释引用文本或命令后文本
 
 ---
 
@@ -445,6 +478,7 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_VISION_MODEL` | `qwen-vl-plus` | 视觉模型名 |
 | `WO_VISION_MAX_IMAGES` | `3` | 单次 vision 请求最多附几张图（防失控烧钱） |
 | `WO_VISION_MAX_TOKENS` | `800` | 视觉调用输出上限 |
+| `WO_WHISPER_MODEL` | `small` | `worker mm` 的 ASR 档位：`tiny`/`base`/`small`/`medium`/`large-v3`；越大越准越慢越占内存 |
 
 ---
 
@@ -532,7 +566,7 @@ uv run wechat-oracle openclaw send --group-id "<x@chatroom>" "x" # 群发实验
 - **wx4py 跟微信版本耦合**——4.1.x 测过，再后续版本可能要等 wx4py 跟进
 - **dedupe 边缘情况**：没有 `wx_msg_id` 的消息（系统消息等）走 fallback 哈希；media 消息两条管道编码不同（live 用 `mediaLocalPath` 原值，backfill 用相对路径）→ 同一条可能重复
 - **live 启动前的消息抓不到**——历史只能靠 backfill；自由问答兜底受此影响（启动后才有 context）
-- **图片 / 语音 / 视频** 目前只存路径不做内容理解（OCR / ASR / caption 都没接）
+- **视频**：只存路径不识别内容（caption / 视频帧理解都没接）；图片走 `worker mm` 的 OCR + 可选 vision 二轮，语音走 worker mm 的 ASR
 
 ---
 
@@ -585,6 +619,9 @@ src/wechat_oracle/
 - [WeFlow](https://github.com/hicccc77/WeFlow) — 解密本地 WeChat DB 并提供 HTTP API
 - [wx4py](https://github.com/claw-codes/wx4py) — Windows UI 自动化驱动 WeChat
 - [DeepSeek](https://api.deepseek.com) — 默认示例 LLM endpoint（OpenAI 兼容）
+- [DashScope / Qwen-VL](https://help.aliyun.com/zh/model-studio/) — 默认视觉模型 endpoint（OpenAI 兼容）
+- [RapidOCR](https://github.com/RapidAI/RapidOCR) — 本地 PP-OCRv4 ONNX，`worker mm` 的 OCR
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — 本地 ASR，`worker mm` 的语音转录
 - [uv](https://docs.astral.sh/uv/) — 飞快的 Python 依赖管理
 
 ## License
