@@ -19,7 +19,7 @@ import typer
 from loguru import logger
 
 from .config import settings
-from .db import get_conn, init_db
+from .db import get_conn, init_db, transaction
 from .ingest.backfill import import_file
 from .ingest.writer import write_messages
 
@@ -29,11 +29,13 @@ weflow_app = typer.Typer(no_args_is_help=True, help="Inspect what WeFlow's HTTP 
 openclaw_app = typer.Typer(no_args_is_help=True, help="Tencent iLink Bot API experiments (verifying group_id support).")
 worker_app = typer.Typer(no_args_is_help=True, help="Background workers that fill in derived data on messages rows.")
 verify_app = typer.Typer(no_args_is_help=True, help="Health checks for the dispatch pipeline.")
+agent_app = typer.Typer(no_args_is_help=True, help="Inspect & manage agent memory (persona_drift / group_memory / run logs).")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
 app.add_typer(openclaw_app, name="openclaw")
 app.add_typer(worker_app, name="worker")
 app.add_typer(verify_app, name="verify")
+app.add_typer(agent_app, name="agent")
 
 
 @verify_app.command("roundtrip")
@@ -156,6 +158,123 @@ def dispatcher_cmd() -> None:
     """
     from .dispatcher import run_dispatcher
     run_dispatcher()
+
+
+# --- agent memory inspection ----------------------------------------------
+
+
+@agent_app.command("show")
+def agent_show(
+    group_id: str = typer.Argument(..., help="messages.group_id of the target group"),
+) -> None:
+    """Dump persona_drift + group_memory for one group (read-only)."""
+    from datetime import datetime
+    init_db()
+    with get_conn() as conn:
+        drift = conn.execute(
+            "SELECT drift_text, updated_at, last_run_id FROM persona_drift WHERE group_id=?",
+            (group_id,),
+        ).fetchone()
+        memory = conn.execute(
+            "SELECT notes_text, size_chars, updated_at, last_run_id FROM group_memory WHERE group_id=?",
+            (group_id,),
+        ).fetchone()
+
+    typer.echo(f"=== group_id={group_id!r} ===\n")
+    typer.echo("--- persona_drift ---")
+    if drift is None or not (drift["drift_text"] or "").strip():
+        typer.echo("(empty)\n")
+    else:
+        ts = datetime.fromtimestamp(drift["updated_at"]).strftime("%Y-%m-%d %H:%M") if drift["updated_at"] else "?"
+        typer.echo(f"updated_at={ts}  last_run_id={drift['last_run_id'] or '?'}")
+        typer.echo(drift["drift_text"])
+        typer.echo("")
+
+    cap = settings.agent_memory_max_chars
+    typer.echo(f"--- group_memory (cap {cap} chars) ---")
+    if memory is None or not (memory["notes_text"] or "").strip():
+        typer.echo("(empty)\n")
+    else:
+        ts = datetime.fromtimestamp(memory["updated_at"]).strftime("%Y-%m-%d %H:%M") if memory["updated_at"] else "?"
+        size = memory["size_chars"] or 0
+        pct = size * 100 // cap if cap else 0
+        typer.echo(
+            f"updated_at={ts}  last_run_id={memory['last_run_id'] or '?'}  "
+            f"size={size} chars ({pct}% of cap)"
+        )
+        typer.echo(memory["notes_text"])
+
+
+@agent_app.command("wipe")
+def agent_wipe(
+    group_id: str = typer.Argument(..., help="messages.group_id of the target group"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    persona_only: bool = typer.Option(False, "--persona-only", help="Wipe persona_drift only, keep group_memory"),
+    memory_only: bool = typer.Option(False, "--memory-only", help="Wipe group_memory only, keep persona_drift"),
+) -> None:
+    """Clear persona_drift and/or group_memory for one group. Destructive —
+    bot resets to its defaults in this group. agent_run_log is NOT touched
+    (audit trail stays).
+    """
+    if persona_only and memory_only:
+        typer.echo("⚠️  --persona-only and --memory-only are mutually exclusive")
+        raise typer.Exit(1)
+    targets = []
+    if not memory_only:
+        targets.append("persona_drift")
+    if not persona_only:
+        targets.append("group_memory")
+    if not yes:
+        typer.echo(f"about to clear {', '.join(targets)} for group_id={group_id!r}")
+        confirm = typer.confirm("proceed?")
+        if not confirm:
+            typer.echo("aborted")
+            raise typer.Exit(0)
+    init_db()
+    with get_conn() as conn:
+        with transaction(conn):
+            if "persona_drift" in targets:
+                conn.execute("DELETE FROM persona_drift WHERE group_id=?", (group_id,))
+            if "group_memory" in targets:
+                conn.execute("DELETE FROM group_memory WHERE group_id=?", (group_id,))
+    typer.echo(f"wiped: {', '.join(targets)}")
+
+
+@agent_app.command("show-runs")
+def agent_show_runs(
+    group_id: str = typer.Argument(..., help="messages.group_id of the target group"),
+    limit: int = typer.Option(10, "--limit", "-n"),
+) -> None:
+    """Recent agent_run_log entries with phase-B writes highlighted."""
+    import json as _json
+    from datetime import datetime
+    from .agent.memory import list_recent_runs
+    init_db()
+    with get_conn() as conn:
+        rows = list_recent_runs(conn, group_id, limit=limit)
+    if not rows:
+        typer.echo(f"no agent runs for group_id={group_id!r}")
+        return
+    for r in rows:
+        ts = datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S") if r["started_at"] else "?"
+        dur = (r["finished_at"] - r["started_at"]) if (r["started_at"] and r["finished_at"]) else 0
+        reply = (r["reply_text"] or "").replace("\n", " ")[:80] or "(silent)"
+        typer.echo(
+            f"[{r['run_id']}] {ts}  trigger={r['trigger_kind']:12s}  "
+            f"msg_id={r['trigger_msg_id'] or '?':>7}  {dur:.1f}s"
+        )
+        typer.echo(f"     reply: {reply}")
+        # Surface any Phase B writes inline
+        try:
+            pb = _json.loads(r["phase_b_trace"] or "[]")
+        except _json.JSONDecodeError:
+            pb = []
+        writes = [s for s in pb if s.get("kind") == "tool_call" and s.get("tool", "").startswith("update_")]
+        for w in writes:
+            args = w.get("args", {})
+            preview_key = "drift_text" if w["tool"] == "update_persona_drift" else "notes_text"
+            preview = (args.get(preview_key, "") or "").replace("\n", " ")[:80]
+            typer.echo(f"     ↳ phase B {w['tool']}: {preview}")
 
 
 @weflow_app.command("find")

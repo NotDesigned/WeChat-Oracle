@@ -1299,12 +1299,16 @@ def chat_via_agent(
     Returns the reply text, or None if the agent chose stay_silent. Always
     writes one row to `agent_run_log` regardless of outcome (audit).
     """
-    from .agent.memory import insert_run_log
+    from .agent.memory import insert_run_log, link_last_run_id
     from .agent.persona import assemble_system_prompts
     from .agent.runtime import run_agent
     from .agent.tools import GroupScopedTools
     from .agent.tools_read import register_phase_a_tools
-    from .agent.tools_write import phase_b_system_prompt, register_phase_b_tools
+    from .agent.tools_write import (
+        phase_b_system_prompt,
+        register_phase_b_tools,
+        trace_touched_tables,
+    )
 
     started_at = time.time()
     recent_rows = _fetch_recent_for_agent(
@@ -1391,7 +1395,7 @@ def chat_via_agent(
 
     try:
         with transaction(ctx.conn):
-            insert_run_log(
+            run_id = insert_run_log(
                 ctx.conn,
                 group_id=ctx.group_id,
                 trigger_msg_id=ctx.trigger_msg_id,
@@ -1402,6 +1406,19 @@ def chat_via_agent(
                 started_at=started_at,
                 finished_at=finished_at,
             )
+            # Raw↔summary link: any memory rows the agent wrote in Phase B
+            # get last_run_id pointing back to this run, so future debugging
+            # can trace any state to the run that produced it. Skipped when
+            # Phase B was disabled or didn't write.
+            touched_persona, touched_memory = trace_touched_tables(result.phase_b_trace)
+            if touched_persona or touched_memory:
+                link_last_run_id(
+                    ctx.conn,
+                    group_id=ctx.group_id,
+                    run_id=run_id,
+                    touched_persona=touched_persona,
+                    touched_memory=touched_memory,
+                )
     except Exception:
         logger.exception("failed to write agent_run_log; agent reply still returned")
 

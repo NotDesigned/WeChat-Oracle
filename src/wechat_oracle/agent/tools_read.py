@@ -26,7 +26,7 @@ from typing import Any
 
 from ..llm import VisionLLM
 from .media_paths import resolve_media_path_for_msg
-from .memory import get_member_notes, list_group_notes
+from .memory import get_group_memory
 from .tools import Tool, ToolError, ToolSpec, truncate_for_llm
 
 
@@ -306,174 +306,33 @@ class ExpandForwardBundleTool(Tool):
         return truncate_for_llm("\n".join(lines))
 
 
-# --- who_is ----------------------------------------------------------------
+# --- read_group_memory ------------------------------------------------------
 
 
-_WHO_IS_SPEC = ToolSpec(
-    name="who_is",
+_READ_GROUP_MEMORY_SPEC = ToolSpec(
+    name="read_group_memory",
     description=(
-        "Look up what we know about a group member: their accumulated "
-        "member_notes plus their last 20 messages in this group. Use this "
-        "before referring to a person you've not interacted with yet, or "
-        "when asked questions about someone's interests / background."
+        "Read this group's freeform memory document — everything the agent "
+        "has accumulated about who's who, group culture, and recurring "
+        "topics. One document, not per-person; you organize it however you "
+        "want when writing back. Returns empty string when nothing's been "
+        "written yet."
     ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "sender_wxid": {
-                "type": "string",
-                "description": "The member's wxid (from a [N] context line's sender_wxid field). Pass display name only if you don't have a wxid; the tool falls back to display-name match.",
-            },
-        },
-        "required": ["sender_wxid"],
-    },
+    parameters={"type": "object", "properties": {}},
 )
 
 
 @dataclass
-class WhoIsTool(Tool):
-    spec = _WHO_IS_SPEC
+class ReadGroupMemoryTool(Tool):
+    spec = _READ_GROUP_MEMORY_SPEC
     conn: sqlite3.Connection
     group_id: str
 
     def call(self, args: dict[str, Any]) -> str:
-        ident = args.get("sender_wxid")
-        if not isinstance(ident, str) or not ident.strip():
-            raise ToolError("sender_wxid must be a non-empty string")
-        ident = ident.strip()
-
-        # Strict wxid match first; fall back to display-name match if nothing.
-        rows = self.conn.execute(
-            "SELECT msg_id, t, type, sender_wxid, sender_display, "
-            "content_text, transcript FROM messages "
-            "WHERE group_id=? AND sender_wxid=? "
-            "ORDER BY t DESC LIMIT 20",
-            (self.group_id, ident),
-        ).fetchall()
-        matched_by = "wxid"
-        if not rows:
-            rows = self.conn.execute(
-                "SELECT msg_id, t, type, sender_wxid, sender_display, "
-                "content_text, transcript FROM messages "
-                "WHERE group_id=? AND sender_display=? "
-                "ORDER BY t DESC LIMIT 20",
-                (self.group_id, ident),
-            ).fetchall()
-            matched_by = "display_name"
-        if not rows:
-            return f"no messages from sender {ident!r} in this group"
-
-        # Resolve the canonical wxid (for member_notes lookup) from the rows
-        # — display-name mode might still have rows with a real wxid.
-        canonical_wxid = next(
-            (r["sender_wxid"] for r in rows if r["sender_wxid"]),
-            ident if matched_by == "wxid" else "",
-        )
-        notes = (
-            get_member_notes(self.conn, self.group_id, canonical_wxid)
-            if canonical_wxid else ""
-        )
-
-        out = [
-            f"sender: {ident}  (matched_by={matched_by}, canonical_wxid={canonical_wxid or '?'})",
-            f"member_notes: {notes if notes else '(none yet)'}",
-            f"recent messages ({len(rows)}, newest → oldest):",
-        ]
-        out.extend(f"  {_fmt_msg_row(r)}" for r in rows)
-        return truncate_for_llm("\n".join(out))
-
-
-# --- read_member_notes -----------------------------------------------------
-
-
-_READ_MEMBER_NOTES_SPEC = ToolSpec(
-    name="read_member_notes",
-    description=(
-        "Just the accumulated notes about one member, no message history. "
-        "Cheaper than `who_is` when you only need the notes (e.g. before "
-        "calling `write_member_note` to merge new info into them)."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "sender_wxid": {"type": "string"},
-        },
-        "required": ["sender_wxid"],
-    },
-)
-
-
-@dataclass
-class ReadMemberNotesTool(Tool):
-    spec = _READ_MEMBER_NOTES_SPEC
-    conn: sqlite3.Connection
-    group_id: str
-
-    def call(self, args: dict[str, Any]) -> str:
-        wxid = args.get("sender_wxid")
-        if not isinstance(wxid, str) or not wxid.strip():
-            raise ToolError("sender_wxid must be a non-empty string")
-        notes = get_member_notes(self.conn, self.group_id, wxid.strip())
-        return notes or "(no notes yet)"
-
-
-# --- read_group_notes ------------------------------------------------------
-
-
-_READ_GROUP_NOTES_SPEC = ToolSpec(
-    name="read_group_notes",
-    description=(
-        "List recent group-level notes (events, decisions, ongoing topics) "
-        "in this group, newest first. Append-only history — you'll see the "
-        "evolution rather than a single-line summary."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "topic": {
-                "type": "string",
-                "description": "Optional exact-match filter on the note's topic field.",
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 30,
-                "description": "Max notes to return; default 10.",
-            },
-        },
-    },
-)
-
-
-@dataclass
-class ReadGroupNotesTool(Tool):
-    spec = _READ_GROUP_NOTES_SPEC
-    conn: sqlite3.Connection
-    group_id: str
-
-    def call(self, args: dict[str, Any]) -> str:
-        topic = args.get("topic")
-        if topic is not None and not isinstance(topic, str):
-            raise ToolError("topic must be a string")
-        limit = args.get("limit", 10)
-        if not isinstance(limit, int) or limit < 1:
-            limit = 10
-        limit = min(limit, 30)
-
-        rows = list_group_notes(
-            self.conn, self.group_id,
-            topic=topic.strip() if isinstance(topic, str) and topic.strip() else None,
-            limit=limit,
-        )
-        if not rows:
-            return "(no group notes yet)"
-        lines = [f"{len(rows)} note(s):"]
-        for r in rows:
-            ts = _fmt_t(int(r["updated_at"])) if r["updated_at"] else "?"
-            tag = f"[{r['topic']}] " if r["topic"] else ""
-            body = (r["notes_text"] or "").replace("\n", " ").strip()
-            lines.append(f"  ({ts}) {tag}{body}")
-        return truncate_for_llm("\n".join(lines))
+        text = get_group_memory(self.conn, self.group_id)
+        if not text:
+            return "(empty — nothing learned about this group yet)"
+        return text  # NOT truncated: the agent owns this data, gets it whole
 
 
 # --- read_image ------------------------------------------------------------
@@ -643,9 +502,7 @@ def register_phase_a_tools(
     tools.register(RecallGroupHistoryTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ViewQuotedChainTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ExpandForwardBundleTool(conn=tools.conn, group_id=tools.group_id))
-    tools.register(WhoIsTool(conn=tools.conn, group_id=tools.group_id))
-    tools.register(ReadMemberNotesTool(conn=tools.conn, group_id=tools.group_id))
-    tools.register(ReadGroupNotesTool(conn=tools.conn, group_id=tools.group_id))
+    tools.register(ReadGroupMemoryTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ReadImageTool(
         conn=tools.conn, group_id=tools.group_id,
         vision=vision, vision_model=vision_model,

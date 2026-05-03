@@ -35,7 +35,22 @@ def init_db(db_path: Path | None = None) -> Path:
     schema_sql = files("wechat_oracle").joinpath(SCHEMA_RESOURCE).read_text(encoding="utf-8")
     with _connect(path) as conn:
         conn.executescript(schema_sql)
+        _migrate(conn)
     return path
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """One-shot column adds for installs that ran an older schema. Each
+    block is idempotent and only fires when the column is actually missing,
+    so this is safe to re-run."""
+    def _has_column(table: str, col: str) -> bool:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == col for r in rows)
+
+    # last_run_id added when group_memory landed (persona_drift now has the
+    # back-pointer too — see schema.sql comment)
+    if not _has_column("persona_drift", "last_run_id"):
+        conn.execute("ALTER TABLE persona_drift ADD COLUMN last_run_id INTEGER")
 
 
 @contextmanager

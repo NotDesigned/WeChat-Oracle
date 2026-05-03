@@ -108,6 +108,7 @@ class Settings(BaseSettings):
     agent_reflection_enabled: bool = True      # off → skip Phase B entirely
     agent_personas_dir: Path = Field(default=Path("data/personas"))
     agent_recent_context_chat: int = 50        # initial recent-msg window for Phase A system prompt
+    agent_memory_max_chars: int = 100_000      # group_memory hard cap; agent must compact when full
 
     # Send the dispatcher's result back into the WeChat group. False = local-
     # only (stdout + log). True = use the backend below.

@@ -1,15 +1,21 @@
 """DAO functions for the agent's evolvable memory tables.
 
 Tables (defined in `schema.sql`):
-  - persona_drift   — per-group, replace-on-write
-  - member_notes    — per-(group, member), replace-on-write
-  - group_notes     — per-group append-only event log
-  - agent_run_log   — full audit trace of every agent run
+  - persona_drift   — per-group, replace-on-write. Agent's behavior补充.
+  - group_memory    — per-group single freeform blob bounded at
+                      WO_AGENT_MEMORY_MAX_CHARS. Holds everything the agent
+                      has learned about members + culture + recurring topics.
+                      Agent organizes internal structure freely.
+  - agent_run_log   — full audit trace of every agent run.
 
-All functions take an explicit `conn` (the dispatcher's connection); none
-own a connection or transaction. Writers use `db.transaction(conn)` from
-the caller side when they need to be atomic — for now agent runs are
-serial within one dispatcher process so single-statement UPSERTs are fine.
+Both writable rows carry a `last_run_id` foreign key into `agent_run_log` so
+any state can be traced back to the run that produced it (combats summary
+drift; fix-up happens in dispatcher.chat_via_agent after insert_run_log
+returns the run_id).
+
+Two legacy tables (`member_notes`, `group_notes`) still exist as inert
+CREATE statements in schema.sql for old installs but are no longer touched
+by code — see schema.sql for the manual DROP recipe.
 """
 
 from __future__ import annotations
@@ -48,89 +54,61 @@ def upsert_persona_drift(
     )
 
 
-# --- member_notes ----------------------------------------------------------
+# --- group_memory (consolidated member + group notes) ----------------------
 
 
-def get_member_notes(
-    conn: sqlite3.Connection, group_id: str, sender_wxid: str
-) -> str:
+def get_group_memory(conn: sqlite3.Connection, group_id: str) -> str:
     row = conn.execute(
-        "SELECT notes_text FROM member_notes WHERE group_id=? AND sender_wxid=?",
-        (group_id, sender_wxid),
+        "SELECT notes_text FROM group_memory WHERE group_id=?",
+        (group_id,),
     ).fetchone()
     return (row["notes_text"] if row else "") or ""
 
 
-def upsert_member_note(
-    conn: sqlite3.Connection,
-    group_id: str,
-    sender_wxid: str,
-    notes_text: str,
+def upsert_group_memory(
+    conn: sqlite3.Connection, group_id: str, notes_text: str
 ) -> None:
-    """Replace-on-write per (group, sender). Agent is expected to have
-    called `read_member_notes` first and decided on the merged text."""
+    """Replace-on-write per group. Caller is responsible for the size cap
+    (raised as a ToolError to the LLM at the tool boundary, not here — DAO
+    stays dumb)."""
     conn.execute(
         """
-        INSERT INTO member_notes (group_id, sender_wxid, notes_text, updated_at)
+        INSERT INTO group_memory (group_id, notes_text, size_chars, updated_at)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(group_id, sender_wxid) DO UPDATE SET
+        ON CONFLICT(group_id) DO UPDATE SET
             notes_text = excluded.notes_text,
+            size_chars = excluded.size_chars,
             updated_at = excluded.updated_at
         """,
-        (group_id, sender_wxid, notes_text, time.time()),
+        (group_id, notes_text, len(notes_text), time.time()),
     )
 
 
-# --- group_notes -----------------------------------------------------------
+# --- last_run_id linking (for raw↔summary tracing) ------------------------
 
 
-def list_group_notes(
+def link_last_run_id(
     conn: sqlite3.Connection,
-    group_id: str,
     *,
-    topic: str | None = None,
-    limit: int = 10,
-) -> list[sqlite3.Row]:
-    """Newest first. `topic` is an exact-match filter; pass None for all."""
-    if topic is None:
-        return conn.execute(
-            """
-            SELECT note_id, topic, notes_text, updated_at
-              FROM group_notes
-             WHERE group_id=?
-             ORDER BY updated_at DESC
-             LIMIT ?
-            """,
-            (group_id, limit),
-        ).fetchall()
-    return conn.execute(
-        """
-        SELECT note_id, topic, notes_text, updated_at
-          FROM group_notes
-         WHERE group_id=? AND topic=?
-         ORDER BY updated_at DESC
-         LIMIT ?
-        """,
-        (group_id, topic, limit),
-    ).fetchall()
-
-
-def insert_group_note(
-    conn: sqlite3.Connection,
     group_id: str,
-    *,
-    topic: str | None,
-    notes_text: str,
-) -> int:
-    """Append-only. Returns the new `note_id`."""
-    cur = conn.execute(
-        """
-        INSERT INTO group_notes (group_id, topic, notes_text, updated_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (group_id, topic, notes_text, time.time()),
-    )
-    return int(cur.lastrowid)
+    run_id: int,
+    touched_persona: bool,
+    touched_memory: bool,
+) -> None:
+    """Patch `last_run_id` on whichever memory row(s) the agent just wrote.
+    Called from dispatcher.chat_via_agent after `insert_run_log` returns
+    the run_id, since auto-incremented IDs aren't known until the row exists.
+    """
+    if touched_persona:
+        conn.execute(
+            "UPDATE persona_drift SET last_run_id=? WHERE group_id=?",
+            (run_id, group_id),
+        )
+    if touched_memory:
+        conn.execute(
+            "UPDATE group_memory SET last_run_id=? WHERE group_id=?",
+            (run_id, group_id),
+        )
 
 
 # --- agent_run_log ---------------------------------------------------------
@@ -170,3 +148,20 @@ def insert_run_log(
         ),
     )
     return int(cur.lastrowid)
+
+
+def list_recent_runs(
+    conn: sqlite3.Connection, group_id: str, limit: int = 10
+) -> list[sqlite3.Row]:
+    """Newest first. Used by `wechat-oracle agent show-runs`."""
+    return conn.execute(
+        """
+        SELECT run_id, trigger_msg_id, trigger_kind, reply_text,
+               started_at, finished_at, phase_b_trace
+          FROM agent_run_log
+         WHERE group_id=?
+         ORDER BY run_id DESC
+         LIMIT ?
+        """,
+        (group_id, limit),
+    ).fetchall()

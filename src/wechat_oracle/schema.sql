@@ -71,48 +71,39 @@ CREATE TABLE IF NOT EXISTS command_runs (
 
 -- ---------- Agent loop + memory (CLAUDE.md F17, see plan in commit history) ----------
 -- The dispatcher's @<bot> chat path runs through a multi-turn tool-calling agent
--- loop (`src/wechat_oracle/agent/`). Memory is layered: static persona yaml on
--- disk + the three tables below for evolvable state. `agent_run_log` records the
--- full trace (Phase A read-only + Phase B write-only) for audit and debugging.
+-- loop (`src/wechat_oracle/agent/`). Memory is two evolvable blobs per group +
+-- a full audit trail of every agent run.
 
 -- Per-group evolvable persona supplement (the static core lives in
--- data/personas/<group_id>.yaml). Replaced wholesale by `update_persona_drift`
--- so the LLM can compact rather than letting the file grow without bound.
+-- data/personas/<group_id>.yaml). Replaced wholesale by `update_persona_drift`.
+-- `last_run_id` points back into agent_run_log so any state in this row can be
+-- traced to the run that wrote it (combats summarization-drift, in the spirit
+-- of "keep raw memories linked to consolidated memories").
 CREATE TABLE IF NOT EXISTS persona_drift (
     group_id     TEXT PRIMARY KEY,
     drift_text   TEXT NOT NULL DEFAULT '',
-    updated_at   REAL
-);
-
--- Per-group, per-member notes the agent accumulates about individuals
--- ("张三 is a fan of stoicism", "李四 mostly asks about K8s"). UPSERT semantics:
--- write_member_note replaces the whole row, the LLM is expected to read first
--- and then merge. PRIMARY KEY scopes to (group, sender) so cross-group privacy
--- holds at the schema level.
-CREATE TABLE IF NOT EXISTS member_notes (
-    group_id     TEXT NOT NULL,
-    sender_wxid  TEXT NOT NULL,
-    notes_text   TEXT NOT NULL DEFAULT '',
     updated_at   REAL,
-    PRIMARY KEY (group_id, sender_wxid)
+    last_run_id  INTEGER REFERENCES agent_run_log(run_id) ON DELETE SET NULL
 );
 
--- Append-only log of group-level reflections ("the team agreed on Friday to
--- ship X by Q3"). One row per write; `topic` is a free-form tag the agent uses
--- to scope `read_group_notes`.
-CREATE TABLE IF NOT EXISTS group_notes (
-    note_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id     TEXT NOT NULL,
-    topic        TEXT,
-    notes_text   TEXT NOT NULL,
-    updated_at   REAL
+-- Single per-group memory blob holding everything the agent has learned about
+-- members, group culture, and recurring topics — one freeform document, agent's
+-- job to organize internally. Replaces the previous (member_notes,
+-- group_notes) pair: per-id modeling turned out to be over-structured for what
+-- the agent actually needs. Hard-capped by WO_AGENT_MEMORY_MAX_CHARS (default
+-- 100000) so the agent has to compact when it runs out of room.
+CREATE TABLE IF NOT EXISTS group_memory (
+    group_id     TEXT PRIMARY KEY,
+    notes_text   TEXT NOT NULL DEFAULT '',
+    size_chars   INTEGER NOT NULL DEFAULT 0,
+    updated_at   REAL,
+    last_run_id  INTEGER REFERENCES agent_run_log(run_id) ON DELETE SET NULL
 );
-CREATE INDEX IF NOT EXISTS idx_group_notes_group ON group_notes(group_id);
 
 -- Full trace of every agent run. `phase_a_trace` / `phase_b_trace` are JSON
 -- arrays of step dicts: `[{step:int, kind:'tool_call'|'final', tool?, args?, result?, content?}, ...]`.
 -- `reply_text` is NULL when the agent chose stay_silent. `trigger_kind` is one
--- of 'mention' / 'reply' / 'probability' (only 'mention' is wired in v0).
+-- of 'mention' / 'reply' / 'probability'.
 CREATE TABLE IF NOT EXISTS agent_run_log (
     run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id        TEXT NOT NULL,
@@ -125,6 +116,26 @@ CREATE TABLE IF NOT EXISTS agent_run_log (
     finished_at     REAL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_log_group_t ON agent_run_log(group_id, started_at);
+
+-- ----- Legacy memory tables (member_notes / group_notes) — superseded by
+-- group_memory above. Kept as inert CREATE IF NOT EXISTS so old installs don't
+-- error on init_db; new installs that follow the current code path get them
+-- empty and unused. To clean up an old DB:
+--   DROP TABLE member_notes; DROP TABLE group_notes;
+CREATE TABLE IF NOT EXISTS member_notes (
+    group_id     TEXT NOT NULL,
+    sender_wxid  TEXT NOT NULL,
+    notes_text   TEXT NOT NULL DEFAULT '',
+    updated_at   REAL,
+    PRIMARY KEY (group_id, sender_wxid)
+);
+CREATE TABLE IF NOT EXISTS group_notes (
+    note_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id     TEXT NOT NULL,
+    topic        TEXT,
+    notes_text   TEXT NOT NULL,
+    updated_at   REAL
+);
 
 -- Schema version, for future migrations. Bumped manually when DDL changes.
 CREATE TABLE IF NOT EXISTS schema_meta (

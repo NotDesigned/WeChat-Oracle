@@ -64,52 +64,33 @@ def load_persona_yaml(personas_dir: Path, group_id: str) -> dict[str, Any]:
 # --- prompt assembly -------------------------------------------------------
 
 
+# Minimal-as-possible operational rules. Tool signatures are passed via the
+# OpenAI tools= parameter — re-listing them here would be redundant and waste
+# tokens. Style prescriptions deliberately removed; let `persona_drift` learn
+# what fits this group rather than baking in a prior.
 _PHASE_A_OPS_RULES = """\
-你能调用的工具：
- - recall_group_history(query, ...)：在本群历史里搜过往发言（substring 匹配）
- - view_quoted_chain(msg_id)：跟随某条消息的引用链上溯
- - expand_forward_bundle(msg_id)：展开合并转发的子消息
- - read_image(msg_id, prompt?)：让视觉模型直接看一张图
- - read_voice(msg_id)：拿语音转写（已转写的秒返）
- - who_is(sender_wxid)：看某成员的笔记 + 最近发言
- - read_member_notes(sender_wxid) / read_group_notes(topic?)：取笔记
- - stay_silent(reason)：判断这次不该回应，闭嘴
+约定：context 里方括号 [N] 的数字就是 msg_id（整数）；群 ID 不用传，工具内部已锁定本群。
 
-调用约定：所有 msg_id 是整数（context 里方括号 `[123]` 的数字）；群 ID 不需要传——工具内部已经锁定本群。
-
-回答风格：
- - 中文，2–6 句，像在打字而不是在写文章
- - 不要 markdown，不要 @ 任何人，不要打招呼问候
- - 不必每次都查工具——能直接答的就答；要查就查清楚再答
- - 触发不值得回应（别人在聊天恰好@你别的意思、问题完全跟你无关），调 stay_silent
-"""
-
-
-_DEFAULT_VOICE = (
-    "用群友视角说话，简洁、不卑不亢；不要 ai 助手腔（不要「我可以帮你」「请告诉我」之类）。"
-    " 群里有人发图发语音可以主动看一看再答；引用的消息记得读完再回。"
-)
+不知道该不该说话就调 stay_silent。群友的对话不必每条都接。"""
 
 
 def _identity_block(
     persona: dict[str, Any], bot_name: str, group_name: str | None
 ) -> str:
-    """First paragraph: who the bot is here."""
-    group = group_name or "（未命名群）"
+    """First paragraph: who the bot is here. Defaults are deliberately bare —
+    users opt into a richer identity by writing `data/personas/<gid>.yaml`."""
     identity = persona.get("identity")
     if isinstance(identity, str) and identity.strip():
         return identity.strip()
-    return (
-        f"你是微信群「{group}」里的成员，群昵称叫「{bot_name}」。"
-        " 用户 @ 了你或对你说话，请像群友一样自然回应。"
-    )
+    group = group_name or "（未命名群）"
+    return f"你是微信群「{group}」里的某个成员，群昵称叫「{bot_name}」。"
 
 
 def _voice_block(persona: dict[str, Any]) -> str:
     voice = persona.get("voice")
     if isinstance(voice, str) and voice.strip():
         return voice.strip()
-    return _DEFAULT_VOICE
+    return ""  # no default voice — let the model + drift settle naturally
 
 
 def _list_block(persona: dict[str, Any], key: str, label: str) -> str:
@@ -135,6 +116,12 @@ def _drift_block(drift_text: str, persona: dict[str, Any]) -> str:
     return ""
 
 
+def _join_nonempty(*parts: str, sep: str = "\n\n") -> str:
+    """Drop any empty / whitespace-only parts before joining. Keeps the
+    output tight when persona is mostly default (no yaml + no drift)."""
+    return sep.join(p.strip() for p in parts if p and p.strip())
+
+
 def build_phase_a_system(
     *,
     persona: dict[str, Any],
@@ -142,20 +129,17 @@ def build_phase_a_system(
     bot_name: str,
     group_name: str | None,
 ) -> str:
-    """Compose: identity + voice + knows/avoid + drift + ops rules + tool
-    inventory. The result goes straight into the agent's system role."""
-    parts = [
+    """Compose persona layers (identity → voice → knows/avoid → drift) and
+    operational rules into one system prompt. Empty layers drop out clean —
+    bare default persona renders to just identity + ops_rules."""
+    persona_block = _join_nonempty(
         _identity_block(persona, bot_name, group_name),
-        "",
         _voice_block(persona),
-    ]
-    parts.append(_list_block(persona, "knows_about", "你对以下话题有立场或上下文"))
-    parts.append(_list_block(persona, "avoid", "请避免的话题或语气"))
-    parts.append(_drift_block(drift_text, persona))
-    parts.append("")
-    parts.append("---")
-    parts.append(_PHASE_A_OPS_RULES)
-    return "\n".join(p for p in parts if p is not None).strip()
+        _list_block(persona, "knows_about", "你对以下话题有立场或上下文"),
+        _list_block(persona, "avoid", "请避免的话题或语气"),
+        _drift_block(drift_text, persona),
+    )
+    return _join_nonempty(persona_block, "---", _PHASE_A_OPS_RULES)
 
 
 def build_phase_b_system(
@@ -166,20 +150,14 @@ def build_phase_b_system(
     group_name: str | None,
     base_phase_b_prompt: str,
 ) -> str:
-    """Phase B keeps voice/identity (so update_persona_drift writes in a
-    consistent voice) but appends the reflection-specific rules instead
-    of the chat ops rules. `base_phase_b_prompt` is the static reflection
-    instructions (from `tools_write.phase_b_system_prompt()`)."""
-    parts = [
+    """Phase B keeps the persona stack (so writes to drift/memory stay in
+    voice) and swaps the chat ops rules for reflection rules."""
+    persona_block = _join_nonempty(
         _identity_block(persona, bot_name, group_name),
-        "",
         _voice_block(persona),
-    ]
-    parts.append(_drift_block(drift_text, persona))
-    parts.append("")
-    parts.append("---")
-    parts.append(base_phase_b_prompt)
-    return "\n".join(p for p in parts if p is not None).strip()
+        _drift_block(drift_text, persona),
+    )
+    return _join_nonempty(persona_block, "---", base_phase_b_prompt)
 
 
 # --- top-level convenience -------------------------------------------------

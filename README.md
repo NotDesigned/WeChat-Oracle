@@ -240,10 +240,10 @@ agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`�
 - `recall_group_history(query, since_days?, sender_wxid?)`：在本群历史里 substring 搜（`content_text` + `transcript` 都搜）
 - `view_quoted_chain(msg_id)` / `expand_forward_bundle(msg_id)`：跟引用链上溯 / 展开合并转发的子项
 - `read_image(msg_id, prompt?)` / `read_voice(msg_id)`：让视觉模型直接看一张图 / 拿语音转录（已转写的秒返）
-- `who_is(sender_wxid)` / `read_member_notes` / `read_group_notes`：取成员或群级笔记
+- `read_group_memory()`：取群文档（成员、事件、群文化全在一段 freeform text 里，agent 自己组织结构）
 - `stay_silent(reason)`：判断这次不该回应，闭嘴（实际不会发回群）
 
-回答完，进入 **Phase B 反思**（`WO_AGENT_REFLECTION_ENABLED=True` 时）：agent 看自己刚才做了什么，决定要不要把新观察写进 `member_notes` / `group_notes` / `persona_drift`。详见「数据流细节」段。
+回答完，进入 **Phase B 反思**（`WO_AGENT_REFLECTION_ENABLED=True` 时）：agent 看自己刚才做了什么，决定要不要把新观察写进 `group_memory`（替换语义，100k 上限）或 `persona_drift`（替换语义）。详见「数据流细节」段。
 
 > agent 触发的检索池**包含**：直发文本 + **引用回复**（用户的回复正文）+ **合并转发包里的子项**（详见 [appmsg 子类型](#appmsg-子类型-localtype49-family)）+ **图片/语音的 OCR/ASR 文字**（详见 [多媒体识别](#多媒体识别-worker-mm)）。即「张三 2024 年的话被 2026 年某人转发进群」、「李四引用某人发言后说了啥」、「上周谁分享的那张报表显示啥」都搜得到。`/find` 用同一份检索池做 LLM 精筛。
 
@@ -436,17 +436,17 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 1. 装配 system prompt：`agent/persona.py` 把 `data/personas/<group_id>.yaml`（静态人格核心）+ `persona_drift` 表（agent 自维护的演化补充）+ 操作规则（工具清单 + msg_id 整数约定 + 简短输出风格）拼起来
 2. 装配 user message：当前时间 + 触发原因 + 引用消息（如有）+ 最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（50）条群消息（每行 `[msg_id] (time) sender (wxid): 内容`）+ 用户对你说的话
-3. 进 tool-calling 循环：每步模型可以调一组只读工具（recall / view_quoted / expand_forward / read_image / read_voice / who_is / read_member_notes / read_group_notes / stay_silent）或输出最终回复文字。每步的 tool name + args + result 都进 trace
+3. 进 tool-calling 循环：每步模型可以调一组只读工具（recall / view_quoted / expand_forward / read_image / read_voice / read_group_memory / stay_silent）或输出最终回复文字。每步的 tool name + args + result 都进 trace
 4. 终态：模型输出文字 → 是回复；调 `stay_silent` → 标记沉默；用满步数 → 取最后一条 assistant content 兜底
 
-**Phase B（write-only 反思，`WO_AGENT_REFLECTION_ENABLED=True` 时；最多 `WO_AGENT_REFLECT_MAX_STEPS`=5 步）**
+**Phase B（反思，`WO_AGENT_REFLECTION_ENABLED=True` 时；最多 `WO_AGENT_REFLECT_MAX_STEPS`=5 步）**
 
-5. 模型看完整 Phase A trace + 最终回复，决定要不要写笔记。可调：`read_member_notes` / `read_group_notes` / `read_persona_drift`（先读再写）+ `write_member_note`（替换语义） / `write_group_note`（追加语义） / `update_persona_drift`（替换语义）
+5. 模型看完整 Phase A trace + 最终回复，决定要不要 update 记忆。可调：读 `read_persona_drift` / `read_group_memory`（先读再写），写 `update_persona_drift`（替换） / `update_group_memory`（替换，100k 上限）
 6. 终态：模型输出空文本 = 不写；用满步数 = 强制结束。绝大部分对话 Phase B 应该 0 写入
 
 **两阶段都结束后**：
 
-7. 写一行 `agent_run_log`：group_id / trigger_msg_id / trigger_kind / phase_a_trace JSON / phase_b_trace JSON / reply_text / 时间戳——审计 + 调试主入口
+7. 写一行 `agent_run_log`：group_id / trigger_msg_id / trigger_kind / phase_a_trace JSON / phase_b_trace JSON / reply_text / 时间戳——审计 + 调试主入口。如果 Phase B 写了 persona_drift / group_memory，对应行的 `last_run_id` 反向链回这次 run（防 summary drift 不可追溯）
 8. `reply_text` 非空 → 走 `replier.send` 发回群；空（`stay_silent`）→ dispatcher 跳过 send，群里看不到 bot 任何反应
 
 **触发**：dispatcher 现在扫**所有未处理的 live 消息**（不只 @ 的），在 `_classify_trigger` 里分三类——
@@ -526,6 +526,7 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_AGENT_REFLECTION_ENABLED` | `True` | 关闭后跳过 Phase B；不写任何 member/group/persona 笔记 |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | 静态人格 yaml 目录，每群一个 `<group_id>.yaml` |
 | `WO_AGENT_RECENT_CONTEXT_CHAT` | `50` | Phase A 初始 system prompt 注入的最近群消息条数 |
+| `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | `group_memory` 单文档硬上限；超过 update_group_memory 抛 ToolError，agent 必须先压缩 |
 
 ---
 
@@ -566,18 +567,30 @@ forwarded_records (
     UNIQUE(parent_msg_id, seq)
 )
 
--- agent loop 记忆 + 审计（WO_AGENT_ENABLED=True 时写）
-persona_drift   ( group_id PRIMARY KEY, drift_text, updated_at )         -- 可演化人格补充，replace-on-write
-member_notes    ( (group_id, sender_wxid) PK, notes_text, updated_at )    -- 成员笔记，replace-on-write
-group_notes     ( note_id PK, group_id, topic, notes_text, updated_at )   -- 群级笔记，append-only
-agent_run_log   ( run_id PK, group_id, trigger_msg_id, trigger_kind,      -- 每次 agent run 的完整 trace
+-- agent loop 记忆 + 审计
+persona_drift   ( group_id PK, drift_text, updated_at, last_run_id )           -- 演化人格补充, replace-on-write
+group_memory    ( group_id PK, notes_text, size_chars, updated_at,             -- 群文档(成员/事件/文化全放一起),
+                  last_run_id )                                                  -- replace-on-write, 100k 上限
+agent_run_log   ( run_id PK, group_id, trigger_msg_id, trigger_kind,           -- 每次 agent run 的完整 trace
                   phase_a_trace, phase_b_trace, reply_text,
                   started_at, finished_at )
+
+-- 历史遗留(已不被使用,新装无影响; 旧装可手动 DROP):
+-- member_notes / group_notes — 之前按成员 / 按主题分开存的笔记表; 已合并为单一 group_memory
 ```
 
 跨源去重靠 `UNIQUE(dedupe_key)`：有 `wx_msg_id` 时用 `wx:<group>:<id>`，没有时用关键字段哈希。`messages.status` 和 `command_runs` 是两条并行的状态机，互不污染。
 
-agent 四张表里 `member_notes` / `persona_drift` 用替换语义（让 LLM 自己读现状再决定新值，避免无限增长），`group_notes` 用追加（群级讨论是事件流），`agent_run_log` 始终追加（审计）。所有 SQL 实现都在 tool 实现层强制 `WHERE group_id=?`——`group_id` 不暴露给 LLM，靠 `GroupScopedTools` 构造器锁。
+agent 三张表的写语义：`persona_drift` / `group_memory` 都是 replace-on-write（读 → 合并 → 整段写回；100k 上限强制压缩），`agent_run_log` 始终追加。所有 SQL 实现都在 tool 实现层强制 `WHERE group_id=?` —— `group_id` 不暴露给 LLM，靠 `GroupScopedTools` 构造器锁。`persona_drift.last_run_id` / `group_memory.last_run_id` 反向链回 `agent_run_log`，任何笔记内容都能查到是哪次 agent run 写的（防 summarization drift 不可追溯）。
+
+CLI 看 / 改 agent 状态：
+
+```powershell
+uv run wechat-oracle agent show <group_id>            # dump persona_drift + group_memory
+uv run wechat-oracle agent show-runs <group_id> -n 10 # 最近 N 次 agent_run_log + 写动作高亮
+uv run wechat-oracle agent wipe <group_id>            # 清 persona_drift + group_memory（带确认）
+uv run wechat-oracle agent wipe <group_id> --persona-only / --memory-only / -y
+```
 
 ---
 
