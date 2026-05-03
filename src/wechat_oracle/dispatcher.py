@@ -1482,36 +1482,6 @@ def _format_recent_for_agent(rows: list[sqlite3.Row]) -> str:
     return "\n".join(out) if out else "（最近群里没消息）"
 
 
-def _build_agent_phase_a_system(
-    *, bot_name: str, group_name: str | None
-) -> str:
-    """Default system prompt used until commit 6 swaps in yaml personas.
-    Keeps the operational rules even after that swap (yaml will only carry
-    voice/tone/personality)."""
-    group = group_name or "（未命名群）"
-    return (
-        f"你是微信群「{group}」里的成员，群昵称叫「{bot_name}」。"
-        " 用户 @ 了你或对你说话，请像群友一样自然回应。\n\n"
-        "你能调用的工具：\n"
-        " - recall_group_history(query, ...)：在本群历史里搜过往发言（substring 匹配）\n"
-        " - view_quoted_chain(msg_id)：跟随某条消息的引用链上溯\n"
-        " - expand_forward_bundle(msg_id)：展开合并转发的子消息\n"
-        " - read_image(msg_id, prompt?)：让视觉模型直接看一张图\n"
-        " - read_voice(msg_id)：拿语音转写（已转写的秒返）\n"
-        " - who_is(sender_wxid)：看某成员的笔记 + 最近发言\n"
-        " - read_member_notes(sender_wxid) / read_group_notes(topic?)：取笔记\n"
-        " - stay_silent(reason)：判断这次不该回应，闭嘴\n\n"
-        "调用约定：所有 msg_id 是整数（context 里方括号 `[123]` 的数字）；"
-        "群 ID 不需要传——工具内部已经锁定本群。\n\n"
-        "回答风格：\n"
-        " - 中文，2–6 句，像在打字而不是在写文章\n"
-        " - 不要 markdown，不要 @ 任何人，不要打招呼问候\n"
-        " - 不必每次都查工具——能直接答的就答；要查就查清楚再答\n"
-        " - 如果触发不值得回应（比如别人在聊天恰好@了你别的意思、"
-        "或问题完全跟你无关），调 stay_silent 让自己闭嘴"
-    )
-
-
 def _fetch_recent_for_agent(
     conn: sqlite3.Connection, group_id: str, limit: int
 ) -> list[sqlite3.Row]:
@@ -1542,6 +1512,7 @@ def chat_via_agent(
     writes one row to `agent_run_log` regardless of outcome (audit).
     """
     from .agent.memory import insert_run_log
+    from .agent.persona import assemble_system_prompts
     from .agent.runtime import run_agent
     from .agent.tools import GroupScopedTools
     from .agent.tools_read import register_phase_a_tools
@@ -1587,8 +1558,15 @@ def chat_via_agent(
         vision_max_tokens=ctx.vision_max_tokens,
     )
 
-    system_prompt = _build_agent_phase_a_system(
-        bot_name=ctx.bot_name, group_name=ctx.group_name
+    # Persona: yaml core + persona_drift table → both system prompts. Yaml
+    # missing → built-in defaults; see agent/persona.py.
+    system_prompt, phase_b_system_full = assemble_system_prompts(
+        conn=ctx.conn,
+        group_id=ctx.group_id,
+        group_name=ctx.group_name,
+        bot_name=ctx.bot_name,
+        personas_dir=settings.agent_personas_dir,
+        base_phase_b_prompt=phase_b_system_prompt(),
     )
 
     write_tools: GroupScopedTools | None = None
@@ -1599,7 +1577,7 @@ def chat_via_agent(
             group_name=ctx.group_name, bot_name=ctx.bot_name,
         )
         register_phase_b_tools(write_tools)
-        phase_b_system = phase_b_system_prompt()
+        phase_b_system = phase_b_system_full
 
     result = run_agent(
         llm=ctx.llm,  # type: ignore[arg-type]  # OpenAICompatLLM satisfies ToolingLLM structurally

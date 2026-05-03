@@ -14,6 +14,7 @@ dependencies = [
     "openai>=1.50.0",
     "pydantic>=2.13.3",
     "pydantic-settings>=2.14.0",
+    "pyyaml>=6.0.3",
     "qrcode[pil]>=8.2",
     "rapidocr-onnxruntime>=1.4.4",
     "typer>=0.25.1",
