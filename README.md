@@ -199,6 +199,8 @@ uv run wechat-oracle dispatcher
 @小号 /explain 这句话是什么意思：SQLite 开了 WAL
 ```
 
+> **图片直读**：如果引用的是一张图片消息，且配置了 `WO_VISION_API_KEY`，会跳过 OCR 文本路径直接把图片字节喂视觉模型。无需 sentinel 协议——用户已经明确指定哪张图。视觉关闭或图片文件不存在时降级回文本路径，看到的就是 `[图片]` 占位。
+
 ### 自由问答兜底
 
 不带 `/` 命令的 @ 消息直接进入兜底：把最近 2500 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。

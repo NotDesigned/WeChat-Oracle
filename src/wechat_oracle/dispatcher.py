@@ -666,15 +666,27 @@ class ExplainCommand(Command):
     def execute(self, ctx: CommandContext) -> ExecResult:
         quoted = ctx.quoted_text.strip() if ctx.quoted_text else ""
         explicit = self.text.strip()
+        if not quoted and not explicit:
+            text = "请引用一条消息后发送 `/explain`，或者写成 `/explain <待解释文本>`。"
+            return ExecResult(stdout=text, chat=text, summary="explain: missing input")
+
+        # If the user 引用ed an image and we have a vision client, send the
+        # actual bytes directly — there's no point asking the text model to
+        # explain a `[图片]` placeholder. Single-pass: the user has already
+        # pointed at the exact message, so no <NEED_IMAGES> selector needed.
+        image_path = (
+            _resolve_quoted_image_path(ctx.conn, ctx.quoted_msg_id)
+            if ctx.vision is not None else None
+        )
+        if image_path is not None:
+            return self._execute_vision(ctx, image_path, explicit)
+
         if quoted:
             source = f"引用内容：{quoted}"
             if explicit:
                 source += f"\n用户补充：{explicit}"
-        elif explicit:
-            source = f"待解释文本：{explicit}"
         else:
-            text = "请引用一条消息后发送 `/explain`，或者写成 `/explain <待解释文本>`。"
-            return ExecResult(stdout=text, chat=text, summary="explain: missing input")
+            source = f"待解释文本：{explicit}"
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         user = f"当前时间：{now_str}\n{source}"
@@ -700,6 +712,43 @@ class ExplainCommand(Command):
                     bool(quoted), len(explicit), len(reply))
         stdout = f"/explain\n{source}\n\n{reply}"
         return ExecResult(stdout=stdout, chat=reply, summary=f"explain ({len(reply)} chars)")
+
+    def _execute_vision(
+        self, ctx: CommandContext, image_path: Path, explicit: str
+    ) -> ExecResult:
+        assert ctx.vision is not None  # checked by caller
+        prompt = "用户在群里引用了一张图片，要求你解释。"
+        if explicit:
+            prompt += f" 补充说明：{explicit}"
+        prompt += " 请直接说明图里的内容含义、关键信息、必要时指出不确定点。中文 2-6 句，不用 markdown，不 @ 任何人。"
+        try:
+            image_bytes = image_path.read_bytes()
+            reply_raw = ctx.vision.complete_with_images(
+                model=ctx.vision_model,
+                system=_EXPLAIN_SYSTEM_PROMPT,
+                user=prompt,
+                images=[image_bytes],
+                temperature=0.2,
+                max_tokens=ctx.vision_max_tokens or settings.short_max_tokens,
+            )
+        except Exception as e:
+            logger.warning("/explain vision failed ({}); falling back to text", e)
+            text = "（视觉模型调用失败，无法直接解读这张图。）"
+            return ExecResult(stdout=text, chat=text, summary=f"explain-vision: {e}")
+        reply = (reply_raw or "").strip() or "（模型没返回内容，再问一次试试）"
+        if ctx.llm_log_path:
+            _dump_llm_call(
+                ctx.llm_log_path,
+                label=f"/explain-vision  ::  {explicit[:60] or '(quoted image)'}",
+                system=_EXPLAIN_SYSTEM_PROMPT,
+                user=prompt,
+                raw=reply_raw,
+                parsed=None,
+            )
+        logger.info("explain :: image={} explicit_len={} reply_len={}",
+                    image_path.name, len(explicit), len(reply))
+        stdout = f"/explain (图片直读)\n{image_path}\n\n{reply}"
+        return ExecResult(stdout=stdout, chat=reply, summary=f"explain-vision ({len(reply)} chars)")
 
 
 # ---------- /help ----------
@@ -1182,6 +1231,28 @@ def _extract_need_images(text: str) -> tuple[str, list[str]]:
                 cand_ids.append(tok)
     cleaned = _NEED_IMAGES_RE.sub("", text).strip()
     return cleaned, cand_ids
+
+
+def _resolve_quoted_image_path(
+    conn: sqlite3.Connection, wx_msg_id: str | None
+) -> Path | None:
+    """If `wx_msg_id` (from a quote-reply's `<refermsg><svrid>`) points to
+    an image row whose media file is on disk, return its resolved path.
+    None for everything else — non-image, no media_path, file missing,
+    or no quote at all. Used by /explain to feed the actual bytes when
+    the user 引用ed an image."""
+    if not wx_msg_id:
+        return None
+    row = conn.execute(
+        "SELECT type, media_path FROM messages WHERE wx_msg_id=?",
+        (wx_msg_id,),
+    ).fetchone()
+    if not row or row["type"] != "image" or not row["media_path"]:
+        return None
+    p = Path(row["media_path"])
+    if not p.is_absolute():
+        p = settings.data_dir / row["media_path"]
+    return p if p.exists() else None
 
 
 def _resolve_image_paths(
