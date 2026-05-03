@@ -373,22 +373,37 @@ class ChatCommand(Command):
     def execute(self, ctx: CommandContext) -> ExecResult:
         """Multi-turn tool-calling agent loop. Returns ExecResult with
         chat='' (the silent signal honored by `_process`) when the agent
-        chose stay_silent. Full trace in `agent_run_log`."""
-        reply = chat_via_agent(ctx=ctx, user_question=self.message, trigger_kind="mention")
+        chose stay_silent. Full trace in `agent_run_log`; readable trace
+        block lands in dispatcher.log via stdout."""
+        reply, trace_block = chat_via_agent(
+            ctx=ctx, user_question=self.message, trigger_kind="mention",
+        )
         if reply is None:
-            stdout = (
-                f"@<bot> agent  ::  {self.message}\n"
-                f"  (stay_silent — see agent_run_log for trace)"
+            stdout_parts = [
+                f"@<bot> agent  ::  {self.message}",
+                "  (silent — see agent_run_log for full trace)",
+            ]
+            if trace_block:
+                stdout_parts.append(trace_block)
+            return ExecResult(
+                stdout="\n".join(stdout_parts),
+                chat="",
+                summary="agent: silent",
             )
-            return ExecResult(stdout=stdout, chat="", summary="agent: silent")
         if not reply.strip():
             reply = "（agent 没返回内容，再问一次试试）"
-        stdout = (
-            f"@<bot> agent  ::  {self.message}\n"
-            f"  (reply_len={len(reply)})\n"
-            f"{reply}"
+        stdout_parts = [
+            f"@<bot> agent  ::  {self.message}",
+            f"  (reply_len={len(reply)})",
+            reply,
+        ]
+        if trace_block:
+            stdout_parts.append(trace_block)
+        return ExecResult(
+            stdout="\n".join(stdout_parts),
+            chat=reply,
+            summary=f"agent ({len(reply)} chars)",
         )
-        return ExecResult(stdout=stdout, chat=reply, summary=f"agent ({len(reply)} chars)")
 
 
 # ---------- /ask ----------
@@ -1274,6 +1289,65 @@ def _format_recent_for_agent(
     return "\n".join(out) if out else "（最近群里没消息）"
 
 
+def _trace_step_line(s: dict[str, object]) -> str:
+    """Render one trace step as a one-liner for dispatcher.log. Compact,
+    grep-friendly, but readable enough that you don't need to dig into the
+    raw JSON for normal debugging."""
+    step = s.get("step", "?")
+    kind = s.get("kind")
+    if kind == "tool_call":
+        tool = s.get("tool") or "?"
+        try:
+            args_str = json.dumps(s.get("args") or {}, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args_str = repr(s.get("args"))
+        if len(args_str) > 120:
+            args_str = args_str[:117] + "..."
+        result = (s.get("result") or "")
+        if isinstance(result, str):
+            result = result.replace("\n", " ").strip()
+            if len(result) > 200:
+                result = result[:197] + "..."
+        return f"  step{step} → {tool}({args_str})  ⇒ {result}"
+    if kind == "final":
+        content = s.get("content")
+        if content:
+            text = str(content).replace("\n", " ").strip()
+            if len(text) > 200:
+                text = text[:197] + "..."
+            return f"  step{step} ← FINAL: {text}"
+        return f"  step{step} ← FINAL: (empty)"
+    if kind == "terminate":
+        return f"  step{step} ← TERMINATE: {s.get('reason') or '?'}"
+    if kind == "tool_error":
+        return f"  step{step} ✗ {s.get('tool') or '?'} ERROR: {(s.get('error') or '?')[:120]}"
+    if kind == "tool_crash":
+        return f"  step{step} ✗ {s.get('tool') or '?'} CRASHED: {(s.get('error') or '?')[:120]}"
+    if kind == "tool_budget_exceeded":
+        return f"  step{step} ✗ BUDGET: {(s.get('error') or '?')[:120]}"
+    if kind == "empty_final_retry":
+        return f"  step{step} ↻ empty final → nudge → retry"
+    if kind == "max_steps_hit":
+        return f"  step{step} ⚠ MAX STEPS HIT"
+    return f"  step{step} ?{kind}: {json.dumps(s, ensure_ascii=False, default=str)[:160]}"
+
+
+def _format_trace_for_log(
+    phase_a_trace: list[dict[str, object]] | None,
+    phase_b_trace: list[dict[str, object]] | None,
+) -> str:
+    """Render Phase A + Phase B traces as block of compact lines suitable for
+    dispatcher.log. Empty / None traces collapse to nothing."""
+    parts: list[str] = []
+    if phase_a_trace:
+        parts.append("[Phase A]")
+        parts.extend(_trace_step_line(s) for s in phase_a_trace)
+    if phase_b_trace:
+        parts.append("[Phase B]")
+        parts.extend(_trace_step_line(s) for s in phase_b_trace)
+    return "\n".join(parts)
+
+
 def _fetch_recent_for_agent(
     conn: sqlite3.Connection, group_id: str, limit: int
 ) -> list[sqlite3.Row]:
@@ -1297,11 +1371,16 @@ def chat_via_agent(
     ctx: CommandContext,
     user_question: str,
     trigger_kind: str = "mention",
-) -> str | None:
+) -> tuple[str | None, str]:
     """Run the multi-turn agent loop for an @<bot> chat trigger.
 
-    Returns the reply text, or None if the agent chose stay_silent. Always
-    writes one row to `agent_run_log` regardless of outcome (audit).
+    Returns `(reply_text, trace_block)` where:
+      - `reply_text` is the text to send to the group (None when the agent
+        chose stay_silent, returned empty, etc.).
+      - `trace_block` is a multi-line human-readable rendering of the
+        Phase A + Phase B traces, suitable for appending to dispatcher.log.
+
+    Always writes one row to `agent_run_log` regardless of outcome (audit).
     """
     from .agent.memory import insert_run_log, link_last_run_id
     from .agent.persona import assemble_system_prompts
@@ -1433,6 +1512,8 @@ def chat_via_agent(
         logger.exception("failed to write agent_run_log; agent reply still returned")
 
     if ctx.llm_log_path:
+        # Full trace dump (not just count) so llm_debug.log is self-sufficient
+        # for post-mortem; dispatcher.log gets a compact one-liner version.
         _dump_llm_call(
             ctx.llm_log_path,
             label=f"agent  ::  {user_question[:60]}",
@@ -1440,7 +1521,7 @@ def chat_via_agent(
             user=user_msg,
             raw=result.reply_text or "(stay_silent)",
             parsed={
-                "phase_a_steps": len(result.phase_a_trace),
+                "phase_a_trace": result.phase_a_trace,
                 "phase_b_trace": result.phase_b_trace,
             },
         )
@@ -1449,7 +1530,8 @@ def chat_via_agent(
         trigger_kind, ctx.trigger_msg_id, len(result.phase_a_trace),
         len(result.reply_text or ""),
     )
-    return result.reply_text
+    trace_block = _format_trace_for_log(result.phase_a_trace, result.phase_b_trace)
+    return result.reply_text, trace_block
 
 
 def summarize_chat(
@@ -1900,7 +1982,9 @@ def _process_agent_only(
         _send_agent_ack(replier, row, requester)
 
     try:
-        reply = chat_via_agent(ctx=ctx, user_question=user_question, trigger_kind=kind)
+        reply, trace_block = chat_via_agent(
+            ctx=ctx, user_question=user_question, trigger_kind=kind,
+        )
     except Exception as e:
         logger.exception("agent crashed on msg_id={} kind={}", msg_id, kind)
         _finalize(conn, msg_id, "error", f"agent-crash: {e}")
@@ -1908,7 +1992,13 @@ def _process_agent_only(
 
     summary = f"agent[{kind}]: " + ("silent" if reply is None else f"{len(reply)} chars")
     print(f"@<bot> agent[{kind}]  ::  msg_id={msg_id}  ->  {summary}", flush=True)
-    _append_log(log_path, row["t"], f"agent[{kind}] msg_id={msg_id}\n{reply or '(silent)'}")
+    log_block_parts = [
+        f"agent[{kind}] msg_id={msg_id}",
+        reply or "(silent)",
+    ]
+    if trace_block:
+        log_block_parts.append(trace_block)
+    _append_log(log_path, row["t"], "\n".join(log_block_parts))
     if reply and reply.strip():
         replier.send(row["group_name"], requester, reply)
         _mark_bot_spoke(row["group_id"])
