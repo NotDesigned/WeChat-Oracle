@@ -1301,24 +1301,32 @@ def chat_assistant(
             f"直接输出最终回答正文，不要说「看图后我发现…」之类的元描述。"
             f"严格遵守第一轮回答的格式要求（中文、不超过 6 句、无 markdown、不 @ 人）。"
         )
-        final = vision.complete_with_images(
+        # step2 uses the base prompt (no NEED_IMAGES tail) — there's no step3,
+        # and the vision model would otherwise echo the sentinel into the
+        # final group reply (it has no idea the tag is system-internal).
+        vision_system = _CHAT_SYSTEM_PROMPT_BASE
+        final_raw = vision.complete_with_images(
             model=vision_model,
-            system=_CHAT_SYSTEM_PROMPT,
+            system=vision_system,
             user=vision_user,
             images=images,
             temperature=0.3,
             max_tokens=vision_max_tokens,
         )
+        # Defensive: even with the tail removed from step2's system prompt,
+        # the model may still parrot a `<NEED_IMAGES>` it saw in step1's
+        # answer (which we passed as context). Always strip before returning.
+        final, _ = _extract_need_images(final_raw)
         if log_path:
             _dump_llm_call(
                 log_path,
                 label=f"chat-vision  ::  {question}  ({len(paths)} imgs)",
-                system=_CHAT_SYSTEM_PROMPT,
+                system=vision_system,
                 user=vision_user,
-                raw=final,
+                raw=final_raw,
                 parsed=None,
             )
-        return final.strip() or cleaned
+        return final or cleaned
     except Exception as e:
         logger.warning(
             "vision second-pass failed ({} imgs requested): {}; falling back to text answer",
