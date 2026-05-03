@@ -14,6 +14,7 @@ A local-first WeChat group-chat archiver with an LLM-backed in-group Q&A assista
   - `/find <描述>` — 语义检索群历史（LLM 精筛 + 关键词兜底）
   - `/sum <主题>` — 总结当前群的一段聊天
   - `/recent [N]` — 直接列最近入库消息，不调用 LLM
+  - `/balance` — 查询当前 LLM API 账号余额
   - `/ask <问题>` — 纯模型问答，不读取群聊上下文，省 token
   - `/explain` — 解释引用消息或给定文本
   - `/help` — 查命令
@@ -172,6 +173,14 @@ uv run wechat-oracle dispatcher
 @小号 /recent 20
 ```
 
+### `/balance` — 查询 LLM 余额
+
+不调用 LLM，直接请求当前 `WO_LLM_ENDPOINT` 对应的 DeepSeek 兼容余额接口。若 endpoint 以 `/v1` 结尾，会自动退回根路径后请求 `/user/balance`。
+
+```
+@小号 /balance
+```
+
 ### `/ask` — 纯模型问答
 
 不读取群聊历史，只把问题本身发给 LLM。适合翻译、改写、解释概念、写短文本这类不需要群聊上下文的场景，比自由问答兜底省 token。
@@ -228,6 +237,7 @@ uv run wechat-oracle worker mm
 - `@小号 /find` → ⚠️ 缺参数 + `/find` 用法
 - `@小号 /sum since:badformat` → ⚠️ since 格式说明
 - `@小号 /recent abc` → ⚠️ N 必须是正整数
+- `@小号 /balance x` → ⚠️ `/balance` 不需要参数
 - `@小号 /xyz` → ⚠️ 未知命令 + 命令总览
 
 ---
@@ -375,6 +385,7 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 - `@<bot> /sum ...` → `SumCommand`：复用 `fetch_candidates`，只看当前群，可用 `from:` / `since:` / `limit:` 收窄后让 LLM 总结
 - `@<bot> /recent [N]` → `RecentCommand`：复用 `fetch_candidates`，但不调用 LLM，直接渲染最近消息
+- `@<bot> /balance` → `BalanceCommand`：不调用 LLM，GET `<WO_LLM_ENDPOINT root>/user/balance` 查询账号余额
 - `@<bot> /explain ...` → `ExplainCommand`：不查 DB；优先解释当前引用消息，否则解释命令后文本
 
 ---

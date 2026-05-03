@@ -6,6 +6,7 @@ Watches the messages table for inbound commands and dispatches each to a
     /find @<target> [since:YYYY[-MM[-DD]]] <description>
     /sum [from:<target>|@<target>] [since:YYYY[-MM[-DD]]] [limit:N] [topic]
     /recent [N]
+    /balance
     /ask <question>
     /explain [question-or-text]
     /help [<command>]
@@ -596,6 +597,32 @@ class RecentCommand(Command):
         return ExecResult(stdout=text, chat=text, summary=f"recent ({len(cands)})")
 
 
+# ---------- /balance ----------
+
+@register
+class BalanceCommand(Command):
+    name = "balance"
+    usage = "/balance"
+    description = "查询当前 LLM API 账号余额；DeepSeek 兼容接口"
+    examples = [
+        "/balance",
+    ]
+
+    @classmethod
+    def parse(cls, args: str) -> "BalanceCommand | ParseError":
+        if args.strip():
+            return ParseError("/balance 不需要参数", show_help=cls)
+        return cls()
+
+    def execute(self, ctx: CommandContext) -> ExecResult:
+        if not settings.llm_api_key:
+            text = "WO_LLM_API_KEY 为空，无法查询余额。"
+            return ExecResult(stdout=text, chat=text, summary="balance: missing key")
+        payload = fetch_llm_balance()
+        text = format_llm_balance(payload)
+        return ExecResult(stdout=text, chat=text, summary="balance")
+
+
 # ---------- /explain ----------
 
 _EXPLAIN_SYSTEM_PROMPT = """你是微信群里的简明解释助手。用户显式使用 /explain，通常是在引用一条消息后要求解释。
@@ -1184,6 +1211,51 @@ def _clip_one_line(text: str, limit: int) -> str:
     if len(one) <= limit:
         return one
     return one[:limit - 1] + "…"
+
+
+def _llm_balance_url() -> str:
+    endpoint = settings.llm_endpoint.rstrip("/")
+    if endpoint.endswith("/v1"):
+        endpoint = endpoint[:-3]
+    return endpoint + "/user/balance"
+
+
+def fetch_llm_balance() -> dict[str, object]:
+    import httpx
+
+    resp = httpx.get(
+        _llm_balance_url(),
+        headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        timeout=20.0,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("balance API returned non-object JSON")
+    return payload
+
+
+def format_llm_balance(payload: dict[str, object]) -> str:
+    available = payload.get("is_available")
+    lines = [f"LLM 余额状态：{'可用' if available else '不可用'}"]
+    infos = payload.get("balance_infos")
+    if not isinstance(infos, list) or not infos:
+        lines.append("未返回余额明细。")
+        return "\n".join(lines)
+    for item in infos:
+        if not isinstance(item, dict):
+            continue
+        currency = item.get("currency") or item.get("currency_code") or "?"
+        total = item.get("total_balance", "?")
+        granted = item.get("granted_balance")
+        topped = item.get("topped_up_balance")
+        line = f"{currency}: total={total}"
+        if granted is not None:
+            line += f", granted={granted}"
+        if topped is not None:
+            line += f", topped_up={topped}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def keyword_fallback(cands: list[Candidate], keywords: list[str], cap: int = 5) -> list[str]:
