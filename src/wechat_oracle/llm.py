@@ -17,6 +17,27 @@ from typing import Literal, Protocol
 from openai import OpenAI
 
 
+def _sniff_image_mime(data: bytes) -> str:
+    """Detect Content-Type from image magic bytes.
+
+    DashScope (and most vision APIs) reject mismatched MIME — e.g. PNG
+    bytes labeled `image/jpeg` may be silently downsampled or rejected.
+    Per DashScope docs, supported types are bmp/jpeg/png/tiff/webp/heic;
+    we cover the WeChat-common five and fall back to jpeg.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    if data[4:12] in (b"ftypheic", b"ftypheix", b"ftyphevc", b"ftypmif1"):
+        return "image/heic"
+    return "image/jpeg"
+
+
 JsonMode = Literal["native", "prompt"]
 
 
@@ -170,10 +191,11 @@ class OpenAICompatVisionLLM:
     ) -> str:
         content: list[dict[str, object]] = [{"type": "text", "text": user}]
         for img in images:
+            mime = _sniff_image_mime(img)
             b64 = base64.b64encode(img).decode("ascii")
             content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
             })
         kwargs: dict[str, object] = {
             "model": model,
