@@ -106,6 +106,11 @@ class CommandContext:
     vision_model: str = ""
     vision_max_images: int = 3
     vision_max_tokens: int | None = None
+    # The triggering message itself — agent loop uses these to identify the
+    # current trigger row for `agent_run_log.trigger_msg_id` and to anchor
+    # the trigger context the agent reads. Other commands ignore them.
+    trigger_msg_id: int | None = None
+    trigger_t: int | None = None
 
 
 @dataclass
@@ -351,11 +356,14 @@ class ChatCommand(Command):
         return cls(message=msg)
 
     def execute(self, ctx: CommandContext) -> ExecResult:
-        # Chat context: include EVERY message type (link cards, files, video
-        # shares, transfers, system events, image/voice placeholders, etc.)
-        # so the LLM sees the full timeline. `for_chat=True` widens the SQL
-        # filter and substitutes type-based placeholders for NULL content_text.
-        # See CLAUDE.md F7.
+        # Agent loop is opt-in via WO_AGENT_ENABLED. When off (today's
+        # default) → fall through to the legacy single-pass + vision-sentinel
+        # path. When on → multi-turn tool-calling agent decides whether and
+        # what to reply.
+        if settings.agent_enabled:
+            return self._execute_agent(ctx)
+
+        # Legacy path. See chat_assistant docstring for the two-pass design.
         context = fetch_candidates(
             ctx.conn,
             group_id=ctx.group_id,
@@ -393,6 +401,28 @@ class ChatCommand(Command):
             f"{reply}"
         )
         return ExecResult(stdout=stdout, chat=reply, summary=f"chat ({len(context)} ctx)")
+
+    def _execute_agent(self, ctx: CommandContext) -> ExecResult:
+        """WO_AGENT_ENABLED=True branch: multi-turn tool-calling loop.
+
+        Returns ExecResult with chat='' (silent signal honored by _process)
+        when the agent chose stay_silent. The full trace lives in
+        agent_run_log; stdout shows a one-line summary for the operator."""
+        reply = chat_via_agent(ctx=ctx, user_question=self.message, trigger_kind="mention")
+        if reply is None:
+            stdout = (
+                f"@<bot> agent  ::  {self.message}\n"
+                f"  (stay_silent — see agent_run_log for trace)"
+            )
+            return ExecResult(stdout=stdout, chat="", summary="agent: silent")
+        if not reply.strip():
+            reply = "（agent 没返回内容，再问一次试试）"
+        stdout = (
+            f"@<bot> agent  ::  {self.message}\n"
+            f"  (reply_len={len(reply)})\n"
+            f"{reply}"
+        )
+        return ExecResult(stdout=stdout, chat=reply, summary=f"agent ({len(reply)} chars)")
 
 
 # ---------- /ask ----------
@@ -1427,6 +1457,193 @@ def chat_assistant(
         return cleaned
 
 
+# --- agent loop integration (commit 4) -------------------------------------
+#
+# Trigger layer note: in v0 ChatCommand only fires when `parse_command` saw an
+# @<bot> mention, so `_should_wake_agent` always returns 'mention' here.
+# Probability and reply-to-bot triggers need a hook in the dispatcher main
+# poll loop (currently we only LIKE-match on bot_name), and require a known
+# bot_wxid for `is_reply_to_bot()`. Tracking that as future work — the agent
+# code itself accepts any `trigger_kind`, only the call site is gated.
+
+
+def _format_recent_for_agent(rows: list[sqlite3.Row]) -> str:
+    """One line per message, oldest first. Bare integer msg_ids in [...] so
+    the agent can pass them straight to its tools (which take int, not the
+    legacy `m:N` cand_id format used by /find)."""
+    out: list[str] = []
+    for r in rows:
+        sender = r["sender_display"] or r["sender_wxid"] or "?"
+        wxid = r["sender_wxid"] or "?"
+        ts = datetime.fromtimestamp(int(r["t"])).strftime("%Y-%m-%d %H:%M")
+        body = r["content_text"] or r["transcript"] or f"[{r['type']}]"
+        body = body.replace("\n", " ").strip()
+        out.append(f"[{r['msg_id']}] {ts} {sender} ({wxid}): {body}")
+    return "\n".join(out) if out else "（最近群里没消息）"
+
+
+def _build_agent_phase_a_system(
+    *, bot_name: str, group_name: str | None
+) -> str:
+    """Default system prompt used until commit 6 swaps in yaml personas.
+    Keeps the operational rules even after that swap (yaml will only carry
+    voice/tone/personality)."""
+    group = group_name or "（未命名群）"
+    return (
+        f"你是微信群「{group}」里的成员，群昵称叫「{bot_name}」。"
+        " 用户 @ 了你或对你说话，请像群友一样自然回应。\n\n"
+        "你能调用的工具：\n"
+        " - recall_group_history(query, ...)：在本群历史里搜过往发言（substring 匹配）\n"
+        " - view_quoted_chain(msg_id)：跟随某条消息的引用链上溯\n"
+        " - expand_forward_bundle(msg_id)：展开合并转发的子消息\n"
+        " - read_image(msg_id, prompt?)：让视觉模型直接看一张图\n"
+        " - read_voice(msg_id)：拿语音转写（已转写的秒返）\n"
+        " - who_is(sender_wxid)：看某成员的笔记 + 最近发言\n"
+        " - read_member_notes(sender_wxid) / read_group_notes(topic?)：取笔记\n"
+        " - stay_silent(reason)：判断这次不该回应，闭嘴\n\n"
+        "调用约定：所有 msg_id 是整数（context 里方括号 `[123]` 的数字）；"
+        "群 ID 不需要传——工具内部已经锁定本群。\n\n"
+        "回答风格：\n"
+        " - 中文，2–6 句，像在打字而不是在写文章\n"
+        " - 不要 markdown，不要 @ 任何人，不要打招呼问候\n"
+        " - 不必每次都查工具——能直接答的就答；要查就查清楚再答\n"
+        " - 如果触发不值得回应（比如别人在聊天恰好@了你别的意思、"
+        "或问题完全跟你无关），调 stay_silent 让自己闭嘴"
+    )
+
+
+def _fetch_recent_for_agent(
+    conn: sqlite3.Connection, group_id: str, limit: int
+) -> list[sqlite3.Row]:
+    """Newest `limit` messages in this group, returned oldest-first."""
+    rows = conn.execute(
+        """
+        SELECT msg_id, t, type, sender_wxid, sender_display,
+               content_text, transcript
+          FROM messages
+         WHERE group_id=?
+         ORDER BY t DESC
+         LIMIT ?
+        """,
+        (group_id, limit),
+    ).fetchall()
+    return list(reversed(rows))
+
+
+def chat_via_agent(
+    *,
+    ctx: CommandContext,
+    user_question: str,
+    trigger_kind: str = "mention",
+) -> str | None:
+    """Run the multi-turn agent loop for an @<bot> chat trigger.
+
+    Returns the reply text, or None if the agent chose stay_silent. Always
+    writes one row to `agent_run_log` regardless of outcome (audit).
+    """
+    from .agent.memory import insert_run_log
+    from .agent.runtime import run_agent
+    from .agent.tools import GroupScopedTools
+    from .agent.tools_read import register_phase_a_tools
+
+    started_at = time.time()
+    recent_rows = _fetch_recent_for_agent(
+        ctx.conn, ctx.group_id, settings.agent_recent_context_chat
+    )
+    recent_block = _format_recent_for_agent(recent_rows)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    requester_line = (
+        f"提问者: {ctx.requester}（即上下文里 sender_display=={ctx.requester!r} 的那位）\n"
+        if ctx.requester else ""
+    )
+    quoted_line = (
+        f"用户引用的一条消息片段: {ctx.quoted_text.strip()}\n"
+        if ctx.quoted_text and ctx.quoted_text.strip() else ""
+    )
+    trigger_line = (
+        f"触发原因: {trigger_kind}\n"
+        f"触发消息 msg_id: {ctx.trigger_msg_id}\n"
+    )
+    user_msg = (
+        f"当前时间: {now_str}\n"
+        f"{trigger_line}"
+        f"{requester_line}"
+        f"{quoted_line}"
+        f"\n最近群消息（按时间正序，最旧→最新）：\n{recent_block}\n\n"
+        f"---\n用户对你说: {user_question}"
+    )
+
+    read_tools = GroupScopedTools(
+        conn=ctx.conn,
+        group_id=ctx.group_id,
+        group_name=ctx.group_name,
+        bot_name=ctx.bot_name,
+    )
+    register_phase_a_tools(
+        read_tools,
+        vision=ctx.vision,
+        vision_model=ctx.vision_model,
+        vision_max_tokens=ctx.vision_max_tokens,
+    )
+
+    system_prompt = _build_agent_phase_a_system(
+        bot_name=ctx.bot_name, group_name=ctx.group_name
+    )
+
+    # Phase B (write tools) lands in commit 5 — pass write_tools=None so
+    # run_agent skips reflection regardless of WO_AGENT_REFLECTION_ENABLED.
+    result = run_agent(
+        llm=ctx.llm,  # type: ignore[arg-type]  # OpenAICompatLLM satisfies ToolingLLM structurally
+        model=ctx.model,
+        phase_a_system=system_prompt,
+        phase_a_user=user_msg,
+        read_tools=read_tools,
+        write_tools=None,
+        phase_b_system=None,
+        max_steps=settings.agent_max_steps,
+        reflect_max_steps=settings.agent_reflect_max_steps,
+        reflection_enabled=False,
+        temperature=0.5,
+        max_tokens=settings.chat_max_tokens,
+    )
+    finished_at = time.time()
+
+    try:
+        with transaction(ctx.conn):
+            insert_run_log(
+                ctx.conn,
+                group_id=ctx.group_id,
+                trigger_msg_id=ctx.trigger_msg_id,
+                trigger_kind=trigger_kind,
+                phase_a_trace=result.phase_a_trace,
+                phase_b_trace=result.phase_b_trace,
+                reply_text=result.reply_text,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+    except Exception:
+        logger.exception("failed to write agent_run_log; agent reply still returned")
+
+    if ctx.llm_log_path:
+        _dump_llm_call(
+            ctx.llm_log_path,
+            label=f"agent  ::  {user_question[:60]}",
+            system=system_prompt,
+            user=user_msg,
+            raw=result.reply_text or "(stay_silent)",
+            parsed={
+                "phase_a_steps": len(result.phase_a_trace),
+                "phase_b_trace": result.phase_b_trace,
+            },
+        )
+    logger.info(
+        "agent :: trigger={} msg_id={} steps={} reply_len={}",
+        trigger_kind, ctx.trigger_msg_id, len(result.phase_a_trace),
+        len(result.reply_text or ""),
+    )
+    return result.reply_text
+
+
 def summarize_chat(
     client: LLMClient,
     model: str,
@@ -1663,6 +1880,8 @@ def _process(
         vision_model=settings.vision_model,
         vision_max_images=settings.vision_max_images,
         vision_max_tokens=settings.vision_max_tokens,
+        trigger_msg_id=int(msg_id),
+        trigger_t=int(row["t"]),
     )
     try:
         result = parsed.execute(ctx)
@@ -1677,7 +1896,11 @@ def _process(
 
     print(result.stdout, flush=True)
     _append_log(log_path, row["t"], result.stdout)
-    replier.send(row["group_name"], requester, result.chat)
+    # Empty `chat` is the explicit silent signal — wired by the agent loop's
+    # stay_silent path. Skip the replier so wx4py doesn't ship empty text into
+    # the group; the operator still sees the audit line in stdout/log.
+    if result.chat.strip():
+        replier.send(row["group_name"], requester, result.chat)
     _finalize(conn, msg_id, "ok", result.summary)
 
 
@@ -1725,9 +1948,10 @@ def run_dispatcher() -> None:
     interval = settings.dispatcher_poll_interval
 
     logger.info(
-        "dispatcher: bot={!r} model={} vision={} interval={}s replier={} commands={} log={} llm_log={}",
+        "dispatcher: bot={!r} model={} vision={} agent={} interval={}s replier={} commands={} log={} llm_log={}",
         settings.bot_name, settings.llm_model,
         f"{settings.vision_model}" if vision else "off",
+        f"on (max_steps={settings.agent_max_steps})" if settings.agent_enabled else "off",
         interval,
         type(replier).__name__, list(COMMANDS), log_path, llm_log_path,
     )
