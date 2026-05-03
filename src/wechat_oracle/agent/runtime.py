@@ -202,29 +202,77 @@ def run_phase_a(
     max_tokens: int | None = None,
     tool_budget: ToolBudget | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
-    """Run the Phase A read-only loop. Returns `(reply_text, trace)`."""
+    """Run the Phase A read-only loop. Returns `(reply_text, trace)`.
+
+    Three exits, all observable in the trace:
+      A. Explicit stay_silent     → trace ends with `kind=terminate reason=stay_silent`
+      B. Final text (incl. empty) → trace ends with `kind=final content=<text|None>`
+                                     If empty on first turn (no tool calls + no
+                                     stay_silent), retried once with a nudge
+                                     (`kind=empty_final_retry` step recorded).
+      C. Max steps hit            → last step is `kind=max_steps_hit`. The last
+                                     non-tool-call turn forces tool_choice='none'
+                                     so the model MUST emit text (or stay_silent)
+                                     — C should be very rare in practice.
+
+    The user_message is augmented with a runtime hint telling the model how
+    many steps it has; without that the model can't pace itself. On the
+    penultimate turn we add a wrap-up nudge; on the last turn we both nudge
+    AND set tool_choice='none' so any further tool calls would be ignored.
+    """
+    augmented_user = (
+        user_message
+        + f"\n\n[runtime] 你最多有 {max_steps} 个 tool-calling 回合"
+        " (每回合可同时调多个工具)。最后一个回合工具调用会被禁用,你必须输出最终文本或调 stay_silent。"
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
+        {"role": "user", "content": augmented_user},
     ]
     tool_specs = tools.openai_specs()
     trace: list[dict[str, Any]] = []
-    reply: str | None = ""  # default to "" so bare empty content → silent
+    empty_retry_used = False
 
     for step in range(max_steps):
+        is_last_step = step == max_steps - 1
+        is_penultimate = step == max_steps - 2
+
+        # Penultimate-step warning (only when there are at least 2 steps).
+        if is_penultimate and max_steps >= 2:
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"[runtime] step {step+1}/{max_steps}: 还剩 1 个回合就要强制收尾。"
+                    " 如果还需要调工具,这一步用完;否则直接输出最终回答。"
+                ),
+            })
+
+        # On the last step: force final text or stay_silent — no more
+        # tool-gathering. tool_choice='none' tells the provider to disallow
+        # function calls; the system message is belt-and-braces in case the
+        # provider ignores tool_choice.
+        if is_last_step:
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"[runtime] 这是你最后一回合 (step {step+1}/{max_steps})。"
+                    " 工具调用已禁用。基于已有信息直接输出最终回答,"
+                    " 或如果实在无法回答就在文字里说清楚为什么 — 不要返回空内容。"
+                ),
+            })
+        tool_choice = "none" if is_last_step else "auto"
+
         resp = llm.complete_with_tools(
             model=model,
             messages=messages,
             tools=tool_specs,
             temperature=temperature,
             max_tokens=max_tokens,
-            tool_choice="auto",
+            tool_choice=tool_choice,
         )
         messages.append(resp.assistant_message)
 
-        if resp.tool_calls:
-            # Special-case stay_silent BEFORE running it: terminate the loop
-            # with reply=None even if other calls share this turn.
+        if resp.tool_calls and not is_last_step:
             silent = any(c.name == "stay_silent" for c in resp.tool_calls)
             tool_msgs = _execute_tool_calls(
                 tools, resp.tool_calls, trace, step, budget=tool_budget
@@ -235,13 +283,37 @@ def run_phase_a(
                 return None, trace
             continue
 
-        # No tool calls → the assistant emitted final text (or empty).
+        # No tool calls → final text (possibly empty).
         reply = (resp.content or "").strip() or None
         trace.append({"step": step, "kind": "final", "content": reply})
+
+        # Empty-final retry: model output nothing, didn't call any tool, and
+        # didn't call stay_silent. Likely confused about whether to answer.
+        # Give one explicit nudge before accepting silence; only retry once,
+        # only on the first step (later retries would compound oddly).
+        if (
+            reply is None
+            and step == 0
+            and not empty_retry_used
+            and not is_last_step
+        ):
+            empty_retry_used = True
+            trace.append({"step": step, "kind": "empty_final_retry"})
+            messages.append({
+                "role": "system",
+                "content": (
+                    "[runtime] 你刚才的回应是空的。"
+                    " 请要么给出实际回答,要么调用 stay_silent 工具并说明 reason。"
+                    " 不能空着结束。"
+                ),
+            })
+            continue
+
         return reply, trace
 
-    # Hit the step cap without final text. Best-effort: take whatever the
-    # last assistant content was; otherwise fall through silent.
+    # Max-steps fallback. Should rarely fire because the last step uses
+    # tool_choice='none', but if the provider ignores that and emits only
+    # tool calls, fall back to whatever assistant text we did see.
     trace.append({"step": max_steps, "kind": "max_steps_hit"})
     last_content: str | None = None
     for m in reversed(messages):

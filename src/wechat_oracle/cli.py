@@ -240,12 +240,46 @@ def agent_wipe(
     typer.echo(f"wiped: {', '.join(targets)}")
 
 
+def _classify_silent(phase_a_trace: list[dict[str, object]] | None) -> tuple[str, str]:
+    """Categorize why an agent run ended without a reply. Returns (label, detail).
+    Labels: 'stay_silent' (A) / 'empty' (B) / 'max_steps' (C) / 'unknown'."""
+    if not phase_a_trace:
+        return "unknown", ""
+    # A: explicit termination via stay_silent
+    for s in phase_a_trace:
+        if s.get("kind") == "terminate" and s.get("reason") == "stay_silent":
+            # Reason given by the model lives in the prior tool_call args
+            for prior in phase_a_trace:
+                if prior.get("kind") == "tool_call" and prior.get("tool") == "stay_silent":
+                    args = prior.get("args") or {}
+                    return "stay_silent", str(args.get("reason", ""))[:80]
+            return "stay_silent", ""
+    # C: hit the step cap
+    for s in phase_a_trace:
+        if s.get("kind") == "max_steps_hit":
+            return "max_steps", ""
+    # B: a final step with empty content
+    for s in phase_a_trace:
+        if s.get("kind") == "final" and not s.get("content"):
+            retried = any(t.get("kind") == "empty_final_retry" for t in phase_a_trace)
+            return "empty", "(retried once)" if retried else ""
+    return "unknown", ""
+
+
 @agent_app.command("show-runs")
 def agent_show_runs(
     group_id: str = typer.Argument(..., help="messages.group_id of the target group"),
     limit: int = typer.Option(10, "--limit", "-n"),
 ) -> None:
-    """Recent agent_run_log entries with phase-B writes highlighted."""
+    """Recent agent_run_log entries with phase-B writes highlighted.
+
+    Silent runs are tagged with one of three causes:
+      stay_silent: model called the stay_silent tool (healthy decision)
+      empty:       model returned empty final text without calling stay_silent
+                   (likely confused / refused — investigate the trigger msg)
+      max_steps:   model burned all tool-calling rounds without emitting text
+                   (rare since runtime forces final on last step)
+    """
     import json as _json
     from datetime import datetime
     from .agent.memory import list_recent_runs
@@ -258,7 +292,16 @@ def agent_show_runs(
     for r in rows:
         ts = datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S") if r["started_at"] else "?"
         dur = (r["finished_at"] - r["started_at"]) if (r["started_at"] and r["finished_at"]) else 0
-        reply = (r["reply_text"] or "").replace("\n", " ")[:80] or "(silent)"
+        reply_text = r["reply_text"]
+        if reply_text is None or not reply_text.strip():
+            try:
+                pa = _json.loads(r["phase_a_trace"] or "[]")
+            except _json.JSONDecodeError:
+                pa = []
+            label, detail = _classify_silent(pa)
+            reply = f"(silent: {label}{' — ' + detail if detail else ''})"
+        else:
+            reply = reply_text.replace("\n", " ")[:80]
         typer.echo(
             f"[{r['run_id']}] {ts}  trigger={r['trigger_kind']:12s}  "
             f"msg_id={r['trigger_msg_id'] or '?':>7}  {dur:.1f}s"

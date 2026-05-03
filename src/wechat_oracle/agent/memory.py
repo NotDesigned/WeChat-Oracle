@@ -153,11 +153,13 @@ def insert_run_log(
 def list_recent_runs(
     conn: sqlite3.Connection, group_id: str, limit: int = 10
 ) -> list[sqlite3.Row]:
-    """Newest first. Used by `wechat-oracle agent show-runs`."""
+    """Newest first. Used by `wechat-oracle agent show-runs`. Returns the
+    full phase_a_trace + phase_b_trace JSON so the caller can inspect tool
+    calls and silent reasons without a second query."""
     return conn.execute(
         """
         SELECT run_id, trigger_msg_id, trigger_kind, reply_text,
-               started_at, finished_at, phase_b_trace
+               started_at, finished_at, phase_a_trace, phase_b_trace
           FROM agent_run_log
          WHERE group_id=?
          ORDER BY run_id DESC
