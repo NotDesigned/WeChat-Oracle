@@ -215,8 +215,22 @@ class ToolingLLM(Protocol):
 def _coerce_assistant_message(msg: Any) -> dict[str, Any]:
     """Normalize the OpenAI SDK's message object into a plain dict the agent
     runtime can re-feed verbatim. Tool calls keep their string `arguments`
-    payload so the model sees the exact text it produced earlier."""
+    payload so the model sees the exact text it produced earlier.
+
+    Thinking-mode providers (DeepSeek-V4, Qwen-Thinking, etc.) emit a
+    `reasoning_content` field alongside `content`. Their server REQUIRES we
+    echo it on the next turn — missing it = HTTP 400
+    "reasoning_content must be passed back to the API". The OpenAI SDK
+    doesn't have it on its typed schema, so check both attribute access
+    and the pydantic model_extra fallback.
+    """
     out: dict[str, Any] = {"role": "assistant", "content": msg.content}
+    rc = getattr(msg, "reasoning_content", None)
+    if rc is None:
+        extra = getattr(msg, "model_extra", None) or {}
+        rc = extra.get("reasoning_content") if isinstance(extra, dict) else None
+    if rc:
+        out["reasoning_content"] = rc
     tcs = getattr(msg, "tool_calls", None) or []
     if tcs:
         out["tool_calls"] = [
