@@ -19,7 +19,8 @@ Conventions:
 Sections:
   - SLASH COMMAND SYSTEMS  — /ask, /sum, /explain, /find
   - SLASH COMMAND BLURBS   — vision prompts, fallback strings
-  - DISPATCHER FRAMINGS    — agent ack, probability framing, reply fallback
+  - DISPATCHER FRAMINGS    — empty-body mention stub, probability framing,
+                             reply fallback
   - PERSONA                — Phase A ops rules + identity defaults +
                              knows-about / avoid labels + drift headers
   - PHASE A RUNTIME HINTS  — step budget, penultimate, last-step, empty retry
@@ -123,10 +124,16 @@ LLM_EMPTY_REPLY = "（模型没返回内容，再问一次试试）"
 # DISPATCHER FRAMINGS
 # ---------------------------------------------------------------------------
 
-# Sent into the WeChat group when the dispatcher accepts an @<bot> chat or a
-# reply-to-bot — a "we got it, working on it" so the user knows their request
-# wasn't dropped while the agent is thinking.
-AGENT_ACK = "收到，正在处理。"
+# Stub user-message used when the @<bot> mention message has no body of
+# its own — most often because WeChat split the user's question and the @
+# into two separate sends, or the user is @-mentioning to point at recent
+# group context. The agent's recent-messages block provides the surrounding
+# chat; the bot still has stay_silent if there's nothing worth responding to.
+MENTION_NO_BODY = (
+    "你刚被 @ 了，但这条消息本身没说具体内容——"
+    "用户可能把问题放在了上一条 / 前几条消息里，或者就是想让你看上下文回应。"
+    "看 recent 群消息判断该说什么；没什么可说的就 stay_silent。"
+)
 
 # Probability path: bot wakes from a random dice roll. Frame as "you're a
 # member of this group, here's a message — judge whether you have something

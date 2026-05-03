@@ -1367,11 +1367,6 @@ def _mark_bot_spoke(group_id: str, when: float | None = None) -> None:
         _BOT_LAST_SPOKE_AT[group_id] = when or time.time()
 
 
-def _send_agent_ack(replier: "Replier", row: sqlite3.Row, requester: str | None) -> None:
-    replier.send(row["group_name"], requester, prompts.AGENT_ACK)
-    _mark_bot_spoke(row["group_id"])
-
-
 def _claim(conn: sqlite3.Connection, msg_id: int) -> bool:
     """INSERT a 'running' row. False if another worker (or a previous run) has it."""
     try:
@@ -1524,8 +1519,12 @@ def _process(
     # the agent loop too — same agent, just dispatched through Command.
     parsed = parse_command(row["content_text"], settings.bot_name)
     if parsed is None:
-        _finalize(conn, msg_id, "ok", "(mention without command body)")
-        return
+        # @<bot> mention without a body in this message — common when WeChat
+        # splits the question and the @ into separate sends, or when the user
+        # @s the bot intending to point at recent group context. Hand to the
+        # agent with a stub framing; the recent-messages block gives it the
+        # surrounding chat to respond to. Bot can still stay_silent.
+        parsed = ChatCommand(message=prompts.MENTION_NO_BODY)
 
     if isinstance(parsed, ParseError):
         text = parsed.chat()
@@ -1534,9 +1533,6 @@ def _process(
         replier.send(row["group_name"], requester, text)
         _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
         return
-
-    if isinstance(parsed, ChatCommand):
-        _send_agent_ack(replier, row, requester)
 
     try:
         result = parsed.execute(ctx)
@@ -1583,9 +1579,6 @@ def _process_agent_only(
         user_question = prompts.PROBABILITY_USER.format(
             text=text or prompts.PROBABILITY_NON_TEXT_PLACEHOLDER,
         )
-
-    if kind == "reply":
-        _send_agent_ack(replier, row, requester)
 
     try:
         reply, trace_block = chat_via_agent(
