@@ -31,7 +31,12 @@ WeChat 客户端 ──► WeFlow（解密本地 DB 提供 HTTP API）
    /api/v1/messages   SSE push           /api/v1/messages
    （历史导入）        （实时）            （查询时拉群成员）
         │              │
-        └─► backfill ──┴─► live ──► SQLite (data/wechat-oracle.db)
+        │              ▼
+        │       ingest live 进程
+        │       ├─ 主线程: 写 messages 表
+        │       └─ mm 工作线程: OCR / ASR → 写 transcript
+        │              │
+        └─► backfill ──┴────► SQLite (data/wechat-oracle.db, WAL)
                                         │
                                         ▼
                                   dispatcher ──► LLM (OpenAI-compatible)
@@ -43,14 +48,14 @@ WeChat 客户端 ──► WeFlow（解密本地 DB 提供 HTTP API）
                                   wx4py 把回复打回群里
 ```
 
-四个进程相互独立，跑在 WAL 模式的同一份 SQLite 上：
+两个常驻进程跑在 WAL 模式的同一份 SQLite 上，一次性 / 调试入口若干：
 
 | 进程 | 职责 | 入口 |
 |---|---|---|
-| `ingest live` | SSE 订阅 + 写库 | `uv run wechat-oracle ingest live` |
-| `dispatcher` | 检测命令 → LLM → 群里回复 | `uv run wechat-oracle dispatcher` |
-| `worker mm` | 后台 OCR / ASR，填 `transcript` | `uv run wechat-oracle worker mm` |
+| `ingest live` | SSE 订阅 + 写库 + 内嵌 mm 工作线程跑 OCR/ASR 填 `transcript` | `uv run wechat-oracle ingest live` |
+| `dispatcher` | 检测命令 → LLM / agent loop → 群里回复 | `uv run wechat-oracle dispatcher` |
 | `ingest backfill` | 一次性导入历史 | `uv run wechat-oracle ingest backfill <file>` |
+| `worker mm` | 单独跑 OCR/ASR worker（一般不用——`ingest live` 已经包了；想 backfill 后 catch up 或单独调试时用） | `uv run wechat-oracle worker mm` |
 
 ---
 
@@ -97,7 +102,7 @@ WO_LLM_API_KEY=sk-...
 # WO_VISION_API_KEY=sk-...             # DashScope 兼容 key；空 = 关闭功能，纯 OCR 文本
 # WO_VISION_MODEL=qwen-vl-plus         # 默认；强推荐 qwen3-vl-plus 或 qwen3.6-plus（OCR 更强）
 
-# 多媒体识别（可选 — worker mm 进程的 ASR 模型档位）
+# 多媒体识别（可选 — mm worker 的 ASR 模型档位；mm 跟 ingest live 同进程跑）
 # WO_WHISPER_MODEL=small               # tiny|base|small|medium|large-v3，默认 small
 
 # Agent loop（@<bot> chat 路径，已默认启用）
@@ -113,27 +118,25 @@ uv run wechat-oracle init-db
 
 ### 4. 跑
 
-四个终端分别跑（worker mm 可选，但群里图片/语音不少时强烈建议开）：
+两个终端：
 
 ```powershell
-# Terminal 1 — 实时抓
+# Terminal 1 — 实时抓 + OCR/ASR 后台识别（mm 工作线程自动跟 live 一起起）
 uv run wechat-oracle ingest live
 
 # Terminal 2 — 命令调度（自动回复）
 uv run wechat-oracle dispatcher
 
-# Terminal 3 — OCR / ASR 后台识别（图片→文字、语音→转录，写进 messages.transcript）
-uv run wechat-oracle worker mm
-
-# Terminal 4 — 用大号在群里 @ 小号
+# 然后用大号在群里 @ 小号
 # @<小号> /help
 # @<小号> 谁今天提到了股票？
 # @<小号> 引用某条图片消息后 → /explain 或 /ask 这是什么
 ```
 
 > - **要让自动回复工作，WeChat 主窗口必须可见**（不能在托盘里）。dispatcher 启动时会用 wx4py 的 `get_group_nickname` 验证当前登录账号在每个群的昵称，跟 `WO_BOT_NAME` 对不上时 warning（不阻断；可能你登错号了）。
-> - **`worker mm` 首次跑会下载 RapidOCR / faster-whisper 模型权重**（几十 MB ~ 几 GB，看 `WO_WHISPER_MODEL` 档位），之后启动很快。
-> - **配了 `WO_VISION_API_KEY` 后才有图片直读能力**——chat 自由问答会自动二轮兜底 OCR 残缺的截图，`/explain` 和 `/ask` 引用图片时会把字节直接喂视觉模型。没配也能跑，但群里图片只看得到 OCR 文本（残的就是残的）。
+> - **`ingest live` 首次跑会按需下载 RapidOCR / faster-whisper 模型权重**（几十 MB ~ 几 GB，看 `WO_WHISPER_MODEL` 档位）——OCR/ASR 引擎是懒加载，群里第一张图 / 第一条语音才触发；纯文本流量下不消耗。
+> - **想单独跑 mm**（比如导入历史 backfill 后 catch up，或不开 live 时调试 OCR/ASR）：`uv run wechat-oracle worker mm`。日常部署不需要。
+> - **配了 `WO_VISION_API_KEY` 后才有图片直读能力**——agent 在 chat 自由问答里会用 `read_image` 工具直接看图，`/explain` 和 `/ask` 引用图片时会把字节直接喂视觉模型。没配也能跑，但群里图片只看得到 OCR 文本（残的就是残的）。
 
 ---
 
@@ -244,18 +247,18 @@ agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`�
 
 > agent 触发的检索池**包含**：直发文本 + **引用回复**（用户的回复正文）+ **合并转发包里的子项**（详见 [appmsg 子类型](#appmsg-子类型-localtype49-family)）+ **图片/语音的 OCR/ASR 文字**（详见 [多媒体识别](#多媒体识别-worker-mm)）。即「张三 2024 年的话被 2026 年某人转发进群」、「李四引用某人发言后说了啥」、「上周谁分享的那张报表显示啥」都搜得到。`/find` 用同一份检索池做 LLM 精筛。
 
-### 多媒体识别 (`worker mm`)
+### 多媒体识别（mm worker，跟 live 同进程跑）
 
-后台进程，把图片 / 语音里的文字识别出来填进 `messages.transcript`，让 dispatcher 检索时能看到内容而不只是 `[图片]` 占位：
+把图片 / 语音里的文字识别出来填进 `messages.transcript`，让 dispatcher 检索时能看到内容而不只是 `[图片]` 占位：
 
 - **OCR**：[rapidocr-onnxruntime](https://github.com/RapidAI/RapidOCR)（PP-OCRv4 ONNX，中文友好），CPU 上 ~1s/张
 - **ASR**：[faster-whisper](https://github.com/SYSTRAN/faster-whisper)，默认 `small` 模型，CPU 上接近实时；设 `WO_WHISPER_MODEL=tiny|base|medium|large-v3` 可覆盖
-- 两个模型**全本地跑**，识别内容不出本机
+- 两个模型**全本地跑**，识别内容不出本机；引擎都是**懒加载**，群里第一张图 / 第一条语音才触发模型权重下载和 RAM 占用
 - 处理顺序：按消息时间倒序（新的优先），队列空时 30s sleep
 - 三种状态：`transcript IS NULL`（待处理）/ `transcript=''`（处理过没识别出文字 / 文件丢了——不重试）/ `transcript='<text>'`（成功）
 - 出口：`fetch_candidates` 的 SQL CASE 优先用 `transcript`，形状 `[图片] <识别文字>` / `[语音] <转录>`，跟 `[链接]` 等占位前缀一脉相承
 
-启动：
+部署：默认在 `ingest live` 里以 daemon 线程跑——你启动 `uv run wechat-oracle ingest live` 就同时启动了 mm worker，**不用单独再开一个进程**。它和 live 主线程各持有自己的 SQLite 连接，靠 WAL 隔离写。要单独跑（比如导入完 backfill 后追识别、或者调试 OCR/ASR 时不想拉 live 流量）：
 
 ```powershell
 uv run wechat-oracle worker mm

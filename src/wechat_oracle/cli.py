@@ -36,12 +36,16 @@ app.add_typer(worker_app, name="worker")
 
 @worker_app.command("mm")
 def worker_mm() -> None:
-    """OCR images / ASR voice messages → write into messages.transcript.
+    """Standalone OCR/ASR worker. Usually you don't need to run this — `ingest
+    live` already starts an mm worker thread alongside SSE capture, so a
+    normal "live + dispatcher" deployment covers it.
 
-    Long-running. Polls newest-first. Models lazy-load on first use:
-    rapidocr-onnxruntime for images, faster-whisper (`small` by default; set
-    WO_WHISPER_MODEL=tiny|base|medium|large-v3 to override) for voice. Both
-    run locally on CPU — no data leaves the machine.
+    Use this command when you want to run mm on its own — e.g. to drain a
+    backfill queue without ingesting new messages, or to debug OCR/ASR in
+    isolation. Long-running. Polls newest-first. Models lazy-load on first
+    use: rapidocr-onnxruntime for images, faster-whisper (`small` by default;
+    set WO_WHISPER_MODEL=tiny|base|medium|large-v3 to override) for voice.
+    Both run locally on CPU — no data leaves the machine.
     """
     from .worker.mm import run_mm_worker
     run_mm_worker()
@@ -70,7 +74,13 @@ def ingest_backfill(
 
 @ingest_app.command("live")
 def ingest_live() -> None:
-    """Poll WeFlow's HTTP API for new messages in WO_GROUPS. Requires WeFlow running."""
+    """Subscribe to WeFlow SSE for new messages in WO_GROUPS, AND run the mm
+    OCR/ASR worker in a background thread. Requires WeFlow running.
+
+    Combined process so a normal deployment is just two terminals:
+    `ingest live` (this) + `dispatcher`. The mm thread shares the SQLite
+    file via WAL — no separate process needed.
+    """
     from .ingest.live import run_live
     run_live()
 

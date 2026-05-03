@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 架构一句话
 
-三个独立进程（`ingest live` / `dispatcher` / `ingest backfill`）共享一份 WAL 模式的 SQLite (`data/wechat-oracle.db`)。**WeFlow 的 HTTP API 是上游唯一真相源**——live 走 SSE 推流，backfill 导 WeFlow JSON 导出，没有路径直连微信原始 DB。dispatcher 轮询 DB，命中 `@<bot>` 文本后过 OpenAI-compatible LLM，再用 wx4py（Windows UI 自动化）把回复打回群。
+两个常驻进程（`ingest live` / `dispatcher`）+ 一次性 `ingest backfill`，共享一份 WAL 模式的 SQLite (`data/wechat-oracle.db`)。**WeFlow 的 HTTP API 是上游唯一真相源**——live 走 SSE 推流，backfill 导 WeFlow JSON 导出，没有路径直连微信原始 DB。`ingest live` 进程内开 daemon 线程跑 mm worker（OCR/ASR），共享 SQLite 写入靠 WAL 隔离。dispatcher 轮询 DB，命中 `@<bot>` 文本后走 agent loop（多轮 tool-calling），用 wx4py（Windows UI 自动化）把回复打回群。
 
 数据形态：`messages`（主表）+ `forwarded_records`（合并转发子项，`parent_msg_id` 反指）+ `command_runs`（dispatcher 幂等记录，`msg_id` 主键）。所有写入路径必须走 `ingest/writer.py:write_messages`，靠 `UNIQUE(dedupe_key)` 跨源去重。详细字段语义看 `schema.sql`（DDL 行级注释是主源）+ `models.py` docstring。
 
@@ -18,12 +18,13 @@ uv run wechat-oracle init-db           # 建表（幂等，每次跑前先来一
 uv run wechat-oracle status            # 查总条数 / 按 status / 按群分布——快速 health check
 ```
 
-三个长跑 / 一次性进程（生产路径上 `live` + `dispatcher` 同时常驻）：
+长跑 / 一次性进程（生产路径上 `live` + `dispatcher` 同时常驻）：
 
 ```bash
-uv run wechat-oracle ingest live                                 # SSE 实时抓 → DB
-uv run wechat-oracle dispatcher                                  # DB 轮询 → LLM → wx4py 回群
+uv run wechat-oracle ingest live                                 # SSE 实时抓 → DB；同进程内跑 mm OCR/ASR daemon 线程
+uv run wechat-oracle dispatcher                                  # DB 轮询 → agent loop / LLM → wx4py 回群
 uv run wechat-oracle ingest backfill <path.json> --format weflow # 一次性导入 WeFlow JSON 导出
+uv run wechat-oracle worker mm                                   # 单独跑 mm（一般不用，ingest live 已包；调试或追识别 backfill 行时用）
 ```
 
 诊断 `WO_GROUPS` 解析（群名找不到对应 wxid 时用）：

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -359,10 +360,28 @@ def _iter_sse_events(client: httpx.Client) -> Iterator[dict[str, Any]]:
             # `event:` and `id:` lines: ignored. The JSON payload already carries `event`.
 
 
+def _start_mm_worker_thread() -> threading.Thread:
+    """Run the OCR/ASR worker in a daemon thread alongside live ingest.
+
+    The mm worker has its own DB connection (sqlite3 connections are per-
+    thread; WAL mode handles concurrent writes from live + mm). Daemon=True
+    so the thread dies when the main thread exits — no separate shutdown
+    plumbing. Engines (rapidocr, faster-whisper) lazy-load on first use,
+    so there's no startup cost when the queue is empty.
+    """
+    from ..worker.mm import run_mm_worker
+    t = threading.Thread(target=run_mm_worker, name="mm-worker", daemon=True)
+    t.start()
+    return t
+
+
 def run_live() -> None:
     if not settings.groups:
         logger.warning("settings.groups is empty; nothing to watch. Set WO_GROUPS=...")
         return
+
+    _start_mm_worker_thread()
+    logger.info("mm worker thread started (OCR/ASR processing in background)")
 
     with _build_client() as client:
         sessions = _resolve_sessions(client, settings.groups)
