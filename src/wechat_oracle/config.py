@@ -64,12 +64,13 @@ class Settings(BaseSettings):
 
     # Dispatcher loop tunables.
     dispatcher_poll_interval: float = 3.0
+    dispatcher_worker_threads: int = 4       # parallel groups; each group stays serial
     dispatcher_candidate_limit: int = 500   # /find candidates per call
     dispatcher_context_chat: int = 2500     # @<bot> free-text context window
 
     # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
     # long-context chat/summaries breathe while keeping short utility commands cheap.
-    llm_max_tokens: int = 1000
+    llm_max_tokens: int = 5000
     llm_chat_max_tokens: int | None = None
     llm_sum_max_tokens: int | None = None
     llm_short_max_tokens: int | None = None
@@ -96,7 +97,7 @@ class Settings(BaseSettings):
 
     @property
     def short_max_tokens(self) -> int:
-        return self.llm_short_max_tokens or min(self.llm_max_tokens, 800)
+        return self.llm_short_max_tokens or self.llm_max_tokens
 
     # Agent loop (multi-turn tool-calling chat path). Triggers are classified
     # cheaply in dispatcher: direct @, quote-reply to bot, or optional

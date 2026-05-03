@@ -95,7 +95,8 @@ WO_BOT_NAME=<小号在群里的群昵称>
 WO_LLM_API_KEY=sk-...
 # WO_LLM_ENDPOINT=https://api.deepseek.com
 # WO_LLM_MODEL=deepseek-v4-pro
-# WO_LLM_MAX_TOKENS=1000               # 默认输出上限；chat/sum/short 可分别覆盖
+# WO_DISPATCHER_WORKER_THREADS=4       # 全局并行 worker 数；wx4py GUI 发送强制走单 sender 队列
+# WO_LLM_MAX_TOKENS=5000               # 默认输出上限；chat/sum/short 可分别覆盖
 # WO_REPLY=0                           # 默认 1 = 自动回到群里；0 = 只本地输出
 
 # 视觉模型（可选 — 让 chat / /explain / /ask 能读图原文，详见「视觉模型集成」段）
@@ -410,6 +411,7 @@ SQLite poll  ──►  _classify_trigger
 - 每 3s 扫 DB 找所有未处理的 live 非 system 消息；廉价 `_classify_trigger` 只看触发消息本身，不烧 LLM
 - `mention` 命中后 Python 端用 `parse_command` 三态 dispatch：`Command` / `ParseError` / `None`（mention 但无有效正文则静默）
 - 命令处理记录在 `command_runs` 表（msg_id 作主键），重启不重跑
+- dispatcher 调度是**全局并行**：扫到的所有未处理消息直接丢进 `WO_DISPATCHER_WORKER_THREADS`-大小的线程池，agent / LLM 同群多条也可同时跑。**代价**：同一个群里几条 @ 几乎同时进来时，bot 的回复会按 LLM 完成时间出现，可能不是消息时间序。`_GlobalScheduler` 用 in-flight `msg_id` 集合去重；`_claim`（atomic INSERT 进 `command_runs`）是源头真相去重。所有 wx4py GUI 发送强制汇入 `_SerialReplier` 单线程队列，避免多 worker 同时操作微信窗口
 - **启动跳过积压**：dispatcher 启动时把所有未处理的历史 live 非 system 消息一次性写入 `command_runs(status='ok', result='(startup-skip)')`，避免冷启动 / 长时间停机后对历史消息触发 mention / reply / probability。只对启动后新到的消息回复。
 
 ### `/find` 检索流水线
@@ -453,6 +455,8 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 7. 写一行 `agent_run_log`：group_id / trigger_msg_id / trigger_kind / phase_a_trace JSON / phase_b_trace JSON / reply_text / 时间戳——审计 + 调试主入口。如果 Phase B 写了 persona_drift / group_memory，对应行的 `last_run_id` 反向链回这次 run（防 summary drift 不可追溯）
 8. `reply_text` 非空 → 走 `replier.send` 发回群；空（`stay_silent`）→ dispatcher 跳过 send，群里看不到 bot 任何反应
+
+直接 @ 进入 agent 或 reply-to-bot 进入 agent 时，dispatcher 会先发一条短提示“收到，正在处理。”；`probability` 自主触发不会预提示，避免没决定要不要说话前先打扰群聊。
 
 **触发**：dispatcher 现在扫**所有未处理的 live 消息**（不只 @ 的），在 `_classify_trigger` 里分三类——
 
@@ -509,13 +513,14 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_LLM_ENDPOINT` | `https://api.deepseek.com` | OpenAI 兼容端点；供应商要求时带 `/v1` |
 | `WO_LLM_MODEL` | `deepseek-v4-pro` | 模型名 |
 | `WO_LLM_JSON_MODE` | `native` | `/find` JSON 返回模式：`native` 传 `response_format`，`prompt` 只靠 prompt 约束 |
-| `WO_LLM_MAX_TOKENS` | `1000` | LLM 输出 token 上限默认值 |
+| `WO_LLM_MAX_TOKENS` | `5000` | LLM 输出 token 上限默认值 |
 | `WO_LLM_CHAT_MAX_TOKENS` | — | 自由问答输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
 | `WO_LLM_SUM_MAX_TOKENS` | — | `/sum` 输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
-| `WO_LLM_SHORT_MAX_TOKENS` | — | `/ask` / `/explain` 输出上限；不设则用 `min(WO_LLM_MAX_TOKENS, 800)` |
+| `WO_LLM_SHORT_MAX_TOKENS` | — | `/ask` / `/explain` 输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
 | `WO_REPLY` | `True` | 是否自动回群里 |
 | `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `stdout`（不发）。openclaw 实测不可用，见下方「实验记录」段 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
+| `WO_DISPATCHER_WORKER_THREADS` | `4` | dispatcher 全局并行 worker 数；同群多条也可并发处理，回复顺序变成完成时间序。wx4py 发送强制走单 sender 队列（GUI 自动化只能一个线程操作） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | 旧 chat 窗口配置名；当前只作为 `/sum` 未显式 `limit:` 时的候选上限来源（实际 capped 到 500）。自由问答 agent 初始窗口用 `WO_AGENT_RECENT_CONTEXT_CHAT` |
 | `WO_VISION_PROVIDER` | `openai-compatible` | vision 适配器 |

@@ -34,14 +34,17 @@ from __future__ import annotations
 
 import abc
 import json
+import queue
 import random
 import re
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 from loguru import logger
 
@@ -1108,29 +1111,30 @@ def _dump_llm_call(
     note: str = "",
 ) -> None:
     """Append one LLM round-trip to the debug log. No-op if log_path is None."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    _maybe_rotate(log_path, _LLM_LOG_MAX_BYTES)
-    ts = datetime.now().isoformat(timespec="seconds")
-    sep = "=" * 70
-    parts = [
-        f"\n{sep}",
-        f"{ts}  {label}",
-        sep,
-        "--- SYSTEM ---",
-        system,
-        "--- USER ---",
-        user,
-        "--- RAW RESPONSE ---",
-        raw,
-    ]
-    if parsed is not None:
-        parts.append("--- PARSED ---")
-        parts.append(json.dumps(parsed, ensure_ascii=False, indent=2))
-    if note:
-        parts.append(f"--- NOTE ---\n{note}")
-    parts.append("")  # trailing newline
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write("\n".join(parts))
+    with _LLM_DEBUG_LOG_LOCK:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _maybe_rotate(log_path, _LLM_LOG_MAX_BYTES)
+        ts = datetime.now().isoformat(timespec="seconds")
+        sep = "=" * 70
+        parts = [
+            f"\n{sep}",
+            f"{ts}  {label}",
+            sep,
+            "--- SYSTEM ---",
+            system,
+            "--- USER ---",
+            user,
+            "--- RAW RESPONSE ---",
+            raw,
+        ]
+        if parsed is not None:
+            parts.append("--- PARSED ---")
+            parts.append(json.dumps(parsed, ensure_ascii=False, indent=2))
+        if note:
+            parts.append(f"--- NOTE ---\n{note}")
+        parts.append("")  # trailing newline
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("\n".join(parts))
 
 
 def llm_filter(
@@ -1556,6 +1560,10 @@ def keyword_fallback(cands: list[Candidate], keywords: list[str], cap: int = 5) 
 # dispatcher loop and any helpers it calls share one view; reset on restart
 # is acceptable.
 _BOT_LAST_SPOKE_AT: dict[str, float] = {}
+_BOT_LAST_SPOKE_AT_LOCK = threading.Lock()
+_DISPATCHER_LOG_LOCK = threading.Lock()
+_LLM_DEBUG_LOG_LOCK = threading.Lock()
+_AGENT_ACK_TEXT = "收到，正在处理。"
 
 
 def _resolve_bot_wxid(conn: sqlite3.Connection, bot_name: str) -> str | None:
@@ -1639,12 +1647,23 @@ def _classify_trigger(
     p = settings.agent_base_probability
     if p <= 0.0:
         return None
-    last = _BOT_LAST_SPOKE_AT.get(row["group_id"], 0.0)
+    with _BOT_LAST_SPOKE_AT_LOCK:
+        last = _BOT_LAST_SPOKE_AT.get(row["group_id"], 0.0)
     if now - last < settings.agent_cooldown_seconds:
         return None
     if random.random() < p:
         return "probability"
     return None
+
+
+def _mark_bot_spoke(group_id: str, when: float | None = None) -> None:
+    with _BOT_LAST_SPOKE_AT_LOCK:
+        _BOT_LAST_SPOKE_AT[group_id] = when or time.time()
+
+
+def _send_agent_ack(replier: "Replier", row: sqlite3.Row, requester: str | None) -> None:
+    replier.send(row["group_name"], requester, _AGENT_ACK_TEXT)
+    _mark_bot_spoke(row["group_id"])
 
 
 def _claim(conn: sqlite3.Connection, msg_id: int) -> bool:
@@ -1674,19 +1693,22 @@ def _next_unprocessed(
     bot_wxid: str | None = None,
     batch: int = 20,
 ) -> list[sqlite3.Row]:
-    """Live messages with no command_runs row yet. Trigger classification
-    happens in Python (`_classify_trigger`) — most rows return None and get
-    finalized as no-trigger; mention / reply / probability wake the agent.
+    """Oldest `batch` live messages with no command_runs row yet, globally.
+
+    No per-group serialization: same-group messages may be processed in
+    parallel (multiple agent runs on the one connection-per-thread + WAL).
+    De-duplication of in-flight msg_ids happens in `_GlobalScheduler.submit`;
+    `_claim` is the source-of-truth gate that turns a row into a
+    command_runs row and removes it from this query's output.
 
     Includes all message types except 'system' (撤回 / 入群 / 退群 — ambient
-    events, not user speech). 'forward' / 'link' / 'image' / 'voice' / etc.
-    all flow through; the agent decides whether they warrant a reply via
-    its `stay_silent` tool. Quote rows are essential — reply-to-bot lives
-    here.
+    events, not user speech). `forward` / `link` / `image` / `voice` /
+    `quote` all flow through; the agent decides whether they warrant a
+    reply via `stay_silent`.
 
-    `sender_display != bot_name` excludes the bot's own echoes. When
-    bot_wxid is known, also exclude by wxid so group nickname changes do not
-    make the dispatcher process its own replies.
+    `sender_display != bot_name` excludes the bot's own echoes; when
+    bot_wxid is known, the wxid check is the stronger guard (display name
+    can drift if you rename the bot in-group).
     """
     own_wxid_clause = ""
     params: list[object] = [bot_name]
@@ -1706,7 +1728,7 @@ def _next_unprocessed(
            AND r.msg_id IS NULL
            AND (m.sender_display IS NULL OR m.sender_display != ?)
            {own_wxid_clause}
-         ORDER BY m.t ASC
+         ORDER BY m.t ASC, m.msg_id ASC
          LIMIT ?
         """,
         params,
@@ -1732,10 +1754,11 @@ def _build_vision_client() -> VisionLLM | None:
 
 
 def _append_log(log_path: Path, command_t: int, block: str) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    when = datetime.fromtimestamp(command_t).strftime("%Y-%m-%d %H:%M:%S")
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"\n=== {when} ===\n{block}\n")
+    with _DISPATCHER_LOG_LOCK:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        when = datetime.fromtimestamp(command_t).strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n=== {when} ===\n{block}\n")
 
 
 def _process(
@@ -1814,6 +1837,9 @@ def _process(
         _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
         return
 
+    if isinstance(parsed, ChatCommand):
+        _send_agent_ack(replier, row, requester)
+
     try:
         result = parsed.execute(ctx)
     except Exception as e:
@@ -1829,7 +1855,7 @@ def _process(
     _append_log(log_path, row["t"], result.stdout)
     if result.chat.strip():
         replier.send(row["group_name"], requester, result.chat)
-        _BOT_LAST_SPOKE_AT[row["group_id"]] = now
+        _mark_bot_spoke(row["group_id"], now)
     _finalize(conn, msg_id, "ok", result.summary)
 
 
@@ -1870,6 +1896,9 @@ def _process_agent_only(
             " 不确定就 stay_silent——宁可不说，不要刷存在感。"
         )
 
+    if kind == "reply":
+        _send_agent_ack(replier, row, requester)
+
     try:
         reply = chat_via_agent(ctx=ctx, user_question=user_question, trigger_kind=kind)
     except Exception as e:
@@ -1882,8 +1911,165 @@ def _process_agent_only(
     _append_log(log_path, row["t"], f"agent[{kind}] msg_id={msg_id}\n{reply or '(silent)'}")
     if reply and reply.strip():
         replier.send(row["group_name"], requester, reply)
-        _BOT_LAST_SPOKE_AT[row["group_id"]] = time.time()
+        _mark_bot_spoke(row["group_id"])
     _finalize(conn, msg_id, "ok", summary)
+
+
+@dataclass
+class _SendJob:
+    group_name: str | None
+    requester: str | None
+    text: str
+    done: threading.Event = field(default_factory=threading.Event)
+    error: Exception | None = None
+
+
+class _SerialReplier:
+    """Run the real replier from one thread.
+
+    wx4py drives a single GUI, so worker threads must never call it directly.
+    `send()` blocks until the sender thread finishes that one GUI operation,
+    preserving the old "finalize after send attempt" behavior.
+    """
+
+    def __init__(self, inner: Replier) -> None:
+        self._inner = inner
+        self._queue: queue.Queue[_SendJob | None] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, name="wechat-oracle-sender", daemon=True
+        )
+        self._thread.start()
+
+    def send(self, group_name: str | None, requester: str | None, text: str) -> None:
+        job = _SendJob(group_name=group_name, requester=requester, text=text)
+        self._queue.put(job)
+        job.done.wait()
+        if job.error is not None:
+            raise job.error
+
+    def disconnect(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=10)
+        self._inner.disconnect()
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            try:
+                self._inner.send(job.group_name, job.requester, job.text)
+            except Exception as e:
+                logger.warning("queued replier send failed: {}", e)
+                job.error = e
+            finally:
+                job.done.set()
+
+
+class _GlobalScheduler:
+    """Global thread pool — all messages run in parallel, dedup by msg_id.
+
+    No per-group serialization: agent runs for two messages in the same group
+    can execute concurrently. Trade-off: if a single user fires two
+    @-mentions back-to-back and the second's run finishes first, the bot's
+    replies arrive in completion order rather than message order. Accepted
+    for throughput.
+
+    The replier is a `_SerialReplier` — wx4py drives one GUI window, so
+    the actual `send` call must happen from a single thread. Workers
+    enqueue into the sender thread and block until the GUI op finishes,
+    preserving the "finalize after send attempt" ordering.
+
+    Each worker thread keeps its own LLM / vision client (sqlite + LLM SDK
+    are not necessarily thread-safe across calls).
+    """
+
+    def __init__(
+        self,
+        *,
+        replier: Replier,
+        log_path: Path,
+        llm_log_path: Path | None,
+        bot_wxid_getter: Callable[[], str | None],
+        max_workers: int,
+    ) -> None:
+        self._replier = replier
+        self._log_path = log_path
+        self._llm_log_path = llm_log_path
+        self._bot_wxid_getter = bot_wxid_getter
+        self._local = threading.local()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, max_workers),
+            thread_name_prefix="wechat-oracle-msg",
+        )
+        self._lock = threading.Lock()
+        self._scheduled_msg_ids: set[int] = set()
+        self._closed = False
+
+    def _llm(self) -> LLMClient:
+        llm = getattr(self._local, "llm", None)
+        if llm is None:
+            llm = _build_llm_client()
+            self._local.llm = llm
+        return llm
+
+    def _vision(self) -> VisionLLM | None:
+        if not hasattr(self._local, "vision"):
+            self._local.vision = _build_vision_client()
+        return self._local.vision
+
+    def submit(self, row: sqlite3.Row) -> bool:
+        """Enqueue this row's processing. Returns False if it's already
+        in-flight (dedup) or the scheduler is shutting down. The poll loop
+        treats `submitted == 0` for an entire batch as "pool saturated" and
+        sleeps."""
+        row_dict = dict(row)
+        msg_id = int(row_dict["msg_id"])
+        with self._lock:
+            if self._closed or msg_id in self._scheduled_msg_ids:
+                return False
+            self._scheduled_msg_ids.add(msg_id)
+            self._executor.submit(self._handle, row_dict)
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=True)
+
+    def _forget(self, msg_id: int) -> None:
+        with self._lock:
+            self._scheduled_msg_ids.discard(msg_id)
+
+    def _handle(self, row: dict[str, object]) -> None:
+        msg_id = int(row["msg_id"])
+        try:
+            try:
+                with get_conn() as conn:
+                    # Source-of-truth dedup: even if our in-memory set somehow
+                    # missed, _claim is an atomic INSERT into command_runs and
+                    # rejects duplicates.
+                    if not _claim(conn, msg_id):
+                        return
+                    _process(
+                        conn,
+                        self._llm(),
+                        self._replier,
+                        row,
+                        self._log_path,
+                        self._llm_log_path,
+                        vision=self._vision(),
+                        bot_wxid=self._bot_wxid_getter(),
+                    )
+            except Exception as e:
+                logger.exception("dispatcher crashed on msg_id={}", msg_id)
+                try:
+                    with get_conn() as conn:
+                        _finalize(conn, msg_id, "error", f"crashed: {e}")
+                except Exception:
+                    logger.exception("failed to finalize crashed msg_id={}", msg_id)
+        finally:
+            self._forget(msg_id)
 
 
 def _skip_backlog(conn: sqlite3.Connection, bot_name: str) -> int:
@@ -1927,14 +2113,16 @@ def run_dispatcher() -> None:
     llm_log_path = settings.data_dir / "llm_debug.log"
     llm = _build_llm_client()
     vision = _build_vision_client()
-    replier = build_replier()
+    replier = _SerialReplier(build_replier())
     interval = settings.dispatcher_poll_interval
+    worker_threads = max(1, settings.dispatcher_worker_threads)
 
     logger.info(
-        "dispatcher: bot={!r} model={} vision={} agent_max_steps={} interval={}s replier={} commands={} log={} llm_log={}",
+        "dispatcher: bot={!r} model={} vision={} agent_max_steps={} workers={} interval={}s replier={} commands={} log={} llm_log={}",
         settings.bot_name, settings.llm_model,
         f"{settings.vision_model}" if vision else "off",
         settings.agent_max_steps,
+        worker_threads,
         interval,
         type(replier).__name__, list(COMMANDS), log_path, llm_log_path,
     )
@@ -1947,6 +2135,17 @@ def run_dispatcher() -> None:
                 skipped,
             )
         bot_wxid = _resolve_bot_wxid(conn, settings.bot_name)
+        bot_wxid_lock = threading.Lock()
+
+        def get_bot_wxid() -> str | None:
+            with bot_wxid_lock:
+                return bot_wxid
+
+        def set_bot_wxid(value: str | None) -> None:
+            nonlocal bot_wxid
+            with bot_wxid_lock:
+                bot_wxid = value
+
         if bot_wxid:
             logger.info(
                 "bot_wxid resolved: {} ({})",
@@ -1959,34 +2158,42 @@ def run_dispatcher() -> None:
                 "Set WO_BOT_WXID in .env to skip the discovery delay."
             )
         loops_since_wxid_retry = 0
+        scheduler = _GlobalScheduler(
+            replier=replier,
+            log_path=log_path,
+            llm_log_path=llm_log_path,
+            bot_wxid_getter=get_bot_wxid,
+            max_workers=worker_threads,
+        )
         try:
             while True:
-                rows = _next_unprocessed(conn, settings.bot_name, bot_wxid=bot_wxid)
+                rows = _next_unprocessed(
+                    conn,
+                    settings.bot_name,
+                    bot_wxid=get_bot_wxid(),
+                )
+                submitted = 0
                 for row in rows:
-                    if not _claim(conn, row["msg_id"]):
-                        continue
-                    try:
-                        _process(conn, llm, replier, row, log_path, llm_log_path,
-                                 vision=vision, bot_wxid=bot_wxid)
-                    except Exception as e:
-                        logger.exception("dispatcher crashed on msg_id={}", row["msg_id"])
-                        _finalize(conn, row["msg_id"], "error", f"crashed: {e}")
+                    if scheduler.submit(row):
+                        submitted += 1
                 # Lazy retry of bot_wxid discovery so reply-to-bot starts working
                 # automatically once WeFlow SSE echoes the first bot reply back.
                 # Cheap (one indexed query) but only if we don't have a value yet.
-                if bot_wxid is None:
+                if get_bot_wxid() is None:
                     loops_since_wxid_retry += 1
                     if loops_since_wxid_retry >= 5:
                         loops_since_wxid_retry = 0
-                        bot_wxid = _resolve_bot_wxid(conn, settings.bot_name)
-                        if bot_wxid:
+                        resolved = _resolve_bot_wxid(conn, settings.bot_name)
+                        if resolved:
+                            set_bot_wxid(resolved)
                             logger.info(
                                 "bot_wxid auto-discovered from echoed reply: {}",
-                                bot_wxid,
+                                resolved,
                             )
-                if not rows:
+                if not rows or submitted == 0:
                     time.sleep(interval)
         except KeyboardInterrupt:
             logger.info("dispatcher stopped by user")
         finally:
+            scheduler.close()
             replier.disconnect()

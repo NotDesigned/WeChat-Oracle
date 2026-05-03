@@ -103,7 +103,7 @@ def _extract_dataitem_timestamp(item: ET.Element) -> int | None:
         try:
             from datetime import datetime
             return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp())
-        except ValueError:
+        except (OSError, OverflowError, ValueError):
             pass
     return None
 
