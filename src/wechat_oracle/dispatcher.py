@@ -112,6 +112,12 @@ class CommandContext:
     # the trigger context the agent reads. Other commands ignore them.
     trigger_msg_id: int | None = None
     trigger_t: int | None = None
+    # Bot's own wxid (when known). Used by `chat_via_agent` to mark the
+    # bot's own rows in the recent-context dump so the LLM doesn't
+    # accidentally treat its prior replies as another user. None when
+    # auto-discovery hasn't found a value yet — markers degrade to
+    # showing the bot's wxid as just another sender.
+    bot_wxid: str | None = None
 
 
 @dataclass
@@ -1241,10 +1247,17 @@ from .agent.media_paths import (
 # code itself accepts any `trigger_kind`, only the call site is gated.
 
 
-def _format_recent_for_agent(rows: list[sqlite3.Row]) -> str:
+def _format_recent_for_agent(
+    rows: list[sqlite3.Row], bot_wxid: str | None = None
+) -> str:
     """One line per message, oldest first. Bare integer msg_ids in [...] so
     the agent can pass them straight to its tools (which take int, not the
-    legacy `m:N` cand_id format used by /find)."""
+    legacy `m:N` cand_id format used by /find).
+
+    When `bot_wxid` is known, mark the bot's own rows with `[自己]` after the
+    timestamp — without this the LLM tends to read its prior replies as
+    just-another-user and may parrot them or argue with itself.
+    """
     out: list[str] = []
     for r in rows:
         sender = r["sender_display"] or r["sender_wxid"] or "?"
@@ -1252,7 +1265,8 @@ def _format_recent_for_agent(rows: list[sqlite3.Row]) -> str:
         ts = datetime.fromtimestamp(int(r["t"])).strftime("%Y-%m-%d %H:%M")
         body = r["content_text"] or r["transcript"] or f"[{r['type']}]"
         body = body.replace("\n", " ").strip()
-        out.append(f"[{r['msg_id']}] {ts} {sender} ({wxid}): {body}")
+        self_tag = " [自己]" if bot_wxid and wxid == bot_wxid else ""
+        out.append(f"[{r['msg_id']}] {ts}{self_tag} {sender} ({wxid}): {body}")
     return "\n".join(out) if out else "（最近群里没消息）"
 
 
@@ -1296,7 +1310,7 @@ def chat_via_agent(
     recent_rows = _fetch_recent_for_agent(
         ctx.conn, ctx.group_id, settings.agent_recent_context_chat
     )
-    recent_block = _format_recent_for_agent(recent_rows)
+    recent_block = _format_recent_for_agent(recent_rows, bot_wxid=ctx.bot_wxid)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     requester_line = (
         f"提问者: {ctx.requester}（即上下文里 sender_display=={ctx.requester!r} 的那位）\n"
@@ -1310,11 +1324,17 @@ def chat_via_agent(
         f"触发原因: {trigger_kind}\n"
         f"触发消息 msg_id: {ctx.trigger_msg_id}\n"
     )
+    self_hint = (
+        f"\n（你自己的 wxid 是 {ctx.bot_wxid}；下面消息列表里标 [自己] 的行是你之前说过的话，"
+        "不要复读自己 / 不要跟自己抬杠。）"
+        if ctx.bot_wxid else ""
+    )
     user_msg = (
         f"当前时间: {now_str}\n"
         f"{trigger_line}"
         f"{requester_line}"
         f"{quoted_line}"
+        f"{self_hint}"
         f"\n最近群消息（按时间正序，最旧→最新）：\n{recent_block}\n\n"
         f"---\n用户对你说: {user_question}"
     )
@@ -1725,6 +1745,7 @@ def _process(
         vision_max_tokens=settings.vision_max_tokens,
         trigger_msg_id=int(msg_id),
         trigger_t=int(row["t"]),
+        bot_wxid=bot_wxid,
     )
 
     if kind != "mention":
@@ -1789,9 +1810,20 @@ def _process_agent_only(
         # via ctx.quoted_text and the agent prompt already inlines it.
         user_question = text or "（用户引用了你之前的话但没说什么）"
     else:  # probability
+        # Frame for stay-silent-by-default. The previous "要不要插一句话" was
+        # a question to the model and biased it toward at least saying
+        # SOMETHING; swap it for an observation + an explicit list of the
+        # only valid reasons to chime in.
         user_question = (
-            f"你正在群里偶然看到这条消息：「{text or '（非文本消息）'}」"
-            "。要不要插一句话？不必要就调 stay_silent 闭嘴；要回应就直接答。"
+            f"群里出现了一条消息：「{text or '（非文本消息）'}」\n\n"
+            "**默认你不说话**——群友的对话不需要 bot 介入。"
+            " 只在以下情况才考虑回应：\n"
+            "  1. 群里在问的事你恰好知道答案，且没人答上来\n"
+            "  2. 出现明显事实错误你能修正\n"
+            "  3. 是你之前提过 / 关心的话题的延续，且你有新东西要补\n"
+            "  4. 群里出现需要你之前帮过/答过类似问题的延续讨论\n"
+            "其他一律 stay_silent。"
+            " 不确定就 stay_silent——宁可不说，不要刷存在感。"
         )
 
     try:
