@@ -63,6 +63,18 @@ class Settings(BaseSettings):
     llm_sum_max_tokens: int | None = None
     llm_short_max_tokens: int | None = None
 
+    # Vision LLM — optional second-pass for `@<bot>` chat when the text model
+    # asks to see original images via `<NEED_IMAGES>` sentinel. Empty api_key
+    # disables; chat then runs text-only (transcript / [图片] markers only).
+    # Default endpoint/model target Qwen-VL via DashScope's OpenAI-compatible
+    # mode; any vendor accepting `image_url` content blocks works.
+    vision_provider: str = "openai-compatible"
+    vision_api_key: str = ""
+    vision_endpoint: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    vision_model: str = "qwen-vl-plus"
+    vision_max_images: int = 3      # hard cap per request; trims model over-asks
+    vision_max_tokens: int | None = 800
+
     @property
     def chat_max_tokens(self) -> int:
         return self.llm_chat_max_tokens or self.llm_max_tokens

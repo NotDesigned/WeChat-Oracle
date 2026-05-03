@@ -230,6 +230,21 @@ uv run wechat-oracle worker mm
 
 > ⚠️ **历史 backfill 行没有 media 文件**：从 WeFlow JSON 导出的图片 / 语音如果没带媒体目录（`media_path IS NULL`），worker 跳过——文件本就在 WeFlow 那边没复制过来，这些行永远空白。**只有 live 抓的（媒体存 WeFlow cache 绝对路径）能识别**。要补全历史，需要重新跑一次带 `media=1` 的 backfill。
 
+#### 视觉模型二轮兜底（可选）
+
+`worker mm` 的离线 OCR 是**检索的主索引**——所有历史问答都依赖 `transcript` 文本。但 PP-OCRv4 在截图模糊、表格、手写、复杂版面这些场景下会漏字。开启 `WO_VISION_API_KEY` 后，`@<bot>` 自由问答走**二轮兜底**：
+
+1. 第一轮：文本主模型（`WO_LLM_MODEL`）按 `transcript` 文本回答；如果 `[图片·OCR] <字>` 残缺/截断，会在回答末尾输出 `<NEED_IMAGES>m:12,m:47</NEED_IMAGES>` 列出要看的图
+2. 第二轮：python 解析这些 cand_id → 取文件字节 → 喂视觉模型（默认 Qwen-VL-Plus via DashScope）→ 它的回答覆盖第一轮
+
+特点：
+- **完全可插拔**：`WO_VISION_API_KEY` 为空时整个二轮关闭，行为跟今天一样（纯文本）
+- **决策权在模型**：第一轮模型自己判断 OCR 够不够用——OCR 命中关键字就直答，残缺才挂图
+- **硬上限 `WO_VISION_MAX_IMAGES=3`**：模型多挑也只取前 3 张，防止失控烧钱
+- **降级安全**：图文件不存在 / 视觉调用失败 → 用第一轮答案兜底，用户感知不到
+- **只在 chat 起作用**：`/find` `/sum` `/recent` 不走视觉，永远纯文本（cand_id 列表用不着图）
+- **`f:` 转发子项不挂图**：合并转发包里的图片不下载到本地，模型挑 `f:N` 会被静默丢弃
+
 ### 错误反馈
 
 写错命令不再静默——直接收到错误提示 + 该命令的帮助：
@@ -418,6 +433,12 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | 自由问答上下文窗口 |
+| `WO_VISION_PROVIDER` | `openai-compatible` | vision 适配器 |
+| `WO_VISION_API_KEY` | — | 视觉模型 API key；空 = 关闭功能（chat 退化成纯文本） |
+| `WO_VISION_ENDPOINT` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 默认指向 DashScope 兼容模式 |
+| `WO_VISION_MODEL` | `qwen-vl-plus` | 视觉模型名 |
+| `WO_VISION_MAX_IMAGES` | `3` | 单次 vision 请求最多附几张图（防失控烧钱） |
+| `WO_VISION_MAX_TOKENS` | `800` | 视觉调用输出上限 |
 
 ---
 

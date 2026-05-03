@@ -46,7 +46,7 @@ from loguru import logger
 
 from .config import settings
 from .db import get_conn, init_db, transaction
-from .llm import LLMClient, build_llm_client
+from .llm import LLMClient, VisionLLM, build_llm_client, build_vision_client
 from .replier import Replier, build_replier
 
 
@@ -101,6 +101,11 @@ class CommandContext:
     # into the LLM prompt; FindCommand ignores them.
     quoted_text: str | None = None
     quoted_msg_id: str | None = None
+    # Optional vision second-pass for `@<bot>` chat. None → text-only (today's behavior).
+    vision: VisionLLM | None = None
+    vision_model: str = ""
+    vision_max_images: int = 3
+    vision_max_tokens: int | None = None
 
 
 @dataclass
@@ -370,6 +375,11 @@ class ChatCommand(Command):
             ctx.llm, ctx.model, message, context,
             log_path=ctx.llm_log_path,
             requester=ctx.requester,
+            vision=ctx.vision,
+            vision_model=ctx.vision_model,
+            vision_max_images=ctx.vision_max_images,
+            vision_max_tokens=ctx.vision_max_tokens,
+            conn=ctx.conn,
         )
         if not reply:
             reply = "（模型没返回内容，再问一次试试）"
@@ -1125,7 +1135,67 @@ _CHAT_SYSTEM_PROMPT = """你是这个微信群里的小助手。用户 @ 了你�
 - 中文回答（除非问题明显是英文）
 - 不要 @ 任何人；不要用 markdown 语法（不要 `**` `#` `-` 这些）
 - 如果问题本身就跟群无关（"今天天气怎么样"），直接答即可，不要硬扯群聊
-- 提到"刚才/刚刚/最近"时，参考下方提供的"当前时间"做时间锚定；用户说"我"/"我刚才说了什么"等指代自己时，参考"提问者"字段定位他在群里的发言"""
+- 提到"刚才/刚刚/最近"时，参考下方提供的"当前时间"做时间锚定；用户说"我"/"我刚才说了什么"等指代自己时，参考"提问者"字段定位他在群里的发言
+
+需要看原图时（仅当 `[图片·OCR]` 文本明显残缺/截断、或仅有 `[图片]` 占位但用户在直接问那张图）：
+- 在你最终回答的**末尾**追加一行：`<NEED_IMAGES>id1,id2</NEED_IMAGES>`，里面填写要看原图的那几条 cand_id（即每行开头方括号里的 `c<数字>`，最多 3 个）
+- 系统会取出原图喂给一个视觉模型，由它出最终回答覆盖你这一轮
+- OCR 文本已经够回答问题就**不要**输出这个标签——会浪费一次调用
+- 不要无中生有 cand_id；只能从上下文真实出现的方括号 id 里挑"""
+
+
+_NEED_IMAGES_RE = re.compile(r"<NEED_IMAGES>([^<]*)</NEED_IMAGES>")
+
+
+def _extract_need_images(text: str) -> tuple[str, list[str]]:
+    """Pull `<NEED_IMAGES>...</NEED_IMAGES>` sentinels out of step1 output.
+
+    Returns (text-with-sentinels-stripped, comma-split cand_ids in order).
+    Multiple sentinels are concatenated; whitespace tokens dropped.
+    """
+    cand_ids: list[str] = []
+    for m in _NEED_IMAGES_RE.finditer(text):
+        for tok in m.group(1).split(","):
+            tok = tok.strip()
+            if tok:
+                cand_ids.append(tok)
+    cleaned = _NEED_IMAGES_RE.sub("", text).strip()
+    return cleaned, cand_ids
+
+
+def _resolve_image_paths(
+    conn: sqlite3.Connection, cand_ids: list[str]
+) -> list[Path]:
+    """Resolve `m:<msg_id>` cand_ids to existing image file paths.
+
+    Skips silently:
+      - `f:<...>` forwarded children (their inline images aren't downloaded)
+      - cand_ids that aren't `type='image'` or have no `media_path`
+      - files that don't exist on disk (live path on a different machine)
+
+    Path resolution mirrors worker/mm.py: absolute = WeFlow live cache,
+    relative = backfill anchored at data_dir.
+    """
+    paths: list[Path] = []
+    for cid in cand_ids:
+        if not cid.startswith("m:"):
+            continue
+        try:
+            msg_id = int(cid[2:])
+        except ValueError:
+            continue
+        row = conn.execute(
+            "SELECT type, media_path FROM messages WHERE msg_id=?",
+            (msg_id,),
+        ).fetchone()
+        if not row or row["type"] != "image" or not row["media_path"]:
+            continue
+        p = Path(row["media_path"])
+        if not p.is_absolute():
+            p = settings.data_dir / row["media_path"]
+        if p.exists():
+            paths.append(p)
+    return paths
 
 
 def chat_assistant(
@@ -1135,11 +1205,24 @@ def chat_assistant(
     context: list[Candidate],
     log_path: Path | None = None,
     requester: str | None = None,
+    *,
+    vision: VisionLLM | None = None,
+    vision_model: str = "",
+    vision_max_images: int = 3,
+    vision_max_tokens: int | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> str:
     """Free-form group-chat-assistant call. Returns plain text reply.
 
     `requester` (the sender's display name) gets a dedicated header line so the
     LLM can resolve "我" / "我刚才说了啥" against the right rows in `context`.
+
+    Two-pass when `vision` and `conn` are both provided:
+      1. text model answers; may append `<NEED_IMAGES>c12,c47</NEED_IMAGES>`
+      2. python resolves those cand_ids to image bytes (capped at
+         `vision_max_images`), feeds them to the vision model along with the
+         step1 answer, and uses the vision model's reply as the final answer.
+    Failures in step2 fall back to step1's stripped text — user always gets *some* answer.
     """
     if context:
         ctx_text = _format_candidates_for_llm(context)
@@ -1172,7 +1255,53 @@ def chat_assistant(
             raw=raw,
             parsed=None,
         )
-    return raw
+
+    cleaned, requested_ids = _extract_need_images(raw)
+    if not (vision and conn is not None and requested_ids):
+        return cleaned
+
+    paths = _resolve_image_paths(conn, requested_ids)[:vision_max_images]
+    if not paths:
+        logger.info(
+            "vision: step1 asked for {} cand_id(s) but none resolved to image files; using text answer",
+            len(requested_ids),
+        )
+        return cleaned
+
+    try:
+        images = [p.read_bytes() for p in paths]
+        vision_user = (
+            f"用户问题：{question}\n\n"
+            f"第一轮（仅基于 OCR 文本）的回答是：\n{cleaned or '（空）'}\n\n"
+            f"附了 {len(paths)} 张原图（OCR 文本可能不全或不准）。"
+            f"如果原图能补充 OCR 漏掉的关键内容，请重写回答；OCR 已经够用就保持原回答。"
+            f"直接输出最终回答正文，不要说「看图后我发现…」之类的元描述。"
+            f"严格遵守第一轮回答的格式要求（中文、不超过 6 句、无 markdown、不 @ 人）。"
+        )
+        final = vision.complete_with_images(
+            model=vision_model,
+            system=_CHAT_SYSTEM_PROMPT,
+            user=vision_user,
+            images=images,
+            temperature=0.3,
+            max_tokens=vision_max_tokens,
+        )
+        if log_path:
+            _dump_llm_call(
+                log_path,
+                label=f"chat-vision  ::  {question}  ({len(paths)} imgs)",
+                system=_CHAT_SYSTEM_PROMPT,
+                user=vision_user,
+                raw=final,
+                parsed=None,
+            )
+        return final.strip() or cleaned
+    except Exception as e:
+        logger.warning(
+            "vision second-pass failed ({} imgs requested): {}; falling back to text answer",
+            len(paths), e,
+        )
+        return cleaned
 
 
 def summarize_chat(
@@ -1341,6 +1470,15 @@ def _build_llm_client() -> LLMClient:
     )
 
 
+def _build_vision_client() -> VisionLLM | None:
+    """None when WO_VISION_API_KEY is empty — chat falls back to text-only."""
+    return build_vision_client(
+        provider=settings.vision_provider,
+        api_key=settings.vision_api_key,
+        endpoint=settings.vision_endpoint,
+    )
+
+
 def _append_log(log_path: Path, command_t: int, block: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     when = datetime.fromtimestamp(command_t).strftime("%Y-%m-%d %H:%M:%S")
@@ -1355,6 +1493,7 @@ def _process(
     row: sqlite3.Row,
     log_path: Path,
     llm_log_path: Path | None,
+    vision: VisionLLM | None = None,
 ) -> None:
     msg_id = row["msg_id"]
     parsed = parse_command(row["content_text"], settings.bot_name)
@@ -1397,6 +1536,10 @@ def _process(
         llm_log_path=llm_log_path,
         quoted_text=quoted_text,
         quoted_msg_id=quoted_msg_id,
+        vision=vision,
+        vision_model=settings.vision_model,
+        vision_max_images=settings.vision_max_images,
+        vision_max_tokens=settings.vision_max_tokens,
     )
     try:
         result = parsed.execute(ctx)
@@ -1454,12 +1597,15 @@ def run_dispatcher() -> None:
     log_path = settings.data_dir / "dispatcher.log"
     llm_log_path = settings.data_dir / "llm_debug.log"
     llm = _build_llm_client()
+    vision = _build_vision_client()
     replier = build_replier()
     interval = settings.dispatcher_poll_interval
 
     logger.info(
-        "dispatcher: bot={!r} model={} interval={}s replier={} commands={} log={} llm_log={}",
-        settings.bot_name, settings.llm_model, interval,
+        "dispatcher: bot={!r} model={} vision={} interval={}s replier={} commands={} log={} llm_log={}",
+        settings.bot_name, settings.llm_model,
+        f"{settings.vision_model}" if vision else "off",
+        interval,
         type(replier).__name__, list(COMMANDS), log_path, llm_log_path,
     )
 
@@ -1474,7 +1620,7 @@ def run_dispatcher() -> None:
                     if not _claim(conn, row["msg_id"]):
                         continue
                     try:
-                        _process(conn, llm, replier, row, log_path, llm_log_path)
+                        _process(conn, llm, replier, row, log_path, llm_log_path, vision=vision)
                     except Exception as e:
                         logger.exception("dispatcher crashed on msg_id={}", row["msg_id"])
                         _finalize(conn, row["msg_id"], "error", f"crashed: {e}")

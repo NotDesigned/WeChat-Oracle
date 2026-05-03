@@ -1,11 +1,17 @@
 """Pluggable LLM client boundary for dispatcher calls.
 
-The dispatcher needs only two shapes: plain text completion for chat-style
-answers, and JSON text completion for `/find`. Keep provider-specific SDK
-details here so command logic stays independent from any one vendor.
+The dispatcher needs three shapes: plain text completion for chat-style
+answers, JSON text completion for `/find`, and (optional) text+image
+completion for the vision second-pass in `chat_assistant`. Provider-
+specific SDK details live here so command logic stays vendor-independent.
+
+`VisionLLM` is intentionally a separate Protocol from `LLMClient`: vision
+is opt-in (off by default; chat falls back to text-only) and may use a
+different provider entirely (e.g. text=DeepSeek, vision=Qwen-VL).
 """
 from __future__ import annotations
 
+import base64
 from typing import Literal, Protocol
 
 from openai import OpenAI
@@ -118,3 +124,83 @@ def build_llm_client(
         endpoint=endpoint,
         json_mode=json_mode,  # type: ignore[arg-type]
     )
+
+
+# --- vision (optional second-pass for image-heavy chat questions) ----------
+
+
+class VisionLLM(Protocol):
+    """Text + image completion. `images` is raw bytes; the adapter handles
+    base64 / data URI / multipart wrapping per provider."""
+
+    name: str
+
+    def complete_with_images(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        images: list[bytes],
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+    ) -> str:
+        ...
+
+
+class OpenAICompatVisionLLM:
+    """OpenAI-compatible vision adapter — works with Qwen-VL (DashScope
+    `compatible-mode/v1`), GPT-4o, and any provider that accepts the
+    standard `image_url` content shape with a base64 data URI."""
+
+    name = "openai-compatible-vision"
+
+    def __init__(self, *, api_key: str, endpoint: str):
+        self._client = OpenAI(api_key=api_key, base_url=endpoint)
+
+    def complete_with_images(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        images: list[bytes],
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+    ) -> str:
+        content: list[dict[str, object]] = [{"type": "text", "text": user}]
+        for img in images:
+            b64 = base64.b64encode(img).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
+        kwargs: dict[str, object] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        resp = self._client.chat.completions.create(**kwargs)
+        return (resp.choices[0].message.content or "").strip()
+
+
+def build_vision_client(
+    *,
+    provider: str,
+    api_key: str,
+    endpoint: str,
+) -> VisionLLM | None:
+    """Returns None when api_key is empty — vision is off, callers fall
+    back to text-only chat. Non-empty key + unknown provider raises."""
+    if not api_key:
+        return None
+    if provider != "openai-compatible":
+        raise RuntimeError(
+            f"Unsupported WO_VISION_PROVIDER={provider!r}; only 'openai-compatible' is implemented"
+        )
+    return OpenAICompatVisionLLM(api_key=api_key, endpoint=endpoint)
