@@ -428,11 +428,23 @@ class AskCommand(Command):
         return cls(question=question)
 
     def execute(self, ctx: CommandContext) -> ExecResult:
+        # If the user 引用ed an image and we have a vision client, send the
+        # bytes directly — same single-pass route as /explain. /ask still
+        # honors its "no group history" promise: only the user's question
+        # + the one quoted image go to the model, no candidate context.
+        image_path = (
+            _resolve_quoted_image_path(ctx.conn, ctx.quoted_msg_id)
+            if ctx.vision is not None else None
+        )
+        if image_path is not None:
+            return self._execute_vision(ctx, image_path)
+
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         requester_line = f"提问者：{ctx.requester}\n" if ctx.requester else ""
-        # If the user 引用ed a message while invoking /ask, inline the quoted
-        # text so it's part of the question. Without this the quote is lost
-        # and "/ask 这句话什么意思" gets answered against thin air.
+        # 引用 a non-image message (text / link / card / etc.) → inline its
+        # text so the model can answer about it. Without this the quote is
+        # silently dropped and "/ask 这句话什么意思" gets answered against
+        # thin air.
         quoted_line = (
             f"用户引用了一条消息：{ctx.quoted_text.strip()}\n"
             if ctx.quoted_text and ctx.quoted_text.strip() else ""
@@ -460,6 +472,25 @@ class AskCommand(Command):
                     self.question[:60], bool(quoted_line), len(reply))
         stdout = f"/ask  ::  {self.question}\n  ({len(reply)} chars)\n{reply}"
         return ExecResult(stdout=stdout, chat=reply, summary=f"ask ({len(reply)} chars)")
+
+    def _execute_vision(
+        self, ctx: CommandContext, image_path: Path
+    ) -> ExecResult:
+        prompt = (
+            f"用户在群里引用了一张图片并问：{self.question}。"
+            f" 直接基于图片内容作答，必要时指出不确定点。"
+            f" 中文 2-6 句，不用 markdown，不 @ 任何人。"
+        )
+        return _run_vision_on_quoted_image(
+            ctx, image_path,
+            system_prompt=_ASK_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            log_label=f"/ask-vision  ::  {self.question[:60]}",
+            stdout_header=f"/ask (图片直读)  ::  {self.question}",
+            summary_label="ask-vision",
+            fail_message="（视觉模型调用失败，无法直接解读这张图。）",
+            temperature=0.3,
+        )
 
 
 # ---------- /sum ----------
@@ -724,39 +755,20 @@ class ExplainCommand(Command):
     def _execute_vision(
         self, ctx: CommandContext, image_path: Path, explicit: str
     ) -> ExecResult:
-        assert ctx.vision is not None  # checked by caller
         prompt = "用户在群里引用了一张图片，要求你解释。"
         if explicit:
             prompt += f" 补充说明：{explicit}"
         prompt += " 请直接说明图里的内容含义、关键信息、必要时指出不确定点。中文 2-6 句，不用 markdown，不 @ 任何人。"
-        try:
-            image_bytes = image_path.read_bytes()
-            reply_raw = ctx.vision.complete_with_images(
-                model=ctx.vision_model,
-                system=_EXPLAIN_SYSTEM_PROMPT,
-                user=prompt,
-                images=[image_bytes],
-                temperature=0.2,
-                max_tokens=ctx.vision_max_tokens or settings.short_max_tokens,
-            )
-        except Exception as e:
-            logger.warning("/explain vision failed ({}); falling back to text", e)
-            text = "（视觉模型调用失败，无法直接解读这张图。）"
-            return ExecResult(stdout=text, chat=text, summary=f"explain-vision: {e}")
-        reply = (reply_raw or "").strip() or "（模型没返回内容，再问一次试试）"
-        if ctx.llm_log_path:
-            _dump_llm_call(
-                ctx.llm_log_path,
-                label=f"/explain-vision  ::  {explicit[:60] or '(quoted image)'}",
-                system=_EXPLAIN_SYSTEM_PROMPT,
-                user=prompt,
-                raw=reply_raw,
-                parsed=None,
-            )
-        logger.info("explain :: image={} explicit_len={} reply_len={}",
-                    image_path.name, len(explicit), len(reply))
-        stdout = f"/explain (图片直读)\n{image_path}\n\n{reply}"
-        return ExecResult(stdout=stdout, chat=reply, summary=f"explain-vision ({len(reply)} chars)")
+        return _run_vision_on_quoted_image(
+            ctx, image_path,
+            system_prompt=_EXPLAIN_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            log_label=f"/explain-vision  ::  {explicit[:60] or '(quoted image)'}",
+            stdout_header="/explain (图片直读)",
+            summary_label="explain-vision",
+            fail_message="（视觉模型调用失败，无法直接解读这张图。）",
+            temperature=0.2,
+        )
 
 
 # ---------- /help ----------
@@ -1239,6 +1251,54 @@ def _extract_need_images(text: str) -> tuple[str, list[str]]:
                 cand_ids.append(tok)
     cleaned = _NEED_IMAGES_RE.sub("", text).strip()
     return cleaned, cand_ids
+
+
+def _run_vision_on_quoted_image(
+    ctx: "CommandContext",
+    image_path: Path,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    log_label: str,
+    stdout_header: str,
+    summary_label: str,
+    fail_message: str,
+    temperature: float = 0.2,
+) -> "ExecResult":
+    """Single-pass vision call shared by /explain and /ask when the quoted
+    message is an image. Caller already verified `ctx.vision is not None`
+    and resolved the path via `_resolve_quoted_image_path`.
+
+    Failure modes (vision API down, bytes unreadable) → return an
+    ExecResult that says so; caller doesn't get a partial / confusing
+    text-pass since the user explicitly pointed at an image."""
+    assert ctx.vision is not None
+    try:
+        image_bytes = image_path.read_bytes()
+        reply_raw = ctx.vision.complete_with_images(
+            model=ctx.vision_model,
+            system=system_prompt,
+            user=user_prompt,
+            images=[image_bytes],
+            temperature=temperature,
+            max_tokens=ctx.vision_max_tokens or settings.short_max_tokens,
+        )
+    except Exception as e:
+        logger.warning("{} vision failed ({}); returning fallback message", log_label, e)
+        return ExecResult(stdout=fail_message, chat=fail_message, summary=f"{summary_label}: {e}")
+    reply = (reply_raw or "").strip() or "（模型没返回内容，再问一次试试）"
+    if ctx.llm_log_path:
+        _dump_llm_call(
+            ctx.llm_log_path,
+            label=log_label,
+            system=system_prompt,
+            user=user_prompt,
+            raw=reply_raw,
+            parsed=None,
+        )
+    logger.info("{} :: image={} reply_len={}", summary_label, image_path.name, len(reply))
+    stdout = f"{stdout_header}\n{image_path}\n\n{reply}"
+    return ExecResult(stdout=stdout, chat=reply, summary=f"{summary_label} ({len(reply)} chars)")
 
 
 def _resolve_quoted_image_path(
