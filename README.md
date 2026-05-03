@@ -99,6 +99,11 @@ WO_LLM_API_KEY=sk-...
 
 # 多媒体识别（可选 — worker mm 进程的 ASR 模型档位）
 # WO_WHISPER_MODEL=small               # tiny|base|small|medium|large-v3，默认 small
+
+# Agent loop（实验性 — 多轮 tool-calling chat 路径，默认 OFF）
+# WO_AGENT_ENABLED=True                # 打开后 @<bot> chat 走 agent loop；OFF 时走旧路径
+# WO_AGENT_BASE_PROBABILITY=0.0        # >0 让 bot 偶尔自主插话（v0 默认 0 = 仅 @ 触发）
+# WO_AGENT_REFLECTION_ENABLED=True     # 关闭跳过 Phase B（不写任何 member/group/persona 笔记）
 ```
 
 ### 3. 建库
@@ -479,6 +484,14 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_VISION_MAX_IMAGES` | `3` | 单次 vision 请求最多附几张图（防失控烧钱） |
 | `WO_VISION_MAX_TOKENS` | `800` | 视觉调用输出上限 |
 | `WO_WHISPER_MODEL` | `small` | `worker mm` 的 ASR 档位：`tiny`/`base`/`small`/`medium`/`large-v3`；越大越准越慢越占内存 |
+| `WO_AGENT_ENABLED` | `False` | 多轮 tool-calling agent loop 总开关；OFF 时 `@<bot>` chat 走旧的单轮 + vision sentinel 路径 |
+| `WO_AGENT_BASE_PROBABILITY` | `0.0` | 非 @ 触发时的概率门槛（v0 默认 0 = 仅 @ 触发；>0 让 bot 偶尔自主插话） |
+| `WO_AGENT_COOLDOWN_SECONDS` | `300` | bot 自己说完后这么久内不被概率触发 |
+| `WO_AGENT_MAX_STEPS` | `10` | Phase A（read-only tools）最多循环步数 |
+| `WO_AGENT_REFLECT_MAX_STEPS` | `5` | Phase B（write-only 反思）最多循环步数 |
+| `WO_AGENT_REFLECTION_ENABLED` | `True` | 关闭后跳过 Phase B；不写任何 member/group/persona 笔记 |
+| `WO_AGENT_PERSONAS_DIR` | `data/personas` | 静态人格 yaml 目录，每群一个 `<group_id>.yaml` |
+| `WO_AGENT_RECENT_CONTEXT_CHAT` | `50` | Phase A 初始 system prompt 注入的最近群消息条数 |
 
 ---
 
@@ -518,9 +531,19 @@ forwarded_records (
     src_msg_id,            -- <fromnewmsgid>，源群里的原 msg_id（informational）
     UNIQUE(parent_msg_id, seq)
 )
+
+-- agent loop 记忆 + 审计（WO_AGENT_ENABLED=True 时写）
+persona_drift   ( group_id PRIMARY KEY, drift_text, updated_at )         -- 可演化人格补充，replace-on-write
+member_notes    ( (group_id, sender_wxid) PK, notes_text, updated_at )    -- 成员笔记，replace-on-write
+group_notes     ( note_id PK, group_id, topic, notes_text, updated_at )   -- 群级笔记，append-only
+agent_run_log   ( run_id PK, group_id, trigger_msg_id, trigger_kind,      -- 每次 agent run 的完整 trace
+                  phase_a_trace, phase_b_trace, reply_text,
+                  started_at, finished_at )
 ```
 
 跨源去重靠 `UNIQUE(dedupe_key)`：有 `wx_msg_id` 时用 `wx:<group>:<id>`，没有时用关键字段哈希。`messages.status` 和 `command_runs` 是两条并行的状态机，互不污染。
+
+agent 四张表里 `member_notes` / `persona_drift` 用替换语义（让 LLM 自己读现状再决定新值，避免无限增长），`group_notes` 用追加（群级讨论是事件流），`agent_run_log` 始终追加（审计）。所有 SQL 实现都在 tool 实现层强制 `WHERE group_id=?`——`group_id` 不暴露给 LLM，靠 `GroupScopedTools` 构造器锁。
 
 ---
 

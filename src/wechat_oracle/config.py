@@ -87,6 +87,19 @@ class Settings(BaseSettings):
     def short_max_tokens(self) -> int:
         return self.llm_short_max_tokens or min(self.llm_max_tokens, 800)
 
+    # Agent loop (multi-turn tool-calling chat path). v0 keeps the flag OFF;
+    # ChatCommand falls back to the legacy single-pass + vision-sentinel route.
+    # Once stable, we delete the legacy path. Triggers: only @<bot> in v0
+    # (probability/reply hooks need wider integration in dispatcher loop).
+    agent_enabled: bool = False
+    agent_base_probability: float = 0.0       # 0 = mention-only; small >0 lets bot self-initiate
+    agent_cooldown_seconds: int = 300          # min seconds between bot's own utterances per group
+    agent_max_steps: int = 10                  # Phase A read-only loop cap
+    agent_reflect_max_steps: int = 5           # Phase B write-only loop cap
+    agent_reflection_enabled: bool = True      # off → skip Phase B entirely
+    agent_personas_dir: Path = Field(default=Path("data/personas"))
+    agent_recent_context_chat: int = 50        # initial recent-msg window for Phase A system prompt
+
     # Send the dispatcher's result back into the WeChat group. False = local-
     # only (stdout + log). True = use the backend below.
     reply: bool = True

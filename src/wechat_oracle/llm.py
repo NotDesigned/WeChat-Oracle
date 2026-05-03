@@ -12,7 +12,8 @@ different provider entirely (e.g. text=DeepSeek, vision=Qwen-VL).
 from __future__ import annotations
 
 import base64
-from typing import Literal, Protocol
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol
 
 from openai import OpenAI
 
@@ -123,6 +124,105 @@ class OpenAICompatLLM:
             kwargs["max_tokens"] = max_tokens
         resp = self._client.chat.completions.create(**kwargs)
         return (resp.choices[0].message.content or "").strip()
+
+    def complete_with_tools(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+        tool_choice: str = "auto",
+    ) -> "ToolingResponse":
+        kwargs: dict[str, object] = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        resp = self._client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        tcs_raw = getattr(msg, "tool_calls", None) or []
+        tool_calls = [
+            ToolCall(
+                id=tc.id,
+                name=tc.function.name,
+                arguments_json=tc.function.arguments or "",
+            )
+            for tc in tcs_raw
+        ]
+        return ToolingResponse(
+            content=msg.content,
+            tool_calls=tool_calls,
+            assistant_message=_coerce_assistant_message(msg),
+        )
+
+
+# --- tool-calling (multi-turn agent loop) ----------------------------------
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One function-call request emitted by the model in a tool-calling turn."""
+    id: str
+    name: str
+    arguments_json: str  # raw JSON string the model produced; runtime parses
+
+
+@dataclass(frozen=True)
+class ToolingResponse:
+    """Result of one `complete_with_tools` call.
+
+    `assistant_message` is the exact dict the runtime should append to the
+    `messages` list before sending tool-result turns back — preserves any
+    provider-specific fields (id, refusals, ...) we don't want to model.
+    """
+    content: str | None
+    tool_calls: list[ToolCall]
+    assistant_message: dict[str, Any]
+
+
+class ToolingLLM(Protocol):
+    """Tool-calling extension of LLMClient. Separate Protocol so providers can
+    opt in independently (some OpenAI-compatible relays reject `tools=[...]`).
+    """
+
+    def complete_with_tools(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+        tool_choice: str = "auto",
+    ) -> ToolingResponse:
+        ...
+
+
+def _coerce_assistant_message(msg: Any) -> dict[str, Any]:
+    """Normalize the OpenAI SDK's message object into a plain dict the agent
+    runtime can re-feed verbatim. Tool calls keep their string `arguments`
+    payload so the model sees the exact text it produced earlier."""
+    out: dict[str, Any] = {"role": "assistant", "content": msg.content}
+    tcs = getattr(msg, "tool_calls", None) or []
+    if tcs:
+        out["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments or "",
+                },
+            }
+            for tc in tcs
+        ]
+    return out
 
 
 def build_llm_client(
