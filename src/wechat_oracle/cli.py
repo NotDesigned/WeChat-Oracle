@@ -266,9 +266,8 @@ def agent_lurk(
     30 min for an active group), or to manually nudge the bot to update
     its impression of group activity after you've imported a backfill.
     """
-    from .dispatcher import (
-        _build_llm_client, _resolve_bot_wxid, chat_via_lurk,
-    )
+    from .agent.orchestrator import chat_via_lurk
+    from .dispatcher import _build_llm_client, _resolve_bot_wxid
     if not settings.bot_name:
         typer.echo("⚠️  WO_BOT_NAME is empty — set it before lurking.")
         raise typer.Exit(1)

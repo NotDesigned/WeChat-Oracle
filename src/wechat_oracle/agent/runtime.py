@@ -323,6 +323,53 @@ def run_phase_a(
     return last_content, trace
 
 
+def _run_simple_tool_loop(
+    *,
+    llm: ToolingLLM,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    tools: GroupScopedTools,
+    max_steps: int,
+    temperature: float,
+    max_tokens: int | None,
+    tool_budget: ToolBudget | None,
+) -> list[dict[str, Any]]:
+    """Bare tool-calling loop with `tool_choice='auto'` — terminates on the
+    first assistant turn with no tool calls (returns whatever text is there
+    as the `final` step), or on max_steps. No empty-final retry, no
+    last-step force, no stay_silent termination — that's `run_phase_a`'s
+    job. Used by both Phase B reflection and lurk background-learning.
+    """
+    trace: list[dict[str, Any]] = []
+    if not tools.names() or max_steps <= 0:
+        return trace
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    tool_specs = tools.openai_specs()
+    for step in range(max_steps):
+        resp = llm.complete_with_tools(
+            model=model,
+            messages=messages,
+            tools=tool_specs,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_choice="auto",
+        )
+        messages.append(resp.assistant_message)
+        if not resp.tool_calls:
+            trace.append({"step": step, "kind": "final", "content": resp.content})
+            return trace
+        tool_msgs = _execute_tool_calls(
+            tools, resp.tool_calls, trace, step, budget=tool_budget
+        )
+        messages.extend(tool_msgs)
+    trace.append({"step": max_steps, "kind": "max_steps_hit"})
+    return trace
+
+
 def run_phase_b(
     *,
     llm: ToolingLLM,
@@ -336,48 +383,27 @@ def run_phase_b(
     max_tokens: int | None = None,
     tool_budget: ToolBudget | None = None,
 ) -> list[dict[str, Any]]:
-    """Run the Phase B write-only loop. Returns the trace; no reply."""
-    trace: list[dict[str, Any]] = []
-    if not write_tools.names() or max_steps <= 0:
-        return trace
-
+    """Reflection over a chat agent run. The model sees a digest of Phase A
+    plus the eventual reply, and decides whether to write notes."""
     digest = json.dumps(phase_a_trace, ensure_ascii=False, indent=2)
-    user = (
+    user_message = (
         f"刚才的 Phase A trace（按时间正序）：\n{digest}\n\n"
         f"最终回复：{reply_text!r}\n\n"
         "现在是反思阶段：根据本次发生的事，决定要不要写笔记。"
         " 大多数情况下不需要写——只有当出现新事实、关键观点或群文化变化时才写。"
         " 若不需要写，直接输出空文本结束。"
     )
-
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user},
-    ]
-    tool_specs = write_tools.openai_specs()
-
-    for step in range(max_steps):
-        resp = llm.complete_with_tools(
-            model=model,
-            messages=messages,
-            tools=tool_specs,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tool_choice="auto",
-        )
-        messages.append(resp.assistant_message)
-
-        if not resp.tool_calls:
-            trace.append({"step": step, "kind": "final", "content": resp.content})
-            return trace
-
-        tool_msgs = _execute_tool_calls(
-            write_tools, resp.tool_calls, trace, step, budget=tool_budget
-        )
-        messages.extend(tool_msgs)
-
-    trace.append({"step": max_steps, "kind": "max_steps_hit"})
-    return trace
+    return _run_simple_tool_loop(
+        llm=llm,
+        model=model,
+        system_prompt=system_prompt,
+        user_message=user_message,
+        tools=write_tools,
+        max_steps=max_steps,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tool_budget=tool_budget,
+    )
 
 
 def run_lurk_reflection(
@@ -392,51 +418,27 @@ def run_lurk_reflection(
     max_tokens: int | None = None,
     tool_budget: ToolBudget | None = None,
 ) -> list[dict[str, Any]]:
-    """Silent background-learning loop.
-
-    Unlike Phase B, the input is not a chat reply trace. The model sees an
-    observation batch, may call read-only history tools for older context, and
-    may call memory write tools. There is never a chat reply; final text is
-    only an audit marker.
-    """
-    trace: list[dict[str, Any]] = []
-    if not tools.names() or max_steps <= 0:
-        return trace
-
+    """Silent background-learning loop. Same shape as `run_phase_b` but the
+    caller supplies `user_message` directly (built from observed messages,
+    not from a Phase A trace) and we add a runtime hint about the budget so
+    the model can pace itself across the few rounds it has."""
     augmented_user = (
         user_message
         + f"\n\n[runtime] 你最多有 {max_steps} 个 tool-calling 回合。"
         "可以用历史检索工具补上下文，也可以直接读/写记忆。"
         "如果没有值得写入的长期信息，直接输出空文本结束。"
     )
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": augmented_user},
-    ]
-    tool_specs = tools.openai_specs()
-
-    for step in range(max_steps):
-        resp = llm.complete_with_tools(
-            model=model,
-            messages=messages,
-            tools=tool_specs,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tool_choice="auto",
-        )
-        messages.append(resp.assistant_message)
-
-        if not resp.tool_calls:
-            trace.append({"step": step, "kind": "final", "content": resp.content})
-            return trace
-
-        tool_msgs = _execute_tool_calls(
-            tools, resp.tool_calls, trace, step, budget=tool_budget
-        )
-        messages.extend(tool_msgs)
-
-    trace.append({"step": max_steps, "kind": "max_steps_hit"})
-    return trace
+    return _run_simple_tool_loop(
+        llm=llm,
+        model=model,
+        system_prompt=system_prompt,
+        user_message=augmented_user,
+        tools=tools,
+        max_steps=max_steps,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tool_budget=tool_budget,
+    )
 
 
 def run_agent(
