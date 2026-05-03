@@ -74,6 +74,46 @@ def _save_transcript(
         )
 
 
+def transcribe_voice_for_msg(conn: sqlite3.Connection, msg_id: int) -> str:
+    """On-demand ASR for one voice msg, callable from outside the worker.
+
+    Used by the agent's `read_voice` tool. Behavior:
+      - if `transcript` is already set (incl. empty string for previously-
+        processed-but-empty rows), return it as-is — no re-work
+      - else load the file and run ASR; persist via `_save_transcript`
+      - file missing or engine error → persist '' and return '' so the
+        worker doesn't compete to retry it later
+
+    Raises ValueError if the row doesn't exist or isn't a voice row.
+    """
+    row = conn.execute(
+        "SELECT msg_id, type, media_path, transcript FROM messages WHERE msg_id=?",
+        (msg_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"msg_id {msg_id} not found")
+    if row["type"] != "voice":
+        raise ValueError(f"msg_id {msg_id} is type {row['type']!r}, not 'voice'")
+    if row["transcript"] is not None:
+        return row["transcript"]
+    if not row["media_path"]:
+        _save_transcript(conn, msg_id, "")
+        return ""
+    path = _resolve_path(row["media_path"])
+    if not path.exists():
+        _save_transcript(conn, msg_id, "")
+        return ""
+    try:
+        from .asr import transcribe_voice
+        text = transcribe_voice(path)
+    except Exception as e:
+        logger.exception("on-demand ASR failed on msg_id={} ({})", msg_id, path)
+        _save_transcript(conn, msg_id, "")
+        return ""
+    _save_transcript(conn, msg_id, text)
+    return text
+
+
 def _process_one(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     """Returns a short status string for logging. Mutates DB."""
     msg_id = row["msg_id"]

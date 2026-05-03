@@ -1301,61 +1301,14 @@ def _run_vision_on_quoted_image(
     return ExecResult(stdout=stdout, chat=reply, summary=f"{summary_label} ({len(reply)} chars)")
 
 
-def _resolve_quoted_image_path(
-    conn: sqlite3.Connection, wx_msg_id: str | None
-) -> Path | None:
-    """If `wx_msg_id` (from a quote-reply's `<refermsg><svrid>`) points to
-    an image row whose media file is on disk, return its resolved path.
-    None for everything else — non-image, no media_path, file missing,
-    or no quote at all. Used by /explain to feed the actual bytes when
-    the user 引用ed an image."""
-    if not wx_msg_id:
-        return None
-    row = conn.execute(
-        "SELECT type, media_path FROM messages WHERE wx_msg_id=?",
-        (wx_msg_id,),
-    ).fetchone()
-    if not row or row["type"] != "image" or not row["media_path"]:
-        return None
-    p = Path(row["media_path"])
-    if not p.is_absolute():
-        p = settings.data_dir / row["media_path"]
-    return p if p.exists() else None
-
-
-def _resolve_image_paths(
-    conn: sqlite3.Connection, cand_ids: list[str]
-) -> list[Path]:
-    """Resolve `m:<msg_id>` cand_ids to existing image file paths.
-
-    Skips silently:
-      - `f:<...>` forwarded children (their inline images aren't downloaded)
-      - cand_ids that aren't `type='image'` or have no `media_path`
-      - files that don't exist on disk (live path on a different machine)
-
-    Path resolution mirrors worker/mm.py: absolute = WeFlow live cache,
-    relative = backfill anchored at data_dir.
-    """
-    paths: list[Path] = []
-    for cid in cand_ids:
-        if not cid.startswith("m:"):
-            continue
-        try:
-            msg_id = int(cid[2:])
-        except ValueError:
-            continue
-        row = conn.execute(
-            "SELECT type, media_path FROM messages WHERE msg_id=?",
-            (msg_id,),
-        ).fetchone()
-        if not row or row["type"] != "image" or not row["media_path"]:
-            continue
-        p = Path(row["media_path"])
-        if not p.is_absolute():
-            p = settings.data_dir / row["media_path"]
-        if p.exists():
-            paths.append(p)
-    return paths
+# Image-path resolution moved to agent/media_paths.py (single source) so
+# the agent's read_image tool and dispatcher's /explain & /ask paths share
+# one implementation. Old names kept as thin re-exports — callers are still
+# numerous in this file.
+from .agent.media_paths import (
+    resolve_image_paths_by_cand as _resolve_image_paths,
+    resolve_quoted_image_path as _resolve_quoted_image_path,
+)
 
 
 def chat_assistant(

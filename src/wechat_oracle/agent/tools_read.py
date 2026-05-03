@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from ..llm import VisionLLM
+from .media_paths import resolve_media_path_for_msg
 from .memory import get_member_notes, list_group_notes
 from .tools import Tool, ToolError, ToolSpec, truncate_for_llm
 
@@ -474,18 +476,180 @@ class ReadGroupNotesTool(Tool):
         return truncate_for_llm("\n".join(lines))
 
 
+# --- read_image ------------------------------------------------------------
+
+
+_READ_IMAGE_SPEC = ToolSpec(
+    name="read_image",
+    description=(
+        "Look at an image message directly with the vision model. Use this "
+        "when the OCR text is missing, partial, gibberish, or when the image "
+        "itself (not its text) is the point — memes, screenshots of charts, "
+        "photos. Optional `prompt` focuses what to extract; without one, "
+        "the model returns a faithful description plus any visible text."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "msg_id": {
+                "type": "integer",
+                "description": "msg_id of an image message in this group.",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Optional steering — e.g. 'what does this meme mean?', 'extract any handwriting'.",
+            },
+        },
+        "required": ["msg_id"],
+    },
+)
+
+
+_READ_IMAGE_DEFAULT_SYSTEM = (
+    "你在帮一个聊天 bot 看图。直接、简洁、客观地描述图里的关键内容："
+    "如果是文字截图就完整摘录文字；如果是表情包、照片、图表就用一两句话描述要点。"
+    "不要加 markdown，不要打招呼，不要说「这是一张图片」之类的废话。"
+)
+
+
+@dataclass
+class ReadImageTool(Tool):
+    """Vision-LLM read-through. The vision client is a hard requirement —
+    if `vision is None`, the tool raises ToolError so the agent can
+    redirect (e.g. ask the user to wait, or fall back to recall)."""
+    spec = _READ_IMAGE_SPEC
+    conn: sqlite3.Connection
+    group_id: str
+    vision: VisionLLM | None
+    vision_model: str
+    vision_max_tokens: int | None
+
+    def call(self, args: dict[str, Any]) -> str:
+        if self.vision is None:
+            raise ToolError(
+                "vision model not configured (WO_VISION_API_KEY empty); "
+                "cannot read images directly. Try recall_group_history "
+                "with keywords from the OCR transcript instead."
+            )
+        msg_id = args.get("msg_id")
+        if not isinstance(msg_id, int):
+            raise ToolError("msg_id must be an integer")
+        prompt = args.get("prompt")
+        if prompt is not None and not isinstance(prompt, str):
+            raise ToolError("prompt must be a string")
+
+        path = resolve_media_path_for_msg(self.conn, msg_id, expected_type="image")
+        if path is None:
+            # Disambiguate the failure for the LLM so it can decide whether to retry.
+            row = self.conn.execute(
+                "SELECT type, media_path FROM messages WHERE msg_id=? AND group_id=?",
+                (msg_id, self.group_id),
+            ).fetchone()
+            if row is None:
+                raise ToolError(f"msg_id {msg_id} not found in this group")
+            if row["type"] != "image":
+                raise ToolError(
+                    f"msg_id {msg_id} is type {row['type']!r}, not 'image'"
+                )
+            raise ToolError(
+                f"msg_id {msg_id} has no usable image file on disk (live cache "
+                "may have been cleared, or backfill ran without media)"
+            )
+
+        user_prompt = (prompt or "").strip() or "请描述这张图，包含文字时一字一句摘录。"
+        try:
+            reply = self.vision.complete_with_images(
+                model=self.vision_model,
+                system=_READ_IMAGE_DEFAULT_SYSTEM,
+                user=user_prompt,
+                images=[path.read_bytes()],
+                temperature=0.2,
+                max_tokens=self.vision_max_tokens,
+            )
+        except Exception as e:
+            raise ToolError(f"vision call failed: {e}")
+        return truncate_for_llm((reply or "").strip() or "(vision model returned empty)")
+
+
+# --- read_voice ------------------------------------------------------------
+
+
+_READ_VOICE_SPEC = ToolSpec(
+    name="read_voice",
+    description=(
+        "Get the ASR transcript of a voice message. If we've already "
+        "transcribed it (the worker runs in the background), this is "
+        "instant; otherwise the model waits for ASR (typically 1–3s)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "msg_id": {
+                "type": "integer",
+                "description": "msg_id of a voice message in this group.",
+            },
+        },
+        "required": ["msg_id"],
+    },
+)
+
+
+@dataclass
+class ReadVoiceTool(Tool):
+    spec = _READ_VOICE_SPEC
+    conn: sqlite3.Connection
+    group_id: str
+
+    def call(self, args: dict[str, Any]) -> str:
+        msg_id = args.get("msg_id")
+        if not isinstance(msg_id, int):
+            raise ToolError("msg_id must be an integer")
+
+        # Group-scope check first — read_voice must not pull voice from
+        # another group via a leaked msg_id.
+        row = self.conn.execute(
+            "SELECT type FROM messages WHERE msg_id=? AND group_id=?",
+            (msg_id, self.group_id),
+        ).fetchone()
+        if row is None:
+            raise ToolError(f"msg_id {msg_id} not found in this group")
+        if row["type"] != "voice":
+            raise ToolError(
+                f"msg_id {msg_id} is type {row['type']!r}, not 'voice'"
+            )
+
+        from ..worker.mm import transcribe_voice_for_msg
+        text = transcribe_voice_for_msg(self.conn, msg_id)
+        if not text:
+            return "(empty transcript — silent or unrecognizable)"
+        return truncate_for_llm(text)
+
+
 # --- factory ---------------------------------------------------------------
 
 
-def register_phase_a_tools(tools: "GroupScopedTools") -> None:  # noqa: F821 - circular import in type-only ref
-    """Register all Phase A read-only tools (incl. stay_silent) into the
-    provided `GroupScopedTools` registry. Caller wires this from dispatcher
-    integration in commit 4."""
-    from .tools import StaySilentTool  # local to avoid circular hint
+def register_phase_a_tools(
+    tools: "GroupScopedTools",  # noqa: F821 - structural-only reference
+    *,
+    vision: VisionLLM | None = None,
+    vision_model: str = "",
+    vision_max_tokens: int | None = None,
+) -> None:
+    """Register all Phase A read-only tools into the provided
+    `GroupScopedTools` registry. Vision-related kwargs may be left at
+    their defaults — `read_image` will then raise a clean ToolError
+    when called instead of crashing."""
+    from .tools import StaySilentTool  # local to keep import cycle light
     tools.register(RecallGroupHistoryTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ViewQuotedChainTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ExpandForwardBundleTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(WhoIsTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ReadMemberNotesTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ReadGroupNotesTool(conn=tools.conn, group_id=tools.group_id))
+    tools.register(ReadImageTool(
+        conn=tools.conn, group_id=tools.group_id,
+        vision=vision, vision_model=vision_model,
+        vision_max_tokens=vision_max_tokens,
+    ))
+    tools.register(ReadVoiceTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(StaySilentTool())
