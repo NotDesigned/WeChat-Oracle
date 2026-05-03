@@ -100,10 +100,12 @@ CREATE TABLE IF NOT EXISTS group_memory (
     last_run_id  INTEGER REFERENCES agent_run_log(run_id) ON DELETE SET NULL
 );
 
--- Full trace of every agent run. `phase_a_trace` / `phase_b_trace` are JSON
--- arrays of step dicts: `[{step:int, kind:'tool_call'|'final', tool?, args?, result?, content?}, ...]`.
+-- Audit trace of every agent run. Chat runs store full `phase_a_trace` /
+-- `phase_b_trace`; lurk stores a compact observation trace plus tool trace.
+-- Trace columns are JSON arrays of step dicts:
+-- `[{step:int, kind:'tool_call'|'final', tool?, args?, result?, content?}, ...]`.
 -- `reply_text` is NULL when the agent chose stay_silent. `trigger_kind` is one
--- of 'mention' / 'reply' / 'probability'.
+-- of 'mention' / 'reply' / 'probability' / 'lurk'.
 CREATE TABLE IF NOT EXISTS agent_run_log (
     run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id        TEXT NOT NULL,
@@ -116,6 +118,16 @@ CREATE TABLE IF NOT EXISTS agent_run_log (
     finished_at     REAL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_log_group_t ON agent_run_log(group_id, started_at);
+
+-- Per-group cursor for silent background learning. This is operational state,
+-- deliberately separate from agent_run_log: audit rows describe what happened;
+-- this row says where the next lurk pass should resume.
+CREATE TABLE IF NOT EXISTS agent_lurk_state (
+    group_id       TEXT PRIMARY KEY,
+    last_msg_id    INTEGER,
+    last_run_id    INTEGER REFERENCES agent_run_log(run_id) ON DELETE SET NULL,
+    updated_at     REAL
+);
 
 -- ----- Legacy memory tables (member_notes / group_notes) — superseded by
 -- group_memory above. Kept as inert CREATE IF NOT EXISTS so old installs don't

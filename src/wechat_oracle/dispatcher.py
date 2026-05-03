@@ -1331,7 +1331,11 @@ def _trace_step_line(s: dict[str, object]) -> str:
         return f"  step{step} ⚠ MAX STEPS HIT"
     if kind == "lurk_observation":
         args = s.get("args") or {}
-        return f"  step{step} ◌ lurk_observation: {args.get('recent_msgs', '?')} msgs in window"
+        return (
+            f"  step{step} ◌ lurk_observation: {args.get('recent_msgs', '?')} msgs "
+            f"range={args.get('oldest_msg_id', '?')}..{args.get('newest_msg_id', '?')} "
+            f"after={args.get('after_msg_id', None)}"
+        )
     return f"  step{step} ?{kind}: {json.dumps(s, ensure_ascii=False, default=str)[:160]}"
 
 
@@ -1367,6 +1371,90 @@ def _fetch_recent_for_agent(
         (group_id, limit),
     ).fetchall()
     return list(reversed(rows))
+
+
+def _fetch_lurk_window(
+    conn: sqlite3.Connection, group_id: str, *, after_msg_id: int | None, limit: int
+) -> list[sqlite3.Row]:
+    """Messages for one lurk pass, oldest-first.
+
+    First run has no cursor, so it bootstraps from the latest `limit` rows.
+    Later runs only process rows whose autoincrement msg_id is newer than the
+    stored cursor. The agent can still use recall_group_history to inspect
+    older material when the new batch points to it.
+    """
+    if after_msg_id is None:
+        return _fetch_recent_for_agent(conn, group_id, limit)
+    rows = conn.execute(
+        """
+        SELECT msg_id, t, type, sender_wxid, sender_display,
+               content_text, transcript
+          FROM messages
+         WHERE group_id=?
+           AND msg_id > ?
+         ORDER BY msg_id ASC
+         LIMIT ?
+        """,
+        (group_id, after_msg_id, limit),
+    ).fetchall()
+    return list(rows)
+
+
+def _get_lurk_cursor(conn: sqlite3.Connection, group_id: str) -> int | None:
+    row = conn.execute(
+        "SELECT last_msg_id FROM agent_lurk_state WHERE group_id=?",
+        (group_id,),
+    ).fetchone()
+    if row is None or row["last_msg_id"] is None:
+        return None
+    return int(row["last_msg_id"])
+
+
+def _upsert_lurk_cursor(
+    conn: sqlite3.Connection, *, group_id: str, last_msg_id: int, run_id: int
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO agent_lurk_state (group_id, last_msg_id, last_run_id, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(group_id) DO UPDATE SET
+            last_msg_id = excluded.last_msg_id,
+            last_run_id = excluded.last_run_id,
+            updated_at = excluded.updated_at
+        """,
+        (group_id, last_msg_id, run_id, time.time()),
+    )
+
+
+def _lurk_due_groups(
+    conn: sqlite3.Connection, *, min_new_messages: int, limit: int
+) -> list[sqlite3.Row]:
+    """Groups with enough messages newer than their lurk cursor."""
+    min_new = max(1, min_new_messages)
+    return conn.execute(
+        """
+        SELECT m.group_id,
+               (
+                   SELECT m2.group_name
+                     FROM messages m2
+                    WHERE m2.group_id = m.group_id
+                      AND m2.group_name IS NOT NULL
+                    ORDER BY m2.msg_id DESC
+                    LIMIT 1
+               ) AS group_name,
+               COUNT(*) AS new_count,
+               MAX(m.msg_id) AS newest_msg_id
+          FROM messages m
+     LEFT JOIN agent_lurk_state s ON s.group_id = m.group_id
+         WHERE m.type != 'system'
+           AND (s.last_msg_id IS NULL OR m.msg_id > s.last_msg_id)
+         GROUP BY m.group_id
+        HAVING new_count >= ?
+         ORDER BY newest_msg_id ASC
+         LIMIT ?
+        """,
+        (min_new, limit),
+    ).fetchall()
 
 
 def chat_via_agent(
@@ -1565,15 +1653,15 @@ def chat_via_lurk(
     `trigger_kind='lurk'` and links `last_run_id` on any memory rows the
     model rewrote.
     """
-    from .agent.memory import (
-        get_group_memory,
-        get_persona_drift,
-        insert_run_log,
-        link_last_run_id,
-    )
+    from .agent.memory import insert_run_log, link_last_run_id
     from .agent.persona import assemble_system_prompts
-    from .agent.runtime import run_phase_b
+    from .agent.runtime import ToolBudget, run_lurk_reflection
     from .agent.tools import GroupScopedTools
+    from .agent.tools_read import (
+        ExpandForwardBundleTool,
+        RecallGroupHistoryTool,
+        ViewQuotedChainTool,
+    )
     from .agent.tools_write import (
         phase_b_system_prompt,
         register_phase_b_tools,
@@ -1581,59 +1669,87 @@ def chat_via_lurk(
     )
 
     started_at = time.time()
-    rows = _fetch_recent_for_agent(conn, group_id, settings.agent_lurk_recent_msgs)
+    after_msg_id = _get_lurk_cursor(conn, group_id)
+    rows = _fetch_lurk_window(
+        conn,
+        group_id,
+        after_msg_id=after_msg_id,
+        limit=settings.agent_lurk_recent_msgs,
+    )
     if not rows:
-        logger.info("lurk: no recent messages for group_id={!r}", group_id)
-        return "(lurk: no recent messages)"
+        logger.info(
+            "lurk: no new messages for group_id={!r} after_msg_id={}",
+            group_id, after_msg_id,
+        )
+        return "(lurk: no new messages)"
     recent_block = _format_recent_for_agent(rows, bot_wxid=bot_wxid)
-    current_memory = get_group_memory(conn, group_id)
-    current_drift = get_persona_drift(conn, group_id)
+    msg_ids = [int(r["msg_id"]) for r in rows]
+    oldest_msg_id = min(msg_ids)
+    newest_msg_id = max(msg_ids)
+    window_label = (
+        f"msg_id > {after_msg_id}" if after_msg_id is not None else "初次运行，取最近窗口"
+    )
 
-    _, phase_b_system = assemble_system_prompts(
+    lurk_rules = (
+        phase_b_system_prompt()
+        + "\n\n当前是 lurk 后台学习，不是群聊回复。你永远不会发消息到群里。"
+        "输入是一批新观察到的群消息；如果这些消息暗示了旧上下文，"
+        "可以调用 recall_group_history / view_quoted_chain / expand_forward_bundle 查看老消息。"
+        "只把稳定、可复用、以后回答会用到的信息写入 group_memory；"
+        "只把长期说话风格调整写入 persona_drift。普通闲聊、一次性情绪、无关噪声不要写。"
+    )
+
+    _, lurk_system = assemble_system_prompts(
         conn=conn,
         group_id=group_id,
         group_name=group_name,
         bot_name=bot_name,
         personas_dir=settings.agent_personas_dir,
-        base_phase_b_prompt=phase_b_system_prompt(),
+        base_phase_b_prompt=lurk_rules,
     )
 
-    # Synthesize a one-step "Phase A trace" describing the observation, so
-    # run_phase_b's existing user-message construction (which serializes the
-    # phase_a_trace into the reflection prompt) carries the recent_block
-    # naturally to the model.
-    synthetic_phase_a_trace: list[dict[str, object]] = [
+    user_msg = (
+        f"后台学习观察窗口：{window_label}\n"
+        f"本次消息范围：{oldest_msg_id}..{newest_msg_id}，共 {len(rows)} 条。\n\n"
+        f"新观察到的群消息（按时间正序）：\n{recent_block}\n\n"
+        "任务：判断是否需要更新长期记忆。必要时先用历史检索工具查旧消息；"
+        "写之前必须先调用 read_group_memory / read_persona_drift。"
+    )
+
+    audit_observation_trace: list[dict[str, object]] = [
         {
             "step": 0,
             "kind": "lurk_observation",
             "tool": "_lurk",
-            "args": {"group_id": group_id, "recent_msgs": len(rows)},
-            "result": (
-                f"[lurk] 后台静默观察, 不会回群. "
-                f"当前 group_memory ({len(current_memory)} 字):\n"
-                f"{current_memory or '(空)'}\n\n"
-                f"当前 persona_drift ({len(current_drift)} 字):\n"
-                f"{current_drift or '(空)'}\n\n"
-                f"最近 {len(rows)} 条群消息:\n{recent_block}"
-            ),
+            "args": {
+                "group_id": group_id,
+                "after_msg_id": after_msg_id,
+                "oldest_msg_id": oldest_msg_id,
+                "newest_msg_id": newest_msg_id,
+                "recent_msgs": len(rows),
+            },
+            "result": "[lurk] compact audit only; full prompt is in llm_debug.log",
         }
     ]
 
-    write_tools = GroupScopedTools(
+    lurk_tools = GroupScopedTools(
         conn=conn, group_id=group_id, group_name=group_name, bot_name=bot_name,
     )
-    register_phase_b_tools(write_tools)
+    lurk_tools.register(RecallGroupHistoryTool(conn=conn, group_id=group_id))
+    lurk_tools.register(ViewQuotedChainTool(conn=conn, group_id=group_id))
+    lurk_tools.register(ExpandForwardBundleTool(conn=conn, group_id=group_id))
+    register_phase_b_tools(lurk_tools)
 
-    phase_b_trace = run_phase_b(
+    phase_b_trace = run_lurk_reflection(
         llm=llm,  # type: ignore[arg-type]
         model=model,
-        system_prompt=phase_b_system,
-        phase_a_trace=synthetic_phase_a_trace,
-        reply_text=None,
-        write_tools=write_tools,
+        system_prompt=lurk_system,
+        user_message=user_msg,
+        tools=lurk_tools,
         max_steps=settings.agent_lurk_max_steps,
         temperature=0.2,
         max_tokens=settings.chat_max_tokens,
+        tool_budget=ToolBudget(max_per_run=settings.agent_lurk_max_steps * 3, max_per_step=3),
     )
     finished_at = time.time()
 
@@ -1644,11 +1760,17 @@ def chat_via_lurk(
                 group_id=group_id,
                 trigger_msg_id=int(rows[-1]["msg_id"]),  # newest in window, for cursor reference
                 trigger_kind="lurk",
-                phase_a_trace=synthetic_phase_a_trace,
+                phase_a_trace=audit_observation_trace,
                 phase_b_trace=phase_b_trace,
                 reply_text=None,
                 started_at=started_at,
                 finished_at=finished_at,
+            )
+            _upsert_lurk_cursor(
+                conn,
+                group_id=group_id,
+                last_msg_id=newest_msg_id,
+                run_id=run_id,
             )
             touched_persona, touched_memory = trace_touched_tables(phase_b_trace)
             if touched_persona or touched_memory:
@@ -1666,16 +1788,16 @@ def chat_via_lurk(
         _dump_llm_call(
             llm_log_path,
             label=f"lurk  ::  group={group_id}",
-            system=phase_b_system,
-            user=synthetic_phase_a_trace[0]["result"],  # type: ignore[arg-type]
+            system=lurk_system,
+            user=user_msg,
             raw="(lurk — no reply)",
             parsed={"phase_b_trace": phase_b_trace},
         )
 
-    trace_block = _format_trace_for_log(synthetic_phase_a_trace, phase_b_trace)
+    trace_block = _format_trace_for_log(audit_observation_trace, phase_b_trace)
     if log_path:
         _append_log(log_path, int(rows[-1]["t"]),
-                    f"lurk[{group_id}] msgs={len(rows)}\n{trace_block}")
+                    f"lurk[{group_id}] msgs={len(rows)} range={oldest_msg_id}..{newest_msg_id}\n{trace_block}")
     logger.info(
         "lurk :: group_id={} msgs={} writes={} dur={:.1f}s",
         group_id, len(rows),
@@ -2325,6 +2447,76 @@ class _GlobalScheduler:
             self._forget(msg_id)
 
 
+class _LurkScheduler:
+    """Low-priority background learner.
+
+    It has its own single worker so lurk never occupies chat response workers,
+    and it never touches the replier/wx4py sender path.
+    """
+
+    def __init__(
+        self,
+        *,
+        log_path: Path,
+        llm_log_path: Path | None,
+        bot_wxid_getter: Callable[[], str | None],
+    ) -> None:
+        self._log_path = log_path
+        self._llm_log_path = llm_log_path
+        self._bot_wxid_getter = bot_wxid_getter
+        self._local = threading.local()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="wechat-oracle-lurk",
+        )
+        self._lock = threading.Lock()
+        self._scheduled_group_ids: set[str] = set()
+        self._closed = False
+
+    def _llm(self) -> LLMClient:
+        llm = getattr(self._local, "llm", None)
+        if llm is None:
+            llm = _build_llm_client()
+            self._local.llm = llm
+        return llm
+
+    def submit(self, group_id: str, group_name: str | None) -> bool:
+        with self._lock:
+            if self._closed or group_id in self._scheduled_group_ids:
+                return False
+            self._scheduled_group_ids.add(group_id)
+            self._executor.submit(self._handle, group_id, group_name)
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=True)
+
+    def _forget(self, group_id: str) -> None:
+        with self._lock:
+            self._scheduled_group_ids.discard(group_id)
+
+    def _handle(self, group_id: str, group_name: str | None) -> None:
+        try:
+            with get_conn() as conn:
+                chat_via_lurk(
+                    conn=conn,
+                    llm=self._llm(),
+                    model=settings.llm_model,
+                    bot_name=settings.bot_name,
+                    bot_wxid=self._bot_wxid_getter(),
+                    group_id=group_id,
+                    group_name=group_name,
+                    log_path=self._log_path,
+                    llm_log_path=self._llm_log_path,
+                )
+        except Exception:
+            logger.exception("lurk scheduler crashed for group_id={}", group_id)
+        finally:
+            self._forget(group_id)
+
+
 def _skip_backlog(conn: sqlite3.Connection, bot_name: str) -> int:
     """Mark every pre-existing live message (any type except 'system') as
     already-processed. Run once at dispatcher startup so a cold start doesn't
@@ -2418,6 +2610,22 @@ def run_dispatcher() -> None:
             bot_wxid_getter=get_bot_wxid,
             max_workers=worker_threads,
         )
+        lurk_scheduler = (
+            _LurkScheduler(
+                log_path=log_path,
+                llm_log_path=llm_log_path,
+                bot_wxid_getter=get_bot_wxid,
+            )
+            if settings.agent_lurk_enabled else None
+        )
+        next_lurk_check = time.time() + max(1, settings.agent_lurk_interval_seconds)
+        if lurk_scheduler is not None:
+            logger.info(
+                "lurk scheduler enabled: interval={}s min_new={} batch={}",
+                settings.agent_lurk_interval_seconds,
+                settings.agent_lurk_min_new_messages,
+                settings.agent_lurk_recent_msgs,
+            )
         try:
             while True:
                 rows = _next_unprocessed(
@@ -2443,10 +2651,27 @@ def run_dispatcher() -> None:
                                 "bot_wxid auto-discovered from echoed reply: {}",
                                 resolved,
                             )
+                if lurk_scheduler is not None and time.time() >= next_lurk_check:
+                    next_lurk_check = time.time() + max(
+                        1, settings.agent_lurk_interval_seconds
+                    )
+                    due_groups = _lurk_due_groups(
+                        conn,
+                        min_new_messages=settings.agent_lurk_min_new_messages,
+                        limit=max(1, worker_threads),
+                    )
+                    submitted_lurks = 0
+                    for g in due_groups:
+                        if lurk_scheduler.submit(g["group_id"], g["group_name"]):
+                            submitted_lurks += 1
+                    if submitted_lurks:
+                        logger.info("lurk scheduler submitted {} group(s)", submitted_lurks)
                 if not rows or submitted == 0:
                     time.sleep(interval)
         except KeyboardInterrupt:
             logger.info("dispatcher stopped by user")
         finally:
             scheduler.close()
+            if lurk_scheduler is not None:
+                lurk_scheduler.close()
             replier.disconnect()

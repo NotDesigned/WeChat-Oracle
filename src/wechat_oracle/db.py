@@ -53,6 +53,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if not _has_column("persona_drift", "last_run_id"):
         conn.execute("ALTER TABLE persona_drift ADD COLUMN last_run_id INTEGER")
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_lurk_state (
+            group_id       TEXT PRIMARY KEY,
+            last_msg_id    INTEGER,
+            last_run_id    INTEGER,
+            updated_at     REAL
+        )
+        """
+    )
+
 
 @contextmanager
 def get_conn(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:

@@ -19,6 +19,7 @@ digests what was learned in Phase A; reflection should be cheap.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,18 @@ from .tools import Tool, ToolError, ToolSpec
 
 
 # --- read pair (Phase B uses these to read-before-write) ------------------
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class MemoryWriteSession:
+    """Per-agent-run snapshots used to prevent replace-on-write lost updates."""
+
+    persona_hash: str | None = None
+    group_memory_hash: str | None = None
 
 
 _READ_PERSONA_DRIFT_SPEC = ToolSpec(
@@ -53,9 +66,11 @@ class ReadPersonaDriftTool(Tool):
     spec = _READ_PERSONA_DRIFT_SPEC
     conn: sqlite3.Connection
     group_id: str
+    session: MemoryWriteSession
 
     def call(self, args: dict[str, Any]) -> str:
         text = get_persona_drift(self.conn, self.group_id)
+        self.session.persona_hash = _text_hash(text)
         return text or "(no drift recorded yet)"
 
 
@@ -77,9 +92,11 @@ class ReadGroupMemoryForWriteTool(Tool):
     spec = _READ_GROUP_MEMORY_FOR_WRITE_SPEC
     conn: sqlite3.Connection
     group_id: str
+    session: MemoryWriteSession
 
     def call(self, args: dict[str, Any]) -> str:
         text = get_group_memory(self.conn, self.group_id)
+        self.session.group_memory_hash = _text_hash(text)
         if not text:
             return "(empty — nothing learned about this group yet)"
         return text
@@ -118,6 +135,7 @@ class UpdateGroupMemoryTool(Tool):
     spec = _UPDATE_GROUP_MEMORY_SPEC
     conn: sqlite3.Connection
     group_id: str
+    session: MemoryWriteSession
 
     def call(self, args: dict[str, Any]) -> str:
         text = args.get("notes_text")
@@ -130,7 +148,18 @@ class UpdateGroupMemoryTool(Tool):
                 "Compact older / less relevant material before adding new."
             )
         previous = get_group_memory(self.conn, self.group_id)
+        if self.session.group_memory_hash is None:
+            raise ToolError(
+                "read_group_memory must be called immediately before update_group_memory"
+            )
+        if _text_hash(previous) != self.session.group_memory_hash:
+            self.session.group_memory_hash = _text_hash(previous)
+            raise ToolError(
+                "group_memory changed since you read it. Call read_group_memory again, "
+                "merge your update with the current text, then retry."
+            )
         upsert_group_memory(self.conn, self.group_id, text)
+        self.session.group_memory_hash = _text_hash(text)
         return (
             f"group_memory updated. prev_len={len(previous)} new_len={len(text)} "
             f"({len(text)*100//cap}% of cap)"
@@ -172,6 +201,7 @@ class UpdatePersonaDriftTool(Tool):
     spec = _UPDATE_PERSONA_DRIFT_SPEC
     conn: sqlite3.Connection
     group_id: str
+    session: MemoryWriteSession
 
     def call(self, args: dict[str, Any]) -> str:
         text = args.get("drift_text")
@@ -183,7 +213,18 @@ class UpdatePersonaDriftTool(Tool):
                 f"drift_text too long ({len(text)} chars; max {_DRIFT_TEXT_MAX})"
             )
         previous = get_persona_drift(self.conn, self.group_id)
+        if self.session.persona_hash is None:
+            raise ToolError(
+                "read_persona_drift must be called immediately before update_persona_drift"
+            )
+        if _text_hash(previous) != self.session.persona_hash:
+            self.session.persona_hash = _text_hash(previous)
+            raise ToolError(
+                "persona_drift changed since you read it. Call read_persona_drift again, "
+                "merge your update with the current text, then retry."
+            )
         upsert_persona_drift(self.conn, self.group_id, text)
+        self.session.persona_hash = _text_hash(text)
         return (
             f"persona drift updated. prev_len={len(previous)} new_len={len(text)}"
         )
@@ -216,10 +257,19 @@ def phase_b_system_prompt() -> str:
 def register_phase_b_tools(tools: "GroupScopedTools") -> None:  # noqa: F821 - structural-only ref
     """Register Phase B tools: two writers + the two readers needed for
     replace-on-write."""
-    tools.register(ReadPersonaDriftTool(conn=tools.conn, group_id=tools.group_id))
-    tools.register(ReadGroupMemoryForWriteTool(conn=tools.conn, group_id=tools.group_id))
-    tools.register(UpdatePersonaDriftTool(conn=tools.conn, group_id=tools.group_id))
-    tools.register(UpdateGroupMemoryTool(conn=tools.conn, group_id=tools.group_id))
+    session = MemoryWriteSession()
+    tools.register(ReadPersonaDriftTool(
+        conn=tools.conn, group_id=tools.group_id, session=session,
+    ))
+    tools.register(ReadGroupMemoryForWriteTool(
+        conn=tools.conn, group_id=tools.group_id, session=session,
+    ))
+    tools.register(UpdatePersonaDriftTool(
+        conn=tools.conn, group_id=tools.group_id, session=session,
+    ))
+    tools.register(UpdateGroupMemoryTool(
+        conn=tools.conn, group_id=tools.group_id, session=session,
+    ))
 
 
 # --- trace inspection (used by dispatcher to know which memory rows to link) ---

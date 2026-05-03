@@ -64,7 +64,7 @@ class Settings(BaseSettings):
 
     # Dispatcher loop tunables.
     dispatcher_poll_interval: float = 3.0
-    dispatcher_worker_threads: int = 4       # parallel groups; each group stays serial
+    dispatcher_worker_threads: int = 4       # global parallel workers; wx4py send is serialized separately
     dispatcher_candidate_limit: int = 500   # /find candidates per call
     dispatcher_context_chat: int = 2500     # @<bot> free-text context window
 
@@ -115,12 +115,13 @@ class Settings(BaseSettings):
     agent_max_image_reads_per_run: int = 2      # expensive read_image budget
     agent_max_voice_reads_per_run: int = 2      # expensive read_voice budget
 
-    # Lurk: bot silently reads recent messages and decides whether to
-    # update group_memory / persona_drift, without sending any reply.
-    # Manual via `wechat-oracle agent lurk <group_id>`. v0 has no auto-
-    # trigger from dispatcher idle loop — opt in by running the CLI on a
-    # cron / one-shot when you want the bot to digest recent activity.
-    agent_lurk_recent_msgs: int = 100          # window of msgs the lurk run sees
+    # Lurk: bot silently reads a watermarked batch of new messages, may use
+    # history tools for older context, and decides whether to update
+    # group_memory / persona_drift. It never sends a reply.
+    agent_lurk_enabled: bool = False          # opt-in background scheduler in dispatcher
+    agent_lurk_interval_seconds: int = 1800   # how often dispatcher scans due groups
+    agent_lurk_min_new_messages: int = 20     # auto-lurk only after this many new msgs
+    agent_lurk_recent_msgs: int = 100          # max new msgs per lurk run
     agent_lurk_max_steps: int = 4              # tool-call rounds for lurk reflection
 
     # Send the dispatcher's result back into the WeChat group. False = local-

@@ -167,7 +167,7 @@ def dispatcher_cmd() -> None:
 def agent_show(
     group_id: str = typer.Argument(..., help="messages.group_id of the target group"),
 ) -> None:
-    """Dump persona_drift + group_memory for one group (read-only)."""
+    """Dump persona_drift + group_memory + lurk cursor for one group."""
     from datetime import datetime
     init_db()
     with get_conn() as conn:
@@ -177,6 +177,10 @@ def agent_show(
         ).fetchone()
         memory = conn.execute(
             "SELECT notes_text, size_chars, updated_at, last_run_id FROM group_memory WHERE group_id=?",
+            (group_id,),
+        ).fetchone()
+        lurk_state = conn.execute(
+            "SELECT last_msg_id, last_run_id, updated_at FROM agent_lurk_state WHERE group_id=?",
             (group_id,),
         ).fetchone()
 
@@ -203,6 +207,16 @@ def agent_show(
             f"size={size} chars ({pct}% of cap)"
         )
         typer.echo(memory["notes_text"])
+
+    typer.echo("\n--- lurk_state ---")
+    if lurk_state is None:
+        typer.echo("(no cursor yet)")
+    else:
+        ts = datetime.fromtimestamp(lurk_state["updated_at"]).strftime("%Y-%m-%d %H:%M") if lurk_state["updated_at"] else "?"
+        typer.echo(
+            f"last_msg_id={lurk_state['last_msg_id'] or '?'}  "
+            f"last_run_id={lurk_state['last_run_id'] or '?'}  updated_at={ts}"
+        )
 
 
 @agent_app.command("wipe")
@@ -244,9 +258,9 @@ def agent_wipe(
 def agent_lurk(
     group_id: str = typer.Argument(..., help="messages.group_id of the target group"),
 ) -> None:
-    """One-shot 'lurk' run: bot reads recent messages + current memory and
-    decides whether to update group_memory / persona_drift. No reply sent
-    to the group regardless of outcome.
+    """One-shot 'lurk' run: bot reads new messages since its cursor, may
+    search older history for context, and decides whether to update
+    group_memory / persona_drift. No reply is ever sent to the group.
 
     Useful for periodic background memory consolidation (cron this every
     30 min for an active group), or to manually nudge the bot to update
@@ -339,7 +353,9 @@ def agent_show_runs(
         ts = datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S") if r["started_at"] else "?"
         dur = (r["finished_at"] - r["started_at"]) if (r["started_at"] and r["finished_at"]) else 0
         reply_text = r["reply_text"]
-        if reply_text is None or not reply_text.strip():
+        if r["trigger_kind"] == "lurk":
+            reply = "(lurk: no chat reply)"
+        elif reply_text is None or not reply_text.strip():
             try:
                 pa = _json.loads(r["phase_a_trace"] or "[]")
             except _json.JSONDecodeError:

@@ -380,6 +380,65 @@ def run_phase_b(
     return trace
 
 
+def run_lurk_reflection(
+    *,
+    llm: ToolingLLM,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    tools: GroupScopedTools,
+    max_steps: int,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+    tool_budget: ToolBudget | None = None,
+) -> list[dict[str, Any]]:
+    """Silent background-learning loop.
+
+    Unlike Phase B, the input is not a chat reply trace. The model sees an
+    observation batch, may call read-only history tools for older context, and
+    may call memory write tools. There is never a chat reply; final text is
+    only an audit marker.
+    """
+    trace: list[dict[str, Any]] = []
+    if not tools.names() or max_steps <= 0:
+        return trace
+
+    augmented_user = (
+        user_message
+        + f"\n\n[runtime] 你最多有 {max_steps} 个 tool-calling 回合。"
+        "可以用历史检索工具补上下文，也可以直接读/写记忆。"
+        "如果没有值得写入的长期信息，直接输出空文本结束。"
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": augmented_user},
+    ]
+    tool_specs = tools.openai_specs()
+
+    for step in range(max_steps):
+        resp = llm.complete_with_tools(
+            model=model,
+            messages=messages,
+            tools=tool_specs,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_choice="auto",
+        )
+        messages.append(resp.assistant_message)
+
+        if not resp.tool_calls:
+            trace.append({"step": step, "kind": "final", "content": resp.content})
+            return trace
+
+        tool_msgs = _execute_tool_calls(
+            tools, resp.tool_calls, trace, step, budget=tool_budget
+        )
+        messages.extend(tool_msgs)
+
+    trace.append({"step": max_steps, "kind": "max_steps_hit"})
+    return trace
+
+
 def run_agent(
     *,
     llm: ToolingLLM,

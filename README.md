@@ -115,6 +115,11 @@ WO_LLM_API_KEY=sk-...
 # WO_AGENT_MAX_IMAGE_READS_PER_RUN=2   # 单次回答最多直读图片数
 # WO_AGENT_MAX_VOICE_READS_PER_RUN=2   # 单次回答最多读语音数
 # WO_AGENT_REFLECTION_ENABLED=True     # 关闭跳过 Phase B（不写任何 member/group/persona 笔记）
+# WO_AGENT_LURK_ENABLED=False          # 开启后 dispatcher 用独立后台 worker 定期潜水学习
+# WO_AGENT_LURK_INTERVAL_SECONDS=1800  # 自动 lurk 扫描间隔
+# WO_AGENT_LURK_MIN_NEW_MESSAGES=20    # 每群累计至少这么多新消息才自动 lurk
+# WO_AGENT_LURK_RECENT_MSGS=100        # lurk 每次最多消化的新消息数；可按需检索旧消息补上下文
+# WO_AGENT_LURK_MAX_STEPS=4            # lurk 后台学习最多 tool-calling 步数
 ```
 
 ### 3. 建库
@@ -458,6 +463,14 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 直接 @ 进入 agent 或 reply-to-bot 进入 agent 时，dispatcher 会先发一条短提示“收到，正在处理。”；`probability` 自主触发不会预提示，避免没决定要不要说话前先打扰群聊。
 
+### 后台学习（lurk）
+
+`uv run wechat-oracle agent lurk <group_id>` 会跑一次静默学习：首轮取最近 `WO_AGENT_LURK_RECENT_MSGS` 条，之后从 `agent_lurk_state.last_msg_id` 继续增量处理新消息。它不走 replier、不发 ack、不影响 wx4py GUI。设 `WO_AGENT_LURK_ENABLED=True` 后，dispatcher 会用独立的单 worker 定期扫描有足够新消息的群并自动 lurk；这个 worker 不占用聊天响应 worker。
+
+lurk 的模型输入是“新观察到的一批消息”，同时可按需调用 `recall_group_history` / `view_quoted_chain` / `expand_forward_bundle` 查旧消息补上下文，再用 `read_group_memory` / `read_persona_drift` → `update_group_memory` / `update_persona_drift` 写长期记忆。写入工具会检查“读后写”版本；如果并发 agent run 已经改过同一段记忆，会要求模型重新读取并合并，避免 replace-on-write 覆盖掉别人的更新。
+
+`agent_run_log(trigger_kind='lurk')` 只存紧凑审计：消息范围、工具调用和写入动作；完整 prompt 仍写入 `data/llm_debug.log`。`agent_lurk_state` 只保存下一次 lurk 的水位，不承担审计职责。
+
 **触发**：dispatcher 现在扫**所有未处理的 live 消息**（不只 @ 的），在 `_classify_trigger` 里分三类——
 
 | kind | 条件 | cooldown |
@@ -538,8 +551,11 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | 静态人格 yaml 目录，每群一个 `<group_id>.yaml` |
 | `WO_AGENT_RECENT_CONTEXT_CHAT` | `200` | Phase A 初始 system prompt 注入的最近群消息条数 |
 | `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | `group_memory` 单文档硬上限；超过 update_group_memory 抛 ToolError，agent 必须先压缩 |
-| `WO_AGENT_LURK_RECENT_MSGS` | `100` | 一次 lurk run 看的最近消息窗口（潜水观察 → 自决是否 update memory，不发回群） |
-| `WO_AGENT_LURK_MAX_STEPS` | `4` | lurk reflection 阶段最多 tool-calling 步数 |
+| `WO_AGENT_LURK_ENABLED` | `False` | 开启 dispatcher 内置后台学习调度；使用独立 lurk worker，不占聊天 worker，不走 wx4py |
+| `WO_AGENT_LURK_INTERVAL_SECONDS` | `1800` | 自动 lurk 扫描间隔（秒） |
+| `WO_AGENT_LURK_MIN_NEW_MESSAGES` | `20` | 每群累计至少这么多 cursor 之后的新消息，才触发一次自动 lurk |
+| `WO_AGENT_LURK_RECENT_MSGS` | `100` | 一次 lurk run 最多处理的新消息数；首轮取最近窗口，后续按 `agent_lurk_state.last_msg_id` 增量处理，可按需检索旧消息 |
+| `WO_AGENT_LURK_MAX_STEPS` | `4` | lurk 后台学习阶段最多 tool-calling 步数 |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `12` | Phase A 单次回答总工具调用预算；超过后把预算错误喂回模型，让它基于已有信息回答 |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Phase A 单轮 LLM 决策最多执行几个工具 |
 | `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Phase A 单次回答最多执行几次 `read_image` |
@@ -588,9 +604,10 @@ forwarded_records (
 persona_drift   ( group_id PK, drift_text, updated_at, last_run_id )           -- 演化人格补充, replace-on-write
 group_memory    ( group_id PK, notes_text, size_chars, updated_at,             -- 群文档(成员/事件/文化全放一起),
                   last_run_id )                                                  -- replace-on-write, 100k 上限
-agent_run_log   ( run_id PK, group_id, trigger_msg_id, trigger_kind,           -- 每次 agent run 的完整 trace
+agent_run_log   ( run_id PK, group_id, trigger_msg_id, trigger_kind,           -- agent run 审计；chat 完整 trace, lurk 紧凑 trace
                   phase_a_trace, phase_b_trace, reply_text,
                   started_at, finished_at )
+agent_lurk_state( group_id PK, last_msg_id, last_run_id, updated_at )          -- lurk 增量水位；审计仍看 agent_run_log
 
 -- 历史遗留(已不被使用,新装无影响; 旧装可手动 DROP):
 -- member_notes / group_notes — 之前按成员 / 按主题分开存的笔记表; 已合并为单一 group_memory
@@ -598,13 +615,14 @@ agent_run_log   ( run_id PK, group_id, trigger_msg_id, trigger_kind,           -
 
 跨源去重靠 `UNIQUE(dedupe_key)`：有 `wx_msg_id` 时用 `wx:<group>:<id>`，没有时用关键字段哈希。`messages.status` 和 `command_runs` 是两条并行的状态机，互不污染。
 
-agent 三张表的写语义：`persona_drift` / `group_memory` 都是 replace-on-write（读 → 合并 → 整段写回；100k 上限强制压缩），`agent_run_log` 始终追加。所有 SQL 实现都在 tool 实现层强制 `WHERE group_id=?` —— `group_id` 不暴露给 LLM，靠 `GroupScopedTools` 构造器锁。`persona_drift.last_run_id` / `group_memory.last_run_id` 反向链回 `agent_run_log`，任何笔记内容都能查到是哪次 agent run 写的（防 summarization drift 不可追溯）。
+agent 记忆表的写语义：`persona_drift` / `group_memory` 都是 replace-on-write（读 → 合并 → 整段写回；100k 上限强制压缩），写工具会检查读到的版本是否仍是当前版本，防并发覆盖。`agent_run_log` 始终追加。所有 SQL 实现都在 tool 实现层强制 `WHERE group_id=?` —— `group_id` 不暴露给 LLM，靠 `GroupScopedTools` 构造器锁。`persona_drift.last_run_id` / `group_memory.last_run_id` 反向链回 `agent_run_log`，任何笔记内容都能查到是哪次 agent run 写的（防 summarization drift 不可追溯）。`agent_lurk_state` 是 lurk 的增量水位，不存记忆正文。
 
 CLI 看 / 改 agent 状态：
 
 ```powershell
 uv run wechat-oracle agent show <group_id>            # dump persona_drift + group_memory
 uv run wechat-oracle agent show-runs <group_id> -n 10 # 最近 N 次 agent_run_log + 写动作高亮
+uv run wechat-oracle agent lurk <group_id>            # 潜水消化新消息/必要时检索旧消息，只更新记忆，不发群消息
 uv run wechat-oracle agent wipe <group_id>            # 清 persona_drift + group_memory（带确认）
 uv run wechat-oracle agent wipe <group_id> --persona-only / --memory-only / -y
 ```
