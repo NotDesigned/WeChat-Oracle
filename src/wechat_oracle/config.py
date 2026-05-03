@@ -43,6 +43,17 @@ class Settings(BaseSettings):
     # Required for `wechat-oracle dispatcher` to recognize commands.
     bot_name: str = ""
 
+    # Bot's own wxid. Optional — when empty, dispatcher auto-discovers it from
+    # the messages table (looks for the most recent row where sender_display
+    # matches WO_BOT_NAME). Discovery only succeeds after WeFlow SSE has
+    # echoed at least one of the bot's own messages back into the table.
+    # Set this manually to skip the discovery delay (find it once with
+    # `SELECT sender_wxid FROM messages WHERE sender_display='<bot_name>' LIMIT 1`
+    # after the first reply, or copy from WeChat client settings).
+    # When unknown, the reply-to-bot trigger silently degrades; mention
+    # and probability triggers still work.
+    bot_wxid: str = ""
+
     # LLM API for dispatcher calls. The endpoint must expose an OpenAI-compatible
     # `/chat/completions` API; include `/v1` if the provider requires it.
     llm_provider: str = "openai-compatible"

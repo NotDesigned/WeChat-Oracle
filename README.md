@@ -449,7 +449,18 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 7. 写一行 `agent_run_log`：group_id / trigger_msg_id / trigger_kind / phase_a_trace JSON / phase_b_trace JSON / reply_text / 时间戳——审计 + 调试主入口
 8. `reply_text` 非空 → 走 `replier.send` 发回群；空（`stay_silent`）→ dispatcher 跳过 send，群里看不到 bot 任何反应
 
-**触发**：今天只有 @ 触发（`parse_command` 撞 `bot_name` 才进 `ChatCommand`）。`WO_AGENT_BASE_PROBABILITY > 0` 的概率触发和「被 reply 必应」需要在 dispatcher 主轮询里加钩子（待做）。
+**触发**：dispatcher 现在扫**所有未处理的 live 消息**（不只 @ 的），在 `_classify_trigger` 里分三类——
+
+| kind | 条件 | cooldown |
+|---|---|---|
+| `mention` | `content_text` 含 `@<bot_name>` | 不受 cooldown 限制 |
+| `reply` | quote-reply 的 parent (`reply_to_wx_msg_id`→`wx_msg_id`) 是 bot 自己 | 不受 cooldown 限制 |
+| `probability` | 上面都不是 + `WO_AGENT_BASE_PROBABILITY > 0` 摇到 + 上次说话超过 `WO_AGENT_COOLDOWN_SECONDS` | **受 cooldown 限制** |
+| `None` | 上面都没命中 → `_finalize` 标 `(no-trigger)` 跳过，不烧 LLM | — |
+
+`mention` 走完整 `parse_command` 流程（slash 命令都能用，纯文本进 `ChatCommand`→agent）；`reply` / `probability` 直接进 agent loop（无 slash 解析），因为它们没有"命令语法"概念。
+
+reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` 配置（手填）；(2) **自动发现**——dispatcher 启动 + 每 5 个 poll 周期重试：`SELECT sender_wxid FROM messages WHERE sender_display=WO_BOT_NAME ...`。只要 WeFlow SSE 把 bot 自己的回复回流到 `messages` 表（生产路径上应该是），第一次回复后下一轮 poll 就发现了。回流不工作时 reply 触发降级（mention + probability 不受影响），日志里有清晰 warning。`uv run wechat-oracle verify roundtrip` 可以一键查这件事。
 
 **隔离**：所有 SQL 写死 `WHERE group_id=?`，参数从 `GroupScopedTools.__init__` 锁定——`group_id` 不暴露给 LLM 当 tool 参数，从根上禁止跨群泄密。详见 `agent/tools.py`。
 
@@ -486,6 +497,7 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API |
 | `WO_WEFLOW_TOKEN` | — | WeFlow access token |
 | `WO_BOT_NAME` | — | 小号在群里的群昵称（dispatcher 必填） |
+| `WO_BOT_WXID` | — | 小号自己的 wxid（可选）。空时 dispatcher 从 `messages` 表里自动发现（看 `sender_display=WO_BOT_NAME` 的回流消息）；要等 WeFlow SSE 回流第一条 bot 消息后才能命中。手填可立刻启用 reply-to-bot 触发 |
 | `WO_LLM_PROVIDER` | `openai-compatible` | LLM 适配器；目前实现 OpenAI 兼容接口 |
 | `WO_LLM_API_KEY` | — | LLM API key |
 | `WO_LLM_ENDPOINT` | `https://api.deepseek.com` | OpenAI 兼容端点；供应商要求时带 `/v1` |

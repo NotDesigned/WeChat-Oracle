@@ -28,10 +28,72 @@ ingest_app = typer.Typer(no_args_is_help=True)
 weflow_app = typer.Typer(no_args_is_help=True, help="Inspect what WeFlow's HTTP API exposes (diagnose WO_GROUPS issues, etc.)")
 openclaw_app = typer.Typer(no_args_is_help=True, help="Tencent iLink Bot API experiments (verifying group_id support).")
 worker_app = typer.Typer(no_args_is_help=True, help="Background workers that fill in derived data on messages rows.")
+verify_app = typer.Typer(no_args_is_help=True, help="Health checks for the dispatch pipeline.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
 app.add_typer(openclaw_app, name="openclaw")
 app.add_typer(worker_app, name="worker")
+app.add_typer(verify_app, name="verify")
+
+
+@verify_app.command("roundtrip")
+def verify_roundtrip() -> None:
+    """Check whether WeFlow SSE echoes the bot's own replies back into the
+    messages table. Required for reply-to-bot triggers and bot_wxid
+    auto-discovery.
+
+    Run this AFTER you've @ed the bot a few times in a watched group and
+    the bot has replied. Reads `messages` looking for rows where
+    `sender_display == WO_BOT_NAME` (i.e. the bot's own messages).
+    """
+    if not settings.bot_name:
+        typer.echo("⚠️  WO_BOT_NAME is empty — set it to the bot's group nickname first.")
+        raise typer.Exit(1)
+    init_db()
+    with get_conn() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE sender_display = ?",
+            (settings.bot_name,),
+        ).fetchone()["n"]
+        wxid_row = conn.execute(
+            "SELECT sender_wxid FROM messages "
+            "WHERE sender_display = ? AND sender_wxid IS NOT NULL AND sender_wxid != '' "
+            "ORDER BY t DESC LIMIT 1",
+            (settings.bot_name,),
+        ).fetchone()
+        recent = conn.execute(
+            "SELECT msg_id, group_name, t, content_text, sender_wxid FROM messages "
+            "WHERE sender_display = ? ORDER BY t DESC LIMIT 5",
+            (settings.bot_name,),
+        ).fetchall()
+
+    typer.echo(f"bot_name = {settings.bot_name!r}")
+    typer.echo(f"messages where sender_display matches: {total}")
+    if total == 0:
+        typer.echo("")
+        typer.echo("❌ No bot messages echoed back.")
+        typer.echo("   Either the bot hasn't replied yet, OR WeFlow SSE doesn't")
+        typer.echo("   roundtrip self-sent messages. Reply-to-bot trigger will be")
+        typer.echo("   permanently disabled in this case — set WO_BOT_WXID manually.")
+        return
+    if wxid_row is None:
+        typer.echo("")
+        typer.echo("⚠️  Bot messages found but their sender_wxid is NULL.")
+        typer.echo("   Auto-discovery can't recover wxid; set WO_BOT_WXID manually.")
+    else:
+        typer.echo(f"discovered bot wxid: {wxid_row['sender_wxid']}")
+        if not settings.bot_wxid:
+            typer.echo(f"  → consider setting WO_BOT_WXID={wxid_row['sender_wxid']} in .env")
+            typer.echo("    (skips the wxid discovery delay on cold start)")
+        elif settings.bot_wxid != wxid_row["sender_wxid"]:
+            typer.echo(f"⚠️  WO_BOT_WXID={settings.bot_wxid!r} but DB shows {wxid_row['sender_wxid']!r}")
+    typer.echo("")
+    typer.echo("recent bot messages:")
+    from datetime import datetime
+    for r in recent:
+        ts = datetime.fromtimestamp(int(r["t"])).strftime("%Y-%m-%d %H:%M")
+        body = (r["content_text"] or "").replace("\n", " ")[:60]
+        typer.echo(f"  [{r['msg_id']}] {ts} ({r['group_name'] or '?'}): {body}")
 
 
 @worker_app.command("mm")

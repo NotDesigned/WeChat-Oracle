@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import abc
 import json
+import random
 import re
 import sqlite3
 import time
@@ -1505,6 +1506,93 @@ def keyword_fallback(cands: list[Candidate], keywords: list[str], cap: int = 5) 
 
 # ---------- Run loop ----------
 
+
+# Per-process per-group "when did the bot last actually speak" map. Used by
+# the trigger layer to enforce cooldown for probability triggers (and for
+# nothing else; mention/reply must always go through). Module-level so the
+# dispatcher loop and any helpers it calls share one view; reset on restart
+# is acceptable.
+_BOT_LAST_SPOKE_AT: dict[str, float] = {}
+
+
+def _resolve_bot_wxid(conn: sqlite3.Connection, bot_name: str) -> str | None:
+    """Find the bot's own wxid.
+
+    Order:
+      1. `WO_BOT_WXID` config (explicit) — wins immediately.
+      2. Auto-discover from `messages`: look for the newest row where
+         `sender_display == bot_name` AND `sender_wxid IS NOT NULL`.
+         Only succeeds after WeFlow SSE has echoed at least one of the bot's
+         own messages back into the table.
+
+    Returns None when neither path resolves. Callers (trigger classifier)
+    must tolerate a None bot_wxid by skipping the reply-to-bot path.
+    """
+    if settings.bot_wxid:
+        return settings.bot_wxid
+    row = conn.execute(
+        """
+        SELECT sender_wxid FROM messages
+         WHERE sender_display = ?
+           AND sender_wxid IS NOT NULL
+           AND sender_wxid != ''
+         ORDER BY t DESC
+         LIMIT 1
+        """,
+        (bot_name,),
+    ).fetchone()
+    return row["sender_wxid"] if row else None
+
+
+def _is_reply_to_bot(
+    conn: sqlite3.Connection, row: sqlite3.Row, bot_wxid: str | None
+) -> bool:
+    """True iff `row` is a quote-reply whose parent (matched by
+    reply_to_wx_msg_id → wx_msg_id) was sent by the bot."""
+    if bot_wxid is None:
+        return False
+    parent_id = row["reply_to_wx_msg_id"]
+    if not parent_id:
+        return False
+    parent = conn.execute(
+        "SELECT sender_wxid FROM messages WHERE wx_msg_id = ?",
+        (parent_id,),
+    ).fetchone()
+    return parent is not None and parent["sender_wxid"] == bot_wxid
+
+
+def _classify_trigger(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    bot_name: str,
+    bot_wxid: str | None,
+    now: float,
+) -> str | None:
+    """Decide whether to wake the agent for this row. Returns one of
+    'mention' / 'reply' / 'probability' or None (skip silently).
+
+    Order matters:
+      - mention always wakes (even within cooldown)
+      - reply-to-bot always wakes (same)
+      - probability is gated by cooldown + WO_AGENT_BASE_PROBABILITY
+    """
+    text = row["content_text"] or ""
+    if bot_name and f"@{bot_name}" in text:
+        return "mention"
+    if _is_reply_to_bot(conn, row, bot_wxid):
+        return "reply"
+    # Probability path — bail early if the knob is off.
+    p = settings.agent_base_probability
+    if p <= 0.0:
+        return None
+    last = _BOT_LAST_SPOKE_AT.get(row["group_id"], 0.0)
+    if now - last < settings.agent_cooldown_seconds:
+        return None
+    if random.random() < p:
+        return "probability"
+    return None
+
+
 def _claim(conn: sqlite3.Connection, msg_id: int) -> bool:
     """INSERT a 'running' row. False if another worker (or a previous run) has it."""
     try:
@@ -1529,35 +1617,35 @@ def _finalize(conn: sqlite3.Connection, msg_id: int, status: str, result: str) -
 def _next_unprocessed(
     conn: sqlite3.Connection, bot_name: str, batch: int = 20
 ) -> list[sqlite3.Row]:
-    """Live text-or-quote rows that ping the bot (any `@<bot>...`, slash command
-    or free-form question) and have no command_runs row yet. Final dispatch is
-    in Python (parse_command).
+    """Live messages with no command_runs row yet. Trigger classification
+    happens in Python (`_classify_trigger`) — most rows return None and get
+    finalized as no-trigger; mention / reply / probability wake the agent.
 
-    Quote rows are included because a user can right-click → 引用 a previous
-    message and add `@<bot> ...` to it. The reply text (which is what addresses
-    the bot) lives in `content_text` exactly the same as for plain text. See
-    CLAUDE.md F4 / F7.
+    Includes all message types except 'system' (撤回 / 入群 / 退群 — ambient
+    events, not user speech). 'forward' / 'link' / 'image' / 'voice' / etc.
+    all flow through; the agent decides whether they warrant a reply via
+    its `stay_silent` tool. Quote rows are essential — reply-to-bot lives
+    here.
+
+    `sender_display != bot_name` excludes the bot's own echoes (the
+    primary loop-prevention; cheap and good enough for v0). Once
+    bot_wxid is reliably known we could tighten this to wxid-based.
     """
-    # Exclude messages the bot itself sent — otherwise replies that quote /
-    # echo earlier `@<bot>` chatter (e.g. /recent listings) get LIKE-matched
-    # and processed as new commands, looping the bot back into its own input.
-    needle = f"%@{bot_name}%"
     return conn.execute(
         """
-        SELECT m.msg_id, m.group_id, m.group_name, m.t, m.content_text,
+        SELECT m.msg_id, m.group_id, m.group_name, m.t, m.type, m.content_text,
                m.sender_display, m.sender_wxid,
-               m.quote_text, m.reply_to_wx_msg_id
+               m.quote_text, m.reply_to_wx_msg_id, m.wx_msg_id
           FROM messages m
      LEFT JOIN command_runs r ON r.msg_id = m.msg_id
          WHERE m.source = 'live'
-           AND m.type IN ('text', 'quote')
-           AND m.content_text LIKE ?
+           AND m.type != 'system'
            AND r.msg_id IS NULL
            AND (m.sender_display IS NULL OR m.sender_display != ?)
          ORDER BY m.t ASC
          LIMIT ?
         """,
-        (needle, bot_name, batch),
+        (bot_name, batch),
     ).fetchall()
 
 
@@ -1594,34 +1682,29 @@ def _process(
     log_path: Path,
     llm_log_path: Path | None,
     vision: VisionLLM | None = None,
+    bot_wxid: str | None = None,
 ) -> None:
+    """Trigger-classify the row, then route:
+      - 'mention'     → parse_command (slash commands run; bare text → ChatCommand → agent)
+      - 'reply'       → straight to chat_via_agent with the quoted text inlined
+      - 'probability' → straight to chat_via_agent with no question prompt
+      - None          → silently finalize (most messages — bot stays out of group chatter)
+    """
     msg_id = row["msg_id"]
-    parsed = parse_command(row["content_text"], settings.bot_name)
-
-    if parsed is None:
-        # LIKE matched but the message isn't a `@<bot> /<word>` attempt.
-        _finalize(conn, msg_id, "ok", "(not a command)")
-        return
-
     requester = row["sender_display"] or row["sender_wxid"]
-
-    if isinstance(parsed, ParseError):
-        text = parsed.chat()
-        print(text, flush=True)
-        _append_log(log_path, row["t"], text)
-        replier.send(row["group_name"], requester, text)
-        _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
+    now = time.time()
+    kind = _classify_trigger(conn, row, settings.bot_name, bot_wxid, now)
+    if kind is None:
+        _finalize(conn, msg_id, "ok", "(no-trigger)")
         return
 
-    # Row may carry quote-reply info; pass through so ChatCommand can inline
-    # what the user 引用ed into the LLM prompt. Other commands ignore it.
     quoted_text = None
     quoted_msg_id = None
     try:
         quoted_text = row["quote_text"]
         quoted_msg_id = row["reply_to_wx_msg_id"]
     except (KeyError, IndexError):
-        pass  # older code path / non-quote source — fields absent
+        pass
 
     ctx = CommandContext(
         conn=conn,
@@ -1643,6 +1726,29 @@ def _process(
         trigger_msg_id=int(msg_id),
         trigger_t=int(row["t"]),
     )
+
+    if kind != "mention":
+        # reply / probability: skip slash-command parsing, jump straight to
+        # the agent. The user's text is the trigger context itself.
+        _process_agent_only(conn, replier, row, ctx, log_path, kind)
+        return
+
+    # 'mention' path: keep the existing parse_command flow so /find /sum etc.
+    # all still work. Bare `@<bot> <text>` falls into ChatCommand which runs
+    # the agent loop too — same agent, just dispatched through Command.
+    parsed = parse_command(row["content_text"], settings.bot_name)
+    if parsed is None:
+        _finalize(conn, msg_id, "ok", "(mention without command body)")
+        return
+
+    if isinstance(parsed, ParseError):
+        text = parsed.chat()
+        print(text, flush=True)
+        _append_log(log_path, row["t"], text)
+        replier.send(row["group_name"], requester, text)
+        _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
+        return
+
     try:
         result = parsed.execute(ctx)
     except Exception as e:
@@ -1656,24 +1762,66 @@ def _process(
 
     print(result.stdout, flush=True)
     _append_log(log_path, row["t"], result.stdout)
-    # Empty `chat` is the explicit silent signal — wired by the agent loop's
-    # stay_silent path. Skip the replier so wx4py doesn't ship empty text into
-    # the group; the operator still sees the audit line in stdout/log.
     if result.chat.strip():
         replier.send(row["group_name"], requester, result.chat)
+        _BOT_LAST_SPOKE_AT[row["group_id"]] = now
     _finalize(conn, msg_id, "ok", result.summary)
 
 
+def _process_agent_only(
+    conn: sqlite3.Connection,
+    replier: "Replier",
+    row: sqlite3.Row,
+    ctx: "CommandContext",
+    log_path: Path,
+    kind: str,
+) -> None:
+    """Reply-to-bot and probability paths bypass slash-command parsing — the
+    triggering message text IS the prompt. For probability triggers there
+    may be no actionable user question at all, so we feed the agent a stub
+    "在群里看到这条消息" framing and let it decide whether to chime in."""
+    msg_id = row["msg_id"]
+    text = (row["content_text"] or "").strip()
+    requester = row["sender_display"] or row["sender_wxid"]
+    if kind == "reply":
+        # User replied to one of bot's prior messages. Their reply text is
+        # the user_question; quote_text is the bot's prior message we set
+        # via ctx.quoted_text and the agent prompt already inlines it.
+        user_question = text or "（用户引用了你之前的话但没说什么）"
+    else:  # probability
+        user_question = (
+            f"你正在群里偶然看到这条消息：「{text or '（非文本消息）'}」"
+            "。要不要插一句话？不必要就调 stay_silent 闭嘴；要回应就直接答。"
+        )
+
+    try:
+        reply = chat_via_agent(ctx=ctx, user_question=user_question, trigger_kind=kind)
+    except Exception as e:
+        logger.exception("agent crashed on msg_id={} kind={}", msg_id, kind)
+        _finalize(conn, msg_id, "error", f"agent-crash: {e}")
+        return
+
+    summary = f"agent[{kind}]: " + ("silent" if reply is None else f"{len(reply)} chars")
+    print(f"@<bot> agent[{kind}]  ::  msg_id={msg_id}  ->  {summary}", flush=True)
+    _append_log(log_path, row["t"], f"agent[{kind}] msg_id={msg_id}\n{reply or '(silent)'}")
+    if reply and reply.strip():
+        replier.send(row["group_name"], requester, reply)
+        _BOT_LAST_SPOKE_AT[row["group_id"]] = time.time()
+    _finalize(conn, msg_id, "ok", summary)
+
+
 def _skip_backlog(conn: sqlite3.Connection, bot_name: str) -> int:
-    """Mark every existing un-claimed `@<bot>` message as already-processed
-    (status='ok', result='startup-skip'). Run once at dispatcher startup so a
-    cold start doesn't flood the group with replies to historical questions —
-    backlogs may arise from a long downtime, a fresh DB import, or restarting
-    after a one-shot historical re-pull. Future messages stream through
-    `_next_unprocessed` normally.
+    """Mark every pre-existing live message (any type except 'system') as
+    already-processed. Run once at dispatcher startup so a cold start doesn't
+    flood the group with probability-triggered replies to historical messages
+    — backlogs arise from long downtime, fresh DB imports, or restarting
+    after a one-shot historical re-pull.
+
+    Scope expanded from the @-only version to match `_next_unprocessed`:
+    the dispatcher now scans all live messages (not just @ mentions), so
+    we have to skip them all on cold start too.
     """
     now = int(time.time())
-    needle = f"%@{bot_name}%"
     with transaction(conn):
         cur = conn.execute(
             """
@@ -1682,12 +1830,11 @@ def _skip_backlog(conn: sqlite3.Connection, bot_name: str) -> int:
               FROM messages m
          LEFT JOIN command_runs r ON r.msg_id = m.msg_id
              WHERE m.source = 'live'
-               AND m.type IN ('text', 'quote')
-               AND m.content_text LIKE ?
+               AND m.type != 'system'
                AND r.msg_id IS NULL
                AND (m.sender_display IS NULL OR m.sender_display != ?)
             """,
-            (now, now, needle, bot_name),
+            (now, now, bot_name),
         )
     return cur.rowcount or 0
 
@@ -1719,7 +1866,23 @@ def run_dispatcher() -> None:
     with get_conn() as conn:
         skipped = _skip_backlog(conn, settings.bot_name)
         if skipped:
-            logger.info("startup: skipped {} pre-existing @-mentions (won't reply to backlog)", skipped)
+            logger.info(
+                "startup: skipped {} pre-existing live messages (won't trigger on backlog)",
+                skipped,
+            )
+        bot_wxid = _resolve_bot_wxid(conn, settings.bot_name)
+        if bot_wxid:
+            logger.info(
+                "bot_wxid resolved: {} ({})",
+                bot_wxid,
+                "from WO_BOT_WXID" if settings.bot_wxid else "auto-discovered from messages",
+            )
+        else:
+            logger.warning(
+                "bot_wxid unknown — reply-to-bot trigger disabled until WeFlow SSE echoes a bot reply back. "
+                "Set WO_BOT_WXID in .env to skip the discovery delay."
+            )
+        loops_since_wxid_retry = 0
         try:
             while True:
                 rows = _next_unprocessed(conn, settings.bot_name)
@@ -1727,10 +1890,24 @@ def run_dispatcher() -> None:
                     if not _claim(conn, row["msg_id"]):
                         continue
                     try:
-                        _process(conn, llm, replier, row, log_path, llm_log_path, vision=vision)
+                        _process(conn, llm, replier, row, log_path, llm_log_path,
+                                 vision=vision, bot_wxid=bot_wxid)
                     except Exception as e:
                         logger.exception("dispatcher crashed on msg_id={}", row["msg_id"])
                         _finalize(conn, row["msg_id"], "error", f"crashed: {e}")
+                # Lazy retry of bot_wxid discovery so reply-to-bot starts working
+                # automatically once WeFlow SSE echoes the first bot reply back.
+                # Cheap (one indexed query) but only if we don't have a value yet.
+                if bot_wxid is None:
+                    loops_since_wxid_retry += 1
+                    if loops_since_wxid_retry >= 5:
+                        loops_since_wxid_retry = 0
+                        bot_wxid = _resolve_bot_wxid(conn, settings.bot_name)
+                        if bot_wxid:
+                            logger.info(
+                                "bot_wxid auto-discovered from echoed reply: {}",
+                                bot_wxid,
+                            )
                 if not rows:
                     time.sleep(interval)
         except KeyboardInterrupt:
