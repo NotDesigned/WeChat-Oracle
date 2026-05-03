@@ -356,58 +356,9 @@ class ChatCommand(Command):
         return cls(message=msg)
 
     def execute(self, ctx: CommandContext) -> ExecResult:
-        # Agent loop is opt-in via WO_AGENT_ENABLED. When off (today's
-        # default) → fall through to the legacy single-pass + vision-sentinel
-        # path. When on → multi-turn tool-calling agent decides whether and
-        # what to reply.
-        if settings.agent_enabled:
-            return self._execute_agent(ctx)
-
-        # Legacy path. See chat_assistant docstring for the two-pass design.
-        context = fetch_candidates(
-            ctx.conn,
-            group_id=ctx.group_id,
-            target=None,
-            since_t=None,
-            limit=ctx.candidate_limit_chat,
-            bot_name=ctx.bot_name,
-            for_chat=True,
-        )
-        # When the user 引用ed a message and addressed the bot, inline the
-        # quoted snippet so the LLM treats it as the topic of the question
-        # without having to fish it out of the context window.
-        message = self.message
-        if ctx.quoted_text:
-            message = f"[用户引用了一条消息：{ctx.quoted_text}]\n{message}"
-        reply = chat_assistant(
-            ctx.llm, ctx.model, message, context,
-            log_path=ctx.llm_log_path,
-            requester=ctx.requester,
-            vision=ctx.vision,
-            vision_model=ctx.vision_model,
-            vision_max_images=ctx.vision_max_images,
-            vision_max_tokens=ctx.vision_max_tokens,
-            conn=ctx.conn,
-        )
-        if not reply:
-            reply = "（模型没返回内容，再问一次试试）"
-        logger.info(
-            "chat :: {!r}  context={}  reply_len={}",
-            self.message[:60], len(context), len(reply),
-        )
-        stdout = (
-            f"@<bot> chat  ::  {self.message}\n"
-            f"  ({len(context)} ctx msgs -> {len(reply)} chars)\n"
-            f"{reply}"
-        )
-        return ExecResult(stdout=stdout, chat=reply, summary=f"chat ({len(context)} ctx)")
-
-    def _execute_agent(self, ctx: CommandContext) -> ExecResult:
-        """WO_AGENT_ENABLED=True branch: multi-turn tool-calling loop.
-
-        Returns ExecResult with chat='' (silent signal honored by _process)
-        when the agent chose stay_silent. The full trace lives in
-        agent_run_log; stdout shows a one-line summary for the operator."""
+        """Multi-turn tool-calling agent loop. Returns ExecResult with
+        chat='' (the silent signal honored by `_process`) when the agent
+        chose stay_silent. Full trace in `agent_run_log`."""
         reply = chat_via_agent(ctx=ctx, user_question=self.message, trigger_kind="mention")
         if reply is None:
             stdout = (
@@ -1215,74 +1166,6 @@ def llm_filter(
     return LLMFilterResult(hits=hits, keywords=keywords, reason=reason_text)
 
 
-_CHAT_SYSTEM_PROMPT_BASE = """你是这个微信群里的小助手。用户 @ 了你并问了问题/提了话题，你需要结合下面提供的「最近群聊上下文」来作答。
-
-上下文行的格式约定（必须读懂，否则会忽略真实内容）：
-- 普通文字：`[id] (时间) 用户:正文`，正文就是该用户打出来的字
-- 引用回复：`...回复正文[引用 原作者：原内容]`，方括号是被引用消息的 sender + 正文
-- **图片识别**：`[图片·OCR] <文字>` —— 中点后的内容是机器从这张图片里识别出来的字（可能是文章截图、表情包字幕、表格、聊天记录截图等）。**视同该 sender 用图片表达**，可以转述、复读、引用。
-- **语音识别**：`[语音·ASR] <文字>` —— 同上，机器从语音里转出来的字。可能不准、可能很短，但**就是用户当时说的话**，应直接转述。
-- 仅 `[图片]` / `[语音]`（不带 ·OCR / ·ASR 后缀）—— 该消息还没识别（图里没字 / 语音太短失败），按"事件"看，不要假设内容。
-- 系统消息：`[id] (时间) ?:对方撤回了一条消息`、入群退群提示等，可作时间线感知；通常不直接回应。
-- **合并转发的聊天记录**：父行是 `[id] (转发时间) 发起人:[聊天记录]`，紧接着会跟若干 `↳ [f:N] (原时间) 原作者:正文` 缩进子项——**这些缩进行就是被打包转发进来的聊天内容**，原作者/原时间是它们在源群里发出时的信息；要回答"这个聊天记录里说了什么"就直接读这些子项。子项的"原时间"可能比父行早数小时甚至数年（源消息很老）。
-- 其他来源标签：`[链接] 标题\\nURL`、`[卡片消息]`、`[转账]` 等，按字面意义理解。
-
-回答要求：
-- **直接答**，不要"根据上下文…"、"我看到群里…"这类废话开头
-- 上下文不足或没相关信息时如实说"群里没出现过相关讨论"，不要编
-- **控制 2–6 句**；可转述/概括、可复读 OCR/ASR 出来的文字（这不算"复制聊天原文"——那段字本就是用户通过图片/语音表达的，需要时一字一句念出来也没问题），但**不要**贴大段普通发言原文
-- 中文回答（除非问题明显是英文）
-- 不要 @ 任何人；不要用 markdown 语法（不要 `**` `#` `-` 这些）
-- 如果问题本身就跟群无关（"今天天气怎么样"），直接答即可，不要硬扯群聊
-- 提到"刚才/刚刚/最近"时，参考下方提供的"当前时间"做时间锚定；用户说"我"/"我刚才说了什么"等指代自己时，参考"提问者"字段定位他在群里的发言"""
-
-_CHAT_SYSTEM_PROMPT_VISION_TAIL = """
-
-【看原图的二轮机制】系统能把指定的原图喂给视觉模型重答。**满足以下任一条件就在最终回答末尾挂上 `<NEED_IMAGES>m:N1,m:N2</NEED_IMAGES>`（最多 3 个，`f:` 转发子项的图取不到不要选）**——宁多勿少：
-
-1. **用户用引用回复指向某张图**：你看到用户问题前面有 `[用户引用了一条消息：[图片]...]` / `[用户引用了一条消息：[图片·OCR] ...]` —— 用户就是来问那张图的，无脑挂上对应的 m: cand_id
-2. **OCR 内容 ≤ 3 个字符 / 单字母 / 仅标点 / 仅纯数字片段**（如 `[图片·OCR] J`、`[图片·OCR] 。。`、`[图片·OCR] 03`）—— OCR 实际等于啥都没认出来，必挂
-3. **仅 `[图片]` 占位**（无 ·OCR 后缀）且用户问题在指代那张图（"这张图""这张截图""刚才那张""他发的那张图什么意思""这个图什么意思"）—— 必挂
-4. **OCR 内容明显是残句**（结尾断在介词/半个词/不完整数字、或夹杂大量乱码）且用户在问那张图 —— 挂上
-
-**反过来，下列情况不要挂**（避免白花钱）：
-- OCR 出来的是完整成句、整段文字（哪怕有错别字），且足以回答用户问题
-- 用户问题跟图片无关（问的是某条文字、某个事件等）
-
-cand_id 只能从上下文里真实出现的方括号 `m:数字` 里挑，不要凭空造。第二轮视觉模型的回答会**完全覆盖**你这一轮，所以一旦决定挂就别在文字回答里硬猜图片内容。"""
-
-# Back-compat: old name kept since other code may still reference it (logs etc.).
-_CHAT_SYSTEM_PROMPT = _CHAT_SYSTEM_PROMPT_BASE + _CHAT_SYSTEM_PROMPT_VISION_TAIL
-
-
-def _build_chat_system_prompt(vision_available: bool) -> str:
-    """Vision off → strip the NEED_IMAGES instructions so the model doesn't
-    promise the user "我看一下原图" and then never deliver (the python side
-    silently drops the sentinel when no vision client is configured)."""
-    if vision_available:
-        return _CHAT_SYSTEM_PROMPT_BASE + _CHAT_SYSTEM_PROMPT_VISION_TAIL
-    return _CHAT_SYSTEM_PROMPT_BASE
-
-
-_NEED_IMAGES_RE = re.compile(r"<NEED_IMAGES>([^<]*)</NEED_IMAGES>")
-
-
-def _extract_need_images(text: str) -> tuple[str, list[str]]:
-    """Pull `<NEED_IMAGES>...</NEED_IMAGES>` sentinels out of step1 output.
-
-    Returns (text-with-sentinels-stripped, comma-split cand_ids in order).
-    Multiple sentinels are concatenated; whitespace tokens dropped.
-    """
-    cand_ids: list[str] = []
-    for m in _NEED_IMAGES_RE.finditer(text):
-        for tok in m.group(1).split(","):
-            tok = tok.strip()
-            if tok:
-                cand_ids.append(tok)
-    cleaned = _NEED_IMAGES_RE.sub("", text).strip()
-    return cleaned, cand_ids
-
-
 def _run_vision_on_quoted_image(
     ctx: "CommandContext",
     image_path: Path,
@@ -1333,137 +1216,21 @@ def _run_vision_on_quoted_image(
 
 # Image-path resolution moved to agent/media_paths.py (single source) so
 # the agent's read_image tool and dispatcher's /explain & /ask paths share
-# one implementation. Old names kept as thin re-exports — callers are still
-# numerous in this file.
+# one implementation. The legacy `m:N` cand_id resolver
+# (resolve_image_paths_by_cand) is no longer imported here — it was only
+# wired into the deleted vision-sentinel two-pass.
 from .agent.media_paths import (
-    resolve_image_paths_by_cand as _resolve_image_paths,
     resolve_quoted_image_path as _resolve_quoted_image_path,
 )
 
 
-def chat_assistant(
-    client: LLMClient,
-    model: str,
-    question: str,
-    context: list[Candidate],
-    log_path: Path | None = None,
-    requester: str | None = None,
-    *,
-    vision: VisionLLM | None = None,
-    vision_model: str = "",
-    vision_max_images: int = 3,
-    vision_max_tokens: int | None = None,
-    conn: sqlite3.Connection | None = None,
-) -> str:
-    """Free-form group-chat-assistant call. Returns plain text reply.
-
-    `requester` (the sender's display name) gets a dedicated header line so the
-    LLM can resolve "我" / "我刚才说了啥" against the right rows in `context`.
-
-    Two-pass when `vision` and `conn` are both provided:
-      1. text model answers; may append `<NEED_IMAGES>c12,c47</NEED_IMAGES>`
-      2. python resolves those cand_ids to image bytes (capped at
-         `vision_max_images`), feeds them to the vision model along with the
-         step1 answer, and uses the vision model's reply as the final answer.
-    Failures in step2 fall back to step1's stripped text — user always gets *some* answer.
-    """
-    if context:
-        ctx_text = _format_candidates_for_llm(context)
-    else:
-        ctx_text = "（无群聊上下文）"
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    requester_line = (
-        f"提问者：{requester}（即上下文里 sender == {requester!r} 的那位是「我」）\n"
-        if requester else ""
-    )
-    user = (
-        f"当前时间：{now_str}\n"
-        f"{requester_line}"
-        f"用户问题：{question}\n\n"
-        f"最近群聊（按时间正序，最旧 → 最新）：\n{ctx_text}"
-    )
-    vision_available = vision is not None and conn is not None
-    system_prompt = _build_chat_system_prompt(vision_available)
-    raw = client.complete_text(
-        model=model,
-        system=system_prompt,
-        user=user,
-        temperature=0.3,
-        max_tokens=settings.chat_max_tokens,
-    )
-    if log_path:
-        _dump_llm_call(
-            log_path,
-            label=f"chat  ::  {question}",
-            system=system_prompt,
-            user=user,
-            raw=raw,
-            parsed=None,
-        )
-
-    cleaned, requested_ids = _extract_need_images(raw)
-    if not (vision_available and requested_ids):
-        return cleaned
-
-    paths = _resolve_image_paths(conn, requested_ids)[:vision_max_images]
-    if not paths:
-        logger.info(
-            "vision: step1 asked for {} cand_id(s) but none resolved to image files; using text answer",
-            len(requested_ids),
-        )
-        return cleaned
-
-    try:
-        images = [p.read_bytes() for p in paths]
-        vision_user = (
-            f"用户问题：{question}\n\n"
-            f"第一轮（仅基于 OCR 文本）的回答是：\n{cleaned or '（空）'}\n\n"
-            f"附了 {len(paths)} 张原图（OCR 文本可能不全或不准）。"
-            f"如果原图能补充 OCR 漏掉的关键内容，请重写回答；OCR 已经够用就保持原回答。"
-            f"直接输出最终回答正文，不要说「看图后我发现…」之类的元描述。"
-            f"严格遵守第一轮回答的格式要求（中文、不超过 6 句、无 markdown、不 @ 人）。"
-        )
-        # step2 uses the base prompt (no NEED_IMAGES tail) — there's no step3,
-        # and the vision model would otherwise echo the sentinel into the
-        # final group reply (it has no idea the tag is system-internal).
-        vision_system = _CHAT_SYSTEM_PROMPT_BASE
-        final_raw = vision.complete_with_images(
-            model=vision_model,
-            system=vision_system,
-            user=vision_user,
-            images=images,
-            temperature=0.3,
-            max_tokens=vision_max_tokens,
-        )
-        # Defensive: even with the tail removed from step2's system prompt,
-        # the model may still parrot a `<NEED_IMAGES>` it saw in step1's
-        # answer (which we passed as context). Always strip before returning.
-        final, _ = _extract_need_images(final_raw)
-        if log_path:
-            _dump_llm_call(
-                log_path,
-                label=f"chat-vision  ::  {question}  ({len(paths)} imgs)",
-                system=vision_system,
-                user=vision_user,
-                raw=final_raw,
-                parsed=None,
-            )
-        return final or cleaned
-    except Exception as e:
-        logger.warning(
-            "vision second-pass failed ({} imgs requested): {}; falling back to text answer",
-            len(paths), e,
-        )
-        return cleaned
-
-
-# --- agent loop integration (commit 4) -------------------------------------
+# --- agent loop integration ------------------------------------------------
 #
-# Trigger layer note: in v0 ChatCommand only fires when `parse_command` saw an
-# @<bot> mention, so `_should_wake_agent` always returns 'mention' here.
-# Probability and reply-to-bot triggers need a hook in the dispatcher main
-# poll loop (currently we only LIKE-match on bot_name), and require a known
-# bot_wxid for `is_reply_to_bot()`. Tracking that as future work — the agent
+# Trigger layer note: ChatCommand only fires when `parse_command` saw an
+# @<bot> mention, so trigger_kind is always 'mention' today. Probability
+# and reply-to-bot triggers need a hook in the dispatcher main poll loop
+# (currently we only LIKE-match on bot_name), and require a known
+# bot_wxid for `is_reply_to_bot()`. Tracked as future work — the agent
 # code itself accepts any `trigger_kind`, only the call site is gated.
 
 
@@ -1935,10 +1702,10 @@ def run_dispatcher() -> None:
     interval = settings.dispatcher_poll_interval
 
     logger.info(
-        "dispatcher: bot={!r} model={} vision={} agent={} interval={}s replier={} commands={} log={} llm_log={}",
+        "dispatcher: bot={!r} model={} vision={} agent_max_steps={} interval={}s replier={} commands={} log={} llm_log={}",
         settings.bot_name, settings.llm_model,
         f"{settings.vision_model}" if vision else "off",
-        f"on (max_steps={settings.agent_max_steps})" if settings.agent_enabled else "off",
+        settings.agent_max_steps,
         interval,
         type(replier).__name__, list(COMMANDS), log_path, llm_log_path,
     )

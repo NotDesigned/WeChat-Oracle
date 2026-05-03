@@ -1,13 +1,21 @@
 """Pluggable LLM client boundary for dispatcher calls.
 
-The dispatcher needs three shapes: plain text completion for chat-style
-answers, JSON text completion for `/find`, and (optional) text+image
-completion for the vision second-pass in `chat_assistant`. Provider-
-specific SDK details live here so command logic stays vendor-independent.
+The dispatcher needs four shapes:
+  - plain text completion (`complete_text`) for /ask / /sum
+  - JSON text completion (`complete_json`) for /find
+  - tool-calling completion (`complete_with_tools`) for the @<bot> chat
+    agent loop (`agent/runtime.py`)
+  - text + image completion (`VisionLLM.complete_with_images`) for
+    /explain & /ask single-pass image reads, and the agent's `read_image`
+    tool
 
-`VisionLLM` is intentionally a separate Protocol from `LLMClient`: vision
-is opt-in (off by default; chat falls back to text-only) and may use a
-different provider entirely (e.g. text=DeepSeek, vision=Qwen-VL).
+Provider-specific SDK details live here so command and agent logic stay
+vendor-independent.
+
+`VisionLLM` is intentionally a separate Protocol from `LLMClient`:
+vision is opt-in (off by default; agent's read_image raises a clean
+ToolError when unconfigured) and may use a different provider entirely
+(e.g. text=DeepSeek, vision=Qwen-VL).
 """
 from __future__ import annotations
 

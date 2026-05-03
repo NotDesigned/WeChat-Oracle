@@ -100,9 +100,8 @@ WO_LLM_API_KEY=sk-...
 # 多媒体识别（可选 — worker mm 进程的 ASR 模型档位）
 # WO_WHISPER_MODEL=small               # tiny|base|small|medium|large-v3，默认 small
 
-# Agent loop（实验性 — 多轮 tool-calling chat 路径，默认 OFF）
-# WO_AGENT_ENABLED=True                # 打开后 @<bot> chat 走 agent loop；OFF 时走旧路径
-# WO_AGENT_BASE_PROBABILITY=0.0        # >0 让 bot 偶尔自主插话（v0 默认 0 = 仅 @ 触发）
+# Agent loop（@<bot> chat 路径，已默认启用）
+# WO_AGENT_BASE_PROBABILITY=0.0        # >0 让 bot 偶尔自主插话（默认 0 = 仅 @ 触发）
 # WO_AGENT_REFLECTION_ENABLED=True     # 关闭跳过 Phase B（不写任何 member/group/persona 笔记）
 ```
 
@@ -484,7 +483,6 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_VISION_MAX_IMAGES` | `3` | 单次 vision 请求最多附几张图（防失控烧钱） |
 | `WO_VISION_MAX_TOKENS` | `800` | 视觉调用输出上限 |
 | `WO_WHISPER_MODEL` | `small` | `worker mm` 的 ASR 档位：`tiny`/`base`/`small`/`medium`/`large-v3`；越大越准越慢越占内存 |
-| `WO_AGENT_ENABLED` | `False` | 多轮 tool-calling agent loop 总开关；OFF 时 `@<bot>` chat 走旧的单轮 + vision sentinel 路径 |
 | `WO_AGENT_BASE_PROBABILITY` | `0.0` | 非 @ 触发时的概率门槛（v0 默认 0 = 仅 @ 触发；>0 让 bot 偶尔自主插话） |
 | `WO_AGENT_COOLDOWN_SECONDS` | `300` | bot 自己说完后这么久内不被概率触发 |
 | `WO_AGENT_MAX_STEPS` | `10` | Phase A（read-only tools）最多循环步数 |
