@@ -4,6 +4,10 @@ Watches the messages table for inbound commands and dispatches each to a
 `Command` subclass. The current command set is in `COMMANDS`:
 
     /find @<target> [since:YYYY[-MM[-DD]]] <description>
+    /sum [from:<target>|@<target>] [since:YYYY[-MM[-DD]]] [limit:N] [topic]
+    /recent [N]
+    /ask <question>
+    /explain [question-or-text]
     /help [<command>]
 
 Adding a new command = subclass `Command`, register in `COMMANDS`. The
@@ -38,10 +42,10 @@ from pathlib import Path
 from typing import ClassVar
 
 from loguru import logger
-from openai import OpenAI
 
 from .config import settings
 from .db import get_conn, init_db, transaction
+from .llm import LLMClient, build_llm_client
 from .replier import Replier, build_replier
 
 
@@ -55,11 +59,16 @@ class Candidate:
         "f:<forwarded_records.id>" — child of a 合并转发 wrapper
     The LLM echoes these back verbatim in `hits`; we look them up by exact
     string match (no integer conversion).
+
+    `parent_id` is set on `f:` rows to the wrapper's `m:` cand_id; the chat
+    formatter uses it to render children indented under their parent rather
+    than scattering them by their (much-earlier) original timestamps.
     """
     cand_id: str
     t: int
     sender: str
     content: str
+    parent_id: str | None = None
 
 
 @dataclass
@@ -77,7 +86,7 @@ class ExecResult:
 class CommandContext:
     """Everything a command might need from the runtime."""
     conn: sqlite3.Connection
-    llm: OpenAI
+    llm: LLMClient
     model: str
     bot_name: str            # for excluding bot's own messages + command-shaped messages
     group_id: str
@@ -156,7 +165,7 @@ def register(cls: type[Command]) -> type[Command]:
 class FindCommand(Command):
     name = "find"
     usage = "/find [from:<人>|@<人>] [since:YYYY[-MM[-DD]]] <描述>"
-    description = "在群历史里语义检索发言（DeepSeek 精筛）；不指定人时查全员"
+    description = "在群历史里语义检索发言（LLM 精筛）；不指定人时查全员"
     examples = [
         "/find 关于股票的讨论                   # 全员",
         "/find from:张三 关于数学和物理的发言    # 限定张三（推荐，不会 ping 本人）",
@@ -375,6 +384,287 @@ class ChatCommand(Command):
         return ExecResult(stdout=stdout, chat=reply, summary=f"chat ({len(context)} ctx)")
 
 
+# ---------- /ask ----------
+
+_ASK_SYSTEM_PROMPT = """你是微信群里的轻量问答助手。用户显式使用 /ask，表示这次不要读取群聊历史，只按通用知识和用户问题本身回答。
+
+回答要求：
+- 直接回答，不要声称看过群聊上下文
+- 信息不足时说明缺少什么，不要编造
+- 中文回答，除非问题明显要求其它语言
+- 控制在 2-6 句
+- 不要 @ 任何人；不要使用 markdown 语法"""
+
+
+@register
+class AskCommand(Command):
+    name = "ask"
+    usage = "/ask <问题>"
+    description = "轻量问答：不读取群聊上下文，只把问题发给 LLM，省 token"
+    examples = [
+        "/ask 帮我把这句话改得更礼貌：今晚别迟到",
+        "/ask SQLite WAL 是什么？",
+    ]
+
+    def __init__(self, question: str):
+        self.question = question
+
+    @classmethod
+    def parse(cls, args: str) -> "AskCommand | ParseError":
+        question = args.strip()
+        if not question:
+            return ParseError("/ask 需要参数：<问题>", show_help=cls)
+        return cls(question=question)
+
+    def execute(self, ctx: CommandContext) -> ExecResult:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        requester_line = f"提问者：{ctx.requester}\n" if ctx.requester else ""
+        user = f"当前时间：{now_str}\n{requester_line}用户问题：{self.question}"
+        reply = ctx.llm.complete_text(
+            model=ctx.model,
+            system=_ASK_SYSTEM_PROMPT,
+            user=user,
+            temperature=0.3,
+            max_tokens=800,
+        )
+        if not reply:
+            reply = "（模型没返回内容，再问一次试试）"
+        if ctx.llm_log_path:
+            _dump_llm_call(
+                ctx.llm_log_path,
+                label=f"/ask  ::  {self.question}",
+                system=_ASK_SYSTEM_PROMPT,
+                user=user,
+                raw=reply,
+                parsed=None,
+            )
+        logger.info("ask :: {!r}  reply_len={}", self.question[:60], len(reply))
+        stdout = f"/ask  ::  {self.question}\n  ({len(reply)} chars)\n{reply}"
+        return ExecResult(stdout=stdout, chat=reply, summary=f"ask ({len(reply)} chars)")
+
+
+# ---------- /sum ----------
+
+_SUM_SYSTEM_PROMPT = """你是微信群聊摘要助手。根据用户给出的当前群候选消息，提炼讨论重点。
+
+要求：
+- 只总结候选消息里明确出现的信息，不要编造
+- 如果用户给了主题，只总结与主题相关的内容
+- 按“结论 / 分歧 / 待办或决定”组织，但没有的部分不要硬写
+- 中文回答，控制在 4-10 句
+- 不要 @ 任何人；不要使用 markdown 语法"""
+
+
+@register
+class SumCommand(Command):
+    name = "sum"
+    usage = "/sum [from:<人>|@<人>] [since:YYYY[-MM[-DD]]] [limit:N] [主题]"
+    description = "总结当前群的一段聊天；可按人、时间和主题收窄"
+    examples = [
+        "/sum",
+        "/sum 今天讨论了什么",
+        "/sum since:2026-05-01 关于装修",
+        "/sum from:张三 limit:100",
+    ]
+
+    def __init__(self, target: str | None, since_t: int | None, limit: int | None, topic: str):
+        self.target = target
+        self.since_t = since_t
+        self.limit = limit
+        self.topic = topic
+
+    @classmethod
+    def parse(cls, args: str) -> "SumCommand | ParseError":
+        s = args.strip()
+        target: str | None = None
+        since_t: int | None = None
+        limit: int | None = None
+
+        while s:
+            parts = s.split(maxsplit=1)
+            first = parts[0]
+            rest = parts[1] if len(parts) > 1 else ""
+
+            if first.startswith("from:"):
+                if target is not None:
+                    return ParseError("/sum 不能同时指定 from: 和 @<人>", show_help=cls)
+                target = first[len("from:"):].strip()
+                if not target:
+                    return ParseError("from: 后面要跟人名", show_help=cls)
+                s = rest
+                continue
+            if first.startswith("@") and len(first) > 1:
+                if target is not None:
+                    return ParseError("/sum 不能同时指定 from: 和 @<人>", show_help=cls)
+                target = first[1:]
+                s = rest
+                continue
+            if first.startswith("since:"):
+                if since_t is not None:
+                    return ParseError("/sum 重复指定 since:", show_help=cls)
+                raw = first[len("since:"):].strip()
+                since_t = _parse_since(raw)
+                if since_t is None:
+                    return ParseError(
+                        f"since:{raw} 格式错误，支持 YYYY / YYYY-MM / YYYY-MM-DD",
+                        show_help=cls,
+                    )
+                s = rest
+                continue
+            if first.startswith("limit:"):
+                if limit is not None:
+                    return ParseError("/sum 重复指定 limit:", show_help=cls)
+                raw = first[len("limit:"):].strip()
+                if not raw.isdigit() or int(raw) <= 0:
+                    return ParseError("limit: 后面要跟正整数", show_help=cls)
+                limit = min(int(raw), 2000)
+                s = rest
+                continue
+            break
+
+        return cls(target=target, since_t=since_t, limit=limit, topic=s.strip())
+
+    def execute(self, ctx: CommandContext) -> ExecResult:
+        limit = self.limit or min(ctx.candidate_limit_chat, 500)
+        cands = fetch_candidates(
+            ctx.conn,
+            group_id=ctx.group_id,
+            target=self.target,
+            since_t=self.since_t,
+            limit=limit,
+            bot_name=ctx.bot_name,
+        )
+        if not cands:
+            return ExecResult(stdout="/sum: no candidates", chat="没有可总结的群聊消息。", summary="sum: empty")
+        reply = summarize_chat(
+            ctx.llm,
+            ctx.model,
+            cands,
+            topic=self.topic,
+            log_path=ctx.llm_log_path,
+        )
+        if not reply:
+            reply = "（模型没返回内容，再问一次试试）"
+        logger.info("sum :: topic={!r} target={!r} candidates={} reply_len={}",
+                    self.topic, self.target, len(cands), len(reply))
+        stdout = f"/sum :: {self.topic or '(all)'}\n  ({len(cands)} ctx msgs -> {len(reply)} chars)\n{reply}"
+        return ExecResult(stdout=stdout, chat=reply, summary=f"sum ({len(cands)} ctx)")
+
+
+# ---------- /recent ----------
+
+@register
+class RecentCommand(Command):
+    name = "recent"
+    usage = "/recent [N]"
+    description = "列出当前群最近 N 条入库消息，不调用 LLM"
+    examples = [
+        "/recent",
+        "/recent 20",
+    ]
+
+    def __init__(self, limit: int):
+        self.limit = limit
+
+    @classmethod
+    def parse(cls, args: str) -> "RecentCommand | ParseError":
+        s = args.strip()
+        if not s:
+            return cls(limit=10)
+        if not s.isdigit() or int(s) <= 0:
+            return ParseError("/recent 的参数必须是正整数 N", show_help=cls)
+        return cls(limit=min(int(s), 50))
+
+    def execute(self, ctx: CommandContext) -> ExecResult:
+        cands = fetch_candidates(
+            ctx.conn,
+            group_id=ctx.group_id,
+            target=None,
+            since_t=None,
+            limit=self.limit,
+            bot_name=ctx.bot_name,
+        )
+        if not cands:
+            text = "当前群没有可显示的入库消息。"
+            return ExecResult(stdout=text, chat=text, summary="recent: empty")
+        lines = [f"最近 {len(cands)} 条："]
+        for c in cands:
+            ts = datetime.fromtimestamp(c.t).strftime("%m-%d %H:%M")
+            content = _clip_one_line(c.content, 80)
+            lines.append(f"[{ts}] {c.sender}: {content}")
+        text = "\n".join(lines)
+        return ExecResult(stdout=text, chat=text, summary=f"recent ({len(cands)})")
+
+
+# ---------- /explain ----------
+
+_EXPLAIN_SYSTEM_PROMPT = """你是微信群里的简明解释助手。用户显式使用 /explain，通常是在引用一条消息后要求解释。
+
+要求：
+- 只解释提供的文本或引用内容，不读取群聊历史
+- 说明这句话可能是什么意思、关键信息是什么、必要时指出不确定点
+- 信息不足时直接说缺少上下文
+- 中文回答，控制在 2-6 句
+- 不要 @ 任何人；不要使用 markdown 语法"""
+
+
+@register
+class ExplainCommand(Command):
+    name = "explain"
+    usage = "/explain [补充问题或待解释文本]"
+    description = "解释引用消息或给定文本；不读取群聊上下文"
+    examples = [
+        "/explain",
+        "/explain 这句话是什么意思：SQLite 开了 WAL",
+        "引用一条消息后发送 /explain",
+    ]
+
+    def __init__(self, text: str):
+        self.text = text
+
+    @classmethod
+    def parse(cls, args: str) -> "ExplainCommand":
+        return cls(text=args.strip())
+
+    def execute(self, ctx: CommandContext) -> ExecResult:
+        quoted = ctx.quoted_text.strip() if ctx.quoted_text else ""
+        explicit = self.text.strip()
+        if quoted:
+            source = f"引用内容：{quoted}"
+            if explicit:
+                source += f"\n用户补充：{explicit}"
+        elif explicit:
+            source = f"待解释文本：{explicit}"
+        else:
+            text = "请引用一条消息后发送 `/explain`，或者写成 `/explain <待解释文本>`。"
+            return ExecResult(stdout=text, chat=text, summary="explain: missing input")
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        user = f"当前时间：{now_str}\n{source}"
+        reply = ctx.llm.complete_text(
+            model=ctx.model,
+            system=_EXPLAIN_SYSTEM_PROMPT,
+            user=user,
+            temperature=0.2,
+            max_tokens=800,
+        )
+        if not reply:
+            reply = "（模型没返回内容，再问一次试试）"
+        if ctx.llm_log_path:
+            _dump_llm_call(
+                ctx.llm_log_path,
+                label=f"/explain  ::  {explicit or quoted[:60]}",
+                system=_EXPLAIN_SYSTEM_PROMPT,
+                user=user,
+                raw=reply,
+                parsed=None,
+            )
+        logger.info("explain :: quoted={} explicit_len={} reply_len={}",
+                    bool(quoted), len(explicit), len(reply))
+        stdout = f"/explain\n{source}\n\n{reply}"
+        return ExecResult(stdout=stdout, chat=reply, summary=f"explain ({len(reply)} chars)")
+
+
 # ---------- /help ----------
 
 @register
@@ -408,10 +698,15 @@ class HelpCommand(Command):
 
 
 def _help_overview() -> str:
-    parts = ["可用命令："]
-    parts.extend(cls.help() for cls in COMMANDS.values())
-    parts.append(f"不带 / 命令时（如 `@<bot> 谁今天提到了股票？`）→ 进入通用兜底，把最近 {settings.dispatcher_context_chat} 条群消息当上下文，由 LLM 自由回答。")
-    return "\n\n".join(parts)
+    lines = ["可用命令："]
+    for cls in COMMANDS.values():
+        lines.append(f"/{cls.name} — {cls.description}")
+        lines.append(f"  {cls.usage}")
+    lines.append(
+        f"不带 /：直接问，会带最近 {settings.dispatcher_context_chat} 条当前群上下文。"
+    )
+    lines.append("输入 `/help <命令>` 查看示例，比如 `/help sum`。")
+    return "\n".join(lines)
 
 
 # ---------- Top-level parse ----------
@@ -520,6 +815,7 @@ def fetch_candidates(
     main_sql = """
         SELECT 'm:' || m.msg_id AS cand_id, m.t,
                COALESCE(m.sender_display, m.sender_wxid, '?') AS sender,
+               NULL AS parent_id,
                CASE
                    WHEN m.type = 'quote'
                         AND m.quote_text IS NOT NULL AND m.quote_text <> ''
@@ -576,6 +872,7 @@ def fetch_candidates(
     fwd_sql = """
         SELECT 'f:' || f.id AS cand_id, f.t,
                COALESCE(f.sender_display, '?') AS sender,
+               'm:' || m.msg_id AS parent_id,
                f.content
           FROM forwarded_records f
           JOIN messages m ON m.msg_id = f.parent_msg_id
@@ -594,7 +891,7 @@ def fetch_candidates(
     # NULL for unknown types whose content_text is also empty — these would be
     # useless to the LLM).
     sql = f"""
-        SELECT cand_id, t, sender, content FROM (
+        SELECT cand_id, t, sender, parent_id, content FROM (
             {main_sql}
             UNION ALL
             {fwd_sql}
@@ -606,7 +903,8 @@ def fetch_candidates(
     rows.reverse()  # chronological for the LLM
     return [
         Candidate(
-            cand_id=r["cand_id"], t=r["t"], sender=r["sender"], content=r["content"]
+            cand_id=r["cand_id"], t=r["t"], sender=r["sender"],
+            content=r["content"], parent_id=r["parent_id"],
         )
         for r in rows
     ]
@@ -621,7 +919,8 @@ _SYSTEM_PROMPT = """你是聊天记录精筛助手。根据「查询描述」从
 - `[图片·OCR] 文字内容` / `[语音·ASR] 文字内容` —— 中点后是机器识别出来的内容，**视同该 sender 通过图片/语音表达**，要参与匹配
 - 仅 `[图片]` / `[语音]`（没有 ·OCR / ·ASR 后缀） —— 该消息还没识别或无文字可识别，按"事件"算，匹配不到具体内容
 - `...[引用 X：Y]` —— Y 是被引用消息的内容，连同前面的回复一起匹配
-- `[链接] 标题\\nURL` / `[聊天记录]` / `[卡片消息]` 等 —— 按字面意义理解
+- 合并转发：父行 `[聊天记录]` 后会跟一组 `↳ [f:N] (原时间) 原作者:正文` 缩进子项，子项内容也参与匹配（视同原作者在原时间说了那些话）
+- `[链接] 标题\\nURL` / `[卡片消息]` 等 —— 按字面意义理解
 
 排除规则（先判断，命中即跳过该候选）：
 - 命令消息：形如 `@<某机器人> /xxx ...` 这种向机器人发指令的消息，属于操作指令而非被查询者的发言，一律忽略
@@ -643,10 +942,37 @@ _SYSTEM_PROMPT = """你是聊天记录精筛助手。根据「查询描述」从
 
 
 def _format_candidates_for_llm(cands: list[Candidate]) -> str:
-    lines = []
+    """Render candidates for the LLM. `m:` rows print at their own time;
+    `f:` rows (合并转发 children) get **inlined directly under their parent
+    wrapper, indented**, so the LLM sees the conversation structure rather
+    than children scattered by their (much-earlier) original timestamps.
+
+    Orphan `f:` rows (parent fell outside the candidate window) print in
+    their own time slot with a small `[父帖不在窗口]` note.
+    """
+    children: dict[str, list[Candidate]] = {}
+    for c in cands:
+        if c.parent_id:
+            children.setdefault(c.parent_id, []).append(c)
+
+    parents_in_window = {c.cand_id for c in cands if not c.parent_id}
+    lines: list[str] = []
     for c in cands:
         ts = datetime.fromtimestamp(c.t).strftime("%Y-%m-%d %H:%M")
+        if c.parent_id:
+            if c.parent_id in parents_in_window:
+                continue  # will be printed under its parent below
+            # orphan child: parent rolled out of the window
+            lines.append(
+                f"[{c.cand_id}] ({ts}) {c.sender}:{c.content}  [父帖不在窗口]"
+            )
+            continue
         lines.append(f"[{c.cand_id}] ({ts}) {c.sender}:{c.content}")
+        for child in children.get(c.cand_id, []):
+            cts = datetime.fromtimestamp(child.t).strftime("%Y-%m-%d %H:%M")
+            lines.append(
+                f"  ↳ [{child.cand_id}] (原 {cts}) {child.sender}:{child.content}"
+            )
     return "\n".join(lines)
 
 
@@ -708,7 +1034,7 @@ def _dump_llm_call(
 
 
 def llm_filter(
-    client: OpenAI,
+    client: LLMClient,
     model: str,
     description: str,
     cands: list[Candidate],
@@ -724,16 +1050,12 @@ def llm_filter(
     if not cands:
         return LLMFilterResult(hits=[], keywords=[], reason="no candidates")
     user = f"查询：{description}\n\n候选消息：\n{_format_candidates_for_llm(cands)}"
-    resp = client.chat.completions.create(
+    raw = client.complete_json(
         model=model,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user},
-        ],
-        response_format={"type": "json_object"},
+        system=_SYSTEM_PROMPT,
+        user=user,
         temperature=0.0,
     )
-    raw = resp.choices[0].message.content or "{}"
     payload: object | None = None
     try:
         payload = json.loads(raw)
@@ -766,7 +1088,8 @@ _CHAT_SYSTEM_PROMPT = """你是这个微信群里的小助手。用户 @ 了你�
 - **语音识别**：`[语音·ASR] <文字>` —— 同上，机器从语音里转出来的字。可能不准、可能很短，但**就是用户当时说的话**，应直接转述。
 - 仅 `[图片]` / `[语音]`（不带 ·OCR / ·ASR 后缀）—— 该消息还没识别（图里没字 / 语音太短失败），按"事件"看，不要假设内容。
 - 系统消息：`[id] (时间) ?:对方撤回了一条消息`、入群退群提示等，可作时间线感知；通常不直接回应。
-- 其他来源标签：`[链接] 标题\\nURL`、`[聊天记录]`（合并转发，子项另列）、`[卡片消息]`、`[转账]` 等，按字面意义理解。
+- **合并转发的聊天记录**：父行是 `[id] (转发时间) 发起人:[聊天记录]`，紧接着会跟若干 `↳ [f:N] (原时间) 原作者:正文` 缩进子项——**这些缩进行就是被打包转发进来的聊天内容**，原作者/原时间是它们在源群里发出时的信息；要回答"这个聊天记录里说了什么"就直接读这些子项。子项的"原时间"可能比父行早数小时甚至数年（源消息很老）。
+- 其他来源标签：`[链接] 标题\\nURL`、`[卡片消息]`、`[转账]` 等，按字面意义理解。
 
 回答要求：
 - **直接答**，不要"根据上下文…"、"我看到群里…"这类废话开头
@@ -779,7 +1102,7 @@ _CHAT_SYSTEM_PROMPT = """你是这个微信群里的小助手。用户 @ 了你�
 
 
 def chat_assistant(
-    client: OpenAI,
+    client: LLMClient,
     model: str,
     question: str,
     context: list[Candidate],
@@ -806,16 +1129,13 @@ def chat_assistant(
         f"用户问题：{question}\n\n"
         f"最近群聊（按时间正序，最旧 → 最新）：\n{ctx_text}"
     )
-    resp = client.chat.completions.create(
+    raw = client.complete_text(
         model=model,
-        messages=[
-            {"role": "system", "content": _CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": user},
-        ],
+        system=_CHAT_SYSTEM_PROMPT,
+        user=user,
         temperature=0.3,
         max_tokens=1000,  # hard cap; prompt asks for 2-6 句, this allows ~300 中文 chars
     )
-    raw = (resp.choices[0].message.content or "").strip()
     if log_path:
         _dump_llm_call(
             log_path,
@@ -826,6 +1146,44 @@ def chat_assistant(
             parsed=None,
         )
     return raw
+
+
+def summarize_chat(
+    client: LLMClient,
+    model: str,
+    context: list[Candidate],
+    topic: str,
+    log_path: Path | None = None,
+) -> str:
+    ctx_text = _format_candidates_for_llm(context)
+    user = (
+        f"总结主题：{topic or '不限主题，概括这段群聊'}\n\n"
+        f"候选消息（按时间正序）：\n{ctx_text}"
+    )
+    raw = client.complete_text(
+        model=model,
+        system=_SUM_SYSTEM_PROMPT,
+        user=user,
+        temperature=0.2,
+        max_tokens=1200,
+    )
+    if log_path:
+        _dump_llm_call(
+            log_path,
+            label=f"/sum  ::  {topic or '(all)'}",
+            system=_SUM_SYSTEM_PROMPT,
+            user=user,
+            raw=raw,
+            parsed=None,
+        )
+    return raw
+
+
+def _clip_one_line(text: str, limit: int) -> str:
+    one = " ".join(text.split())
+    if len(one) <= limit:
+        return one
+    return one[:limit - 1] + "…"
 
 
 def keyword_fallback(cands: list[Candidate], keywords: list[str], cap: int = 5) -> list[str]:
@@ -879,6 +1237,9 @@ def _next_unprocessed(
     the bot) lives in `content_text` exactly the same as for plain text. See
     CLAUDE.md F4 / F7.
     """
+    # Exclude messages the bot itself sent — otherwise replies that quote /
+    # echo earlier `@<bot>` chatter (e.g. /recent listings) get LIKE-matched
+    # and processed as new commands, looping the bot back into its own input.
     needle = f"%@{bot_name}%"
     return conn.execute(
         """
@@ -891,17 +1252,21 @@ def _next_unprocessed(
            AND m.type IN ('text', 'quote')
            AND m.content_text LIKE ?
            AND r.msg_id IS NULL
+           AND (m.sender_display IS NULL OR m.sender_display != ?)
          ORDER BY m.t ASC
          LIMIT ?
         """,
-        (needle, batch),
+        (needle, bot_name, batch),
     ).fetchall()
 
 
-def _build_llm_client() -> OpenAI:
-    if not settings.deepseek_api_key:
-        raise RuntimeError("WO_DEEPSEEK_API_KEY is empty; set it in .env")
-    return OpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
+def _build_llm_client() -> LLMClient:
+    return build_llm_client(
+        provider=settings.llm_provider,
+        api_key=settings.llm_api_key,
+        endpoint=settings.llm_endpoint,
+        json_mode=settings.llm_json_mode,
+    )
 
 
 def _append_log(log_path: Path, command_t: int, block: str) -> None:
@@ -913,7 +1278,7 @@ def _append_log(log_path: Path, command_t: int, block: str) -> None:
 
 def _process(
     conn: sqlite3.Connection,
-    llm: OpenAI,
+    llm: LLMClient,
     replier: "Replier",
     row: sqlite3.Row,
     log_path: Path,
@@ -950,7 +1315,7 @@ def _process(
     ctx = CommandContext(
         conn=conn,
         llm=llm,
-        model=settings.deepseek_model,
+        model=settings.llm_model,
         bot_name=settings.bot_name,
         group_id=row["group_id"],
         group_name=row["group_name"],
@@ -999,8 +1364,9 @@ def _skip_backlog(conn: sqlite3.Connection, bot_name: str) -> int:
                AND m.type IN ('text', 'quote')
                AND m.content_text LIKE ?
                AND r.msg_id IS NULL
+               AND (m.sender_display IS NULL OR m.sender_display != ?)
             """,
-            (now, now, needle),
+            (now, now, needle, bot_name),
         )
     return cur.rowcount or 0
 
@@ -1021,7 +1387,7 @@ def run_dispatcher() -> None:
 
     logger.info(
         "dispatcher: bot={!r} model={} interval={}s replier={} commands={} log={} llm_log={}",
-        settings.bot_name, settings.deepseek_model, interval,
+        settings.bot_name, settings.llm_model, interval,
         type(replier).__name__, list(COMMANDS), log_path, llm_log_path,
     )
 

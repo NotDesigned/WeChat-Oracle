@@ -43,10 +43,13 @@ class Settings(BaseSettings):
     # Required for `wechat-oracle dispatcher` to recognize commands.
     bot_name: str = ""
 
-    # DeepSeek API for the dispatcher's LLM step. OpenAI-compatible endpoint.
-    deepseek_api_key: str = ""
-    deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-v4-pro"
+    # LLM API for dispatcher calls. The endpoint must expose an OpenAI-compatible
+    # `/chat/completions` API; include `/v1` if the provider requires it.
+    llm_provider: str = "openai-compatible"
+    llm_api_key: str = ""
+    llm_endpoint: str = "https://api.deepseek.com"
+    llm_model: str = "deepseek-v4-pro"
+    llm_json_mode: str = "native"  # native=response_format, prompt=prompt-only JSON
 
     # Dispatcher loop tunables.
     dispatcher_poll_interval: float = 3.0
@@ -81,6 +84,7 @@ class Settings(BaseSettings):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
 
 
 settings = Settings()

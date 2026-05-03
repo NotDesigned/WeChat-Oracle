@@ -79,7 +79,7 @@ def ingest_live() -> None:
 def dispatcher_cmd() -> None:
     """Watch DB for `@<bot> /find ...` commands; print results to stdout + log.
 
-    Requires WO_BOT_NAME and WO_DEEPSEEK_API_KEY in .env. Runs in foreground;
+    Requires WO_BOT_NAME and WO_LLM_API_KEY in .env. Runs in foreground;
     Ctrl+C to stop. Safe to run alongside `ingest live`.
     """
     from .dispatcher import run_dispatcher

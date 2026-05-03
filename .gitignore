@@ -23,3 +23,10 @@ data/
 # wx4py drops a log + send-audit jsonl next to the cwd when imported
 wx4py.log
 wx4py_send_audit.jsonl
+
+# Codex
+.codex/
+!.codex/settings.json
+!.codex/hooks/
+.codex//hooks/__pycache__/
+.agents/skills

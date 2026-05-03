@@ -89,6 +89,25 @@ _PLACEHOLDER: dict[int, str] = {
 }
 
 
+def _extract_dataitem_timestamp(item: ET.Element) -> int | None:
+    """Pull a Unix-second timestamp out of a `<dataitem>`, accommodating both
+    layouts seen in the wild (see CLAUDE.md F11 / F2 lessons)."""
+    raw = item.findtext("srcMsgCreateTime")
+    if raw and raw.strip().isdigit():
+        return int(raw.strip())
+    raw = item.findtext("dataitemsource/createtime")
+    if raw and raw.strip().isdigit():
+        return int(raw.strip())
+    raw = (item.findtext("sourcetime") or "").strip()
+    if raw:
+        try:
+            from datetime import datetime
+            return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp())
+        except ValueError:
+            pass
+    return None
+
+
 # Strip the leading "wxid_xxx:\n" / "<chatroom>@chatroom_xxx:\n" that WeChat
 # prepends to group-message rawContent before the actual XML body.
 _GROUP_PREFIX = re.compile(r"^[^<\n]+:\s*\n(?=<\?xml|<msg)", re.DOTALL)
@@ -122,10 +141,12 @@ def parse_record_xml(raw_content: str | None) -> list[ForwardedItem]:
             datatype = int(dt_raw)
         except ValueError:
             continue
-        ts_raw = item.findtext("srcMsgCreateTime") or ""
-        try:
-            ts = int(ts_raw)
-        except ValueError:
+        # Timestamp field migrated between WeChat / WeFlow versions:
+        #   - old: <dataitem>...<srcMsgCreateTime>1777228811</srcMsgCreateTime>...
+        #   - new: <dataitem>...<dataitemsource><createtime>1777723678</createtime>...
+        # Try both. Last resort: parse <sourcetime>"YYYY-MM-DD HH:MM:SS"</sourcetime>.
+        ts = _extract_dataitem_timestamp(item)
+        if ts is None:
             continue
 
         sender = (item.findtext("sourcename") or "").strip() or None

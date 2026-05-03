@@ -10,8 +10,12 @@ A local-first WeChat group-chat archiver with an LLM-backed in-group Q&A assista
 
 - **实时抓取**：订阅 [WeFlow](https://github.com/hicccc77/WeFlow) 的 SSE 推送，新消息毫秒级落库
 - **历史回灌**：导入 WeFlow 的 JSON 导出，把媒体复制进项目自有的 `data/media/`，一次导入永久脱钩源目录
-- **群内问答机器人**：在群里 @ 小号，触发以下三类操作
-  - `/find <描述>` — 语义检索群历史（DeepSeek 精筛 + 关键词兜底）
+- **群内问答机器人**：在群里 @ 小号，触发以下几类操作
+  - `/find <描述>` — 语义检索群历史（LLM 精筛 + 关键词兜底）
+  - `/sum <主题>` — 总结当前群的一段聊天
+  - `/recent [N]` — 直接列最近入库消息，不调用 LLM
+  - `/ask <问题>` — 纯模型问答，不读取群聊上下文，省 token
+  - `/explain` — 解释引用消息或给定文本
   - `/help` — 查命令
   - **自由问答**（无 `/` 命令）：把最近 2500 条群消息当上下文，让 LLM 直接答
 - **本地优先**：消息、媒体、调试日志全在 `data/`，无云端依赖（除了 LLM API）
@@ -29,7 +33,7 @@ WeChat 客户端 ──► WeFlow（解密本地 DB 提供 HTTP API）
         └─► backfill ──┴─► live ──► SQLite (data/wechat-oracle.db)
                                         │
                                         ▼
-                                  dispatcher ──► DeepSeek LLM
+                                  dispatcher ──► LLM (OpenAI-compatible)
                                         │              │
                                         ▼              ▼
                                   data/dispatcher.log  data/llm_debug.log
@@ -55,7 +59,7 @@ WeChat 客户端 ──► WeFlow（解密本地 DB 提供 HTTP API）
 - **微信 PC 4.1.x（Qt 版）** — wx4py 实测 4.1.7.59 / 4.1.8.29，4.1.9.30 可用；中文 UI 推荐
 - **WeFlow 桌面端** — 装好并能解密你的 WeChat 数据；启动 HTTP API 服务
 - **Python 3.12+**，**[uv](https://docs.astral.sh/uv/)** 管理依赖
-- **DeepSeek API Key**（dispatcher 走 LLM；OpenAI 兼容接口）
+- **LLM API Key**（dispatcher 走 OpenAI 兼容接口）
 
 > ⚠️ wx4py 通过 Windows UI Automation 模拟键鼠操作微信，理论上不被官方支持。封号风险存在但远低于注入式工具（wcferry 等）。仅在你愿意承担风险的小号上使用。本项目作者对账号问题不负责。
 
@@ -82,8 +86,9 @@ WO_GROUPS=<你要监听的群名>      # 群名 / 备注 / wxid，逗号分隔�
 
 # Dispatcher（用群内问答时必填）
 WO_BOT_NAME=<小号在群里的群昵称>
-WO_DEEPSEEK_API_KEY=sk-...
-# WO_DEEPSEEK_MODEL=deepseek-v4-pro    # 默认 deepseek-v4-pro，可换 flash 省钱
+WO_LLM_API_KEY=sk-...
+# WO_LLM_ENDPOINT=https://api.deepseek.com
+# WO_LLM_MODEL=deepseek-v4-pro
 # WO_REPLY=0                           # 默认 1 = 自动回到群里；0 = 只本地输出
 ```
 
@@ -144,6 +149,46 @@ uv run wechat-oracle dispatcher
 @小号 /help find     # 看 /find 详细用法
 ```
 
+`/help` 总览只显示每条命令的一行说明和用法；需要例子时用 `/help <命令>`。
+
+### `/sum` — 总结当前群
+
+复用当前群的候选消息池，让 LLM 总结一段聊天。可用 `from:` 限定发言人、`since:` 限定时间下界、`limit:` 控制最多读取多少条。
+
+```
+@小号 /sum
+@小号 /sum 今天讨论了什么
+@小号 /sum since:2026-05-01 关于装修
+@小号 /sum from:张三 limit:100
+```
+
+### `/recent` — 查看最近入库消息
+
+不调用 LLM，直接返回当前群最近 N 条可见消息。适合排查 live 是否抓到了消息、bot 上下文里大概会看到什么。
+
+```
+@小号 /recent
+@小号 /recent 20
+```
+
+### `/ask` — 纯模型问答
+
+不读取群聊历史，只把问题本身发给 LLM。适合翻译、改写、解释概念、写短文本这类不需要群聊上下文的场景，比自由问答兜底省 token。
+
+```
+@小号 /ask 帮我把这句话改得更礼貌：今晚别迟到
+@小号 /ask SQLite WAL 是什么？
+```
+
+### `/explain` — 解释引用消息或文本
+
+不读取群聊历史。引用一条消息后发送 `/explain`，会只解释被引用内容；也可以直接在命令后写待解释文本。
+
+```
+@小号 /explain
+@小号 /explain 这句话是什么意思：SQLite 开了 WAL
+```
+
 ### 自由问答兜底
 
 不带 `/` 命令的 @ 消息直接进入兜底：把最近 2500 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。
@@ -180,8 +225,9 @@ uv run wechat-oracle worker mm
 写错命令不再静默——直接收到错误提示 + 该命令的帮助：
 
 - `@小号 /find` → ⚠️ 缺参数 + `/find` 用法
+- `@小号 /sum since:badformat` → ⚠️ since 格式说明
+- `@小号 /recent abc` → ⚠️ N 必须是正整数
 - `@小号 /xyz` → ⚠️ 未知命令 + 命令总览
-- `@小号 /find since:badformat 关于X` → ⚠️ since 格式说明
 
 ---
 
@@ -293,7 +339,7 @@ SQLite poll  ──►  parse_command (regex + dispatch)
 SQL 粗筛 (group + sender + since + 排除 bot/命令)
           │
           ▼  最多 500 条候选
-DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
+LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
           │
    命中 ≥ 1?
           │
@@ -316,6 +362,20 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 - 喂 chat-assistant prompt（强调"宁缺勿编、控制 2-6 句、不复制原文"）
 - 直接把 LLM 回复发回群
 
+### 纯模型问答
+
+`@<bot> /ask <问题>` → `AskCommand`：
+
+- 不查 DB，不调用 `fetch_candidates`
+- 不塞最近群聊上下文，只发送当前问题和当前时间
+- 适合通用知识、翻译、改写、生成短文本，token 成本固定且更低
+
+### 摘要 / 最近消息 / 解释
+
+- `@<bot> /sum ...` → `SumCommand`：复用 `fetch_candidates`，只看当前群，可用 `from:` / `since:` / `limit:` 收窄后让 LLM 总结
+- `@<bot> /recent [N]` → `RecentCommand`：复用 `fetch_candidates`，但不调用 LLM，直接渲染最近消息
+- `@<bot> /explain ...` → `ExplainCommand`：不查 DB；优先解释当前引用消息，否则解释命令后文本
+
 ---
 
 ## 配置参考
@@ -332,9 +392,11 @@ DeepSeek (system prompt 强调字面命中必算 + 同时返回 keywords)
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API |
 | `WO_WEFLOW_TOKEN` | — | WeFlow access token |
 | `WO_BOT_NAME` | — | 小号在群里的群昵称（dispatcher 必填） |
-| `WO_DEEPSEEK_API_KEY` | — | DeepSeek API key |
-| `WO_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点 |
-| `WO_DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名 |
+| `WO_LLM_PROVIDER` | `openai-compatible` | LLM 适配器；目前实现 OpenAI 兼容接口 |
+| `WO_LLM_API_KEY` | — | LLM API key |
+| `WO_LLM_ENDPOINT` | `https://api.deepseek.com` | OpenAI 兼容端点；供应商要求时带 `/v1` |
+| `WO_LLM_MODEL` | `deepseek-v4-pro` | 模型名 |
+| `WO_LLM_JSON_MODE` | `native` | `/find` JSON 返回模式：`native` 传 `response_format`，`prompt` 只靠 prompt 约束 |
 | `WO_REPLY` | `True` | 是否自动回群里 |
 | `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `stdout`（不发）。openclaw 实测不可用，见下方「实验记录」段 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
@@ -479,7 +541,7 @@ src/wechat_oracle/
 
 - [WeFlow](https://github.com/hicccc77/WeFlow) — 解密本地 WeChat DB 并提供 HTTP API
 - [wx4py](https://github.com/claw-codes/wx4py) — Windows UI 自动化驱动 WeChat
-- [DeepSeek](https://api.deepseek.com) — OpenAI 兼容的国内 LLM
+- [DeepSeek](https://api.deepseek.com) — 默认示例 LLM endpoint（OpenAI 兼容）
 - [uv](https://docs.astral.sh/uv/) — 飞快的 Python 依赖管理
 
 ## License

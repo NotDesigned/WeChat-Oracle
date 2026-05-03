@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## 架构一句话
 
@@ -47,7 +47,7 @@ uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chat
 - **`README.md`**：对外用户文档。改命令 / 配置 / schema / 入口都要回头同步。「数据流细节」段对理解三个进程怎么协作最有帮助。
 - **代码内 docstring**：模块顶端有 5–10 行职责说明，`dispatcher.py` / `live.py` / `forwarded.py` 写得最详细。
 - **`schema.sql`**：DDL 行级注释是字段语义的**主源**，发现描述模糊就在这儿改。
-- **`.claude/hooks/check_doc_sync.py`**：自动 backstop，跨文件漂移会反向提醒。
+- **`.Codex/hooks/check_doc_sync.py`**：自动 backstop，跨文件漂移会反向提醒。
 
 按场景找入口：
 
@@ -79,7 +79,7 @@ uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chat
 
 ## 易漂移点速查
 
-同一个事实被多处编码就会漂移。下表列出本仓库所有冗余存储位置；改任何一处，**必须**主动看其它行的状态。`.claude/hooks/check_doc_sync.py` 覆盖 F1–F5，其它行靠人 + 本契约保障。
+同一个事实被多处编码就会漂移。下表列出本仓库所有冗余存储位置；改任何一处，**必须**主动看其它行的状态。`.Codex/hooks/check_doc_sync.py` 覆盖 F1–F5，其它行靠人 + 本契约保障。
 
 | ID | 事实 | 存储位置 | 自动校验 | 注意点 |
 |---|---|---|---|---|
@@ -97,13 +97,13 @@ uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chat
 | F12 | 媒体子目录布局 (`images`/`voices`/`videos`/`stickers`) | `ingest/backfill.py:_MEDIA_SUBDIR` + `README.md` 媒体处理段 | — | 改字典等于把已有 `data/media/<旧>/` 全部弃用 |
 | F13 | dispatcher `_skip_backlog` 启动行为 | `dispatcher.py:_skip_backlog` + `README.md` 数据流细节段 | — | 改默认行为（比如改成处理积压）必须同步 README + 给个 flag |
 | F15 | `messages.transcript` 语义（OCR/ASR 出口）+ LLM 可见标签 | `schema.sql` 注释 + `models.py:Message.transcript` docstring + `worker/mm.py` 状态机注释 + `dispatcher.py:fetch_candidates` SQL CASE 拼接逻辑 + 两条 system prompt（`_CHAT_SYSTEM_PROMPT` / `_SYSTEM_PROMPT`）里描述的标签形状 + `README.md` 多媒体识别段 | hook (schema.sql 改触发) | 三态：`NULL` 待处理 / `''` 已处理无文字（不重试） / `'<text>'` 成功。**LLM 可见标签**：有 transcript 时是 `[图片·OCR] xxx`/`[语音·ASR] xxx`（中点 `·` 区分 "已识别" vs "事件占位"），无 transcript 仅 `[图片]`/`[语音]`。改 SQL CASE 的标签形状 → 必须同时改两条 prompt 的格式说明，否则 LLM 看不懂会答"群里没出现过相关讨论" |
-| F14 | 本 hook 的 marker 列表 | `.claude/hooks/check_doc_sync.py:_*_MARKERS` + 本文件「命令体系维护契约」判定标准段 | — | 改 marker 时把 prose 描述也改了，否则 hook 和契约说的不是一回事 |
+| F14 | 本 hook 的 marker 列表 | `.Codex/hooks/check_doc_sync.py:_*_MARKERS` + 本文件「命令体系维护契约」判定标准段 | — | 改 marker 时把 prose 描述也改了，否则 hook 和契约说的不是一回事 |
 | F15 | `WO_REPLY_BACKEND` 取值集 (`wx4py` / `stdout`) | `replier.py:build_replier` if-chain + `config.py:reply_backend` 注释 + `README.md` 配置参考表 | hook (config.py 改触发) | 加新 backend 时把这三处都同步；新建一个 `XxxReplier` 类实现 `Replier` 协议即可，不动 dispatcher。**openclaw 不在列表里**——实测不可群发，见 README「实验记录」 |
 
 **新事实进表的判定**：如果你引入了一个事实它**注定要在两个以上文件里出现**（即使本仓库现在只放在了一处），就把它登记到本表，并尽量用单源 + import 替代多处复制。
 
 **两道闸**：
-- `.claude/hooks/check_doc_sync.py`（PostToolUse）——Claude 编辑文件**当下**就反向提醒，看的是 working tree
+- `.Codex/hooks/check_doc_sync.py`（PostToolUse）——Codex 编辑文件**当下**就反向提醒，看的是 working tree
 - `.githooks/pre-commit`（git）——`git commit` 时**最后一道**关，看的是 staged-only 视图，挡掉手工编辑 / rebase / 不同 agent 漏掉的情况；额外还跑 schema parse / Python 语法 / API key 扫描 / `.env` 防泄露
 
 PostToolUse 是 prompt 时机的提醒（可被忽略 / 可继续编辑修复），pre-commit 是**真硬拦**（exit 1 直接 abort commit）。两个共用同一份 `RULES` 表。
@@ -124,7 +124,7 @@ PostToolUse 是 prompt 时机的提醒（可被忽略 / 可继续编辑修复）
 
 → 那 `README.md` 的「命令详解」**也必须同 PR 改**。
 
-`.claude/hooks/check_doc_sync.py`（覆盖 F1–F5）是自动 backstop：dispatcher.py 上述行被改但 README.md 这次没动时，hook 会反过来提醒下一次工具调用。**hook 不是合规的替代**——以本契约为准，hook 失灵不是免责理由。
+`.Codex/hooks/check_doc_sync.py`（覆盖 F1–F5）是自动 backstop：dispatcher.py 上述行被改但 README.md 这次没动时，hook 会反过来提醒下一次工具调用。**hook 不是合规的替代**——以本契约为准，hook 失灵不是免责理由。
 
 ## 管道字段对齐（Lessons Learned）
 
@@ -136,7 +136,6 @@ PostToolUse 是 prompt 时机的提醒（可被忽略 / 可继续编辑修复）
 - **`media_path`**：backfill 存项目内相对路径（`media/<group>/...`）；live 存 WeFlow 给的绝对路径（`mediaLocalPath`）。两者对同一条消息算 `dedupe_key` 的 fallback hash 不同 → 重复写入。已知边缘情况，README「冲突/幂等」段记录在案。
 - **`localType` 高位编码**：WeFlow 把 `<appmsg>.<type>` 偷塞进 localType 高 32 位（`localType = (appmsg.type << 32) | 49`）。早期 `_WEFLOW_LOCAL_TYPE_MAP` 只查整个 localType，对所有 app 消息都返回 None → **整条消息被 importer 丢弃**（包括合并转发、引用、链接卡片）。修法：所有查表前先 `base_local_type(lt)` 抹掉高位；需要细分的（如 `appmsg.type=19` 合并转发）用 `appmsg_subtype(lt)` 取出来另判。**教训**：第三方 API 返回的「整数字段」可能是组合编码，光按枚举查表会静默吃掉一类消息——加新格式前，先把分布拉出来看一眼。
 - **`forwarded_records.t` 不是入库时间**：合并转发子项的 `t` 来自源群里原消息的 `<srcMsgCreateTime>`，可能比包它进来的 wrapper 早数年。dispatcher 的 `since:` 过滤要按子项自己的 `t` 算（不是 wrapper 的 `t`），否则 `since:2024` 这种查询会漏掉「2024 的消息被 2026 转发进来」的情况。
-- **合并转发的 `<dataitem>` schema 跨版本变了**：早期格式时间戳在顶层 `<srcMsgCreateTime>`，新格式（≈ 2026-05 后看到）搬进了 `<dataitemsource><createtime>`，顶层只剩 `<sourcetime>` 字符串。**parser 早期只查 `<srcMsgCreateTime>`，新格式 dataitem 直接被静默丢弃 → 整条转发包 0 children**。修法：`_extract_dataitem_timestamp` 三级 fallback（顶层数字 → `dataitemsource/createtime` → `sourcetime` 字符串解析）。**教训**：第三方应用解析微信的 schema 不是定死的——同一个 appmsg.type 在不同微信客户端版本 / 不同 WeFlow 版本下字段可以位置漂移，**任何需要"必填"判断的字段都要兜 fallback 或显式 fail-loud**，否则一次客户端升级就能让一类消息批量沉默丢失。
 - **`localType=49` 是个垃圾桶**：所有 `<appmsg>` 包裹的消息都走这条道——链接卡片 / 文件 / 视频号 / 红包 / 转账 / 引用回复 / 合并转发——区分靠 `appmsg.type`（在 WeFlow 的 `localType` 高 32 位）。**早期把 49 一律映射成 `MsgType.LINK` → 引用回复（appmsg.type=57，用户实际打的字在 `<title>` 里）全被 dispatcher 的 `WHERE type='text'` 过滤掉了**——bot 看不到「张三引用某人的话回复了什么」。修法：live `_api_msg_to_normalized` 按 `appmsg_subtype` 分支：57→QUOTE、19→FORWARD、其它→LINK；dispatcher 把 `type IN ('text', 'quote')` 都纳入候选；非文本子类（链接/文件/视频号）由 `format_appmsg_content` 提炼成 `[标签] 标题\nURL` 形式塞进 `content_text`。**教训**：第三方 API 暴露的"消息类型"字段不一定是叶子分类——上面常常还有一层 schema 内编码（`<appmsg>.<type>`），把这层吞掉就等于把一大类消息的语义打平了。新接入数据源时先把所有"高层 type=X" 的子类型分布拉一遍。
 - **quote_text 两源填法不一致 → 出口合并**：backfill 的 `quotedContent` 是 WeFlow JSON 文件预拼好的，`content_text` 直接长成 `<reply>[引用 <orig>:<quoted>]`，`quote_text` 列只是冗余备份；live 的 `content_text` 只有用户回复（"2+2"），`quote_text` 单独存。早期 dispatcher.fetch_candidates 只 SELECT `content_text` → live 的引用回复给 LLM 看就只剩 "2+2"，没上下文，模型每次都问"什么意思"。修法：在 fetch_candidates 的 SQL 出口处用 CASE，遇到 quote 行且 `content_text` 不含 `[引用` 标记时拼接 `[引用 <LEFT JOIN orig.sender>：<quote_text>]`。**教训**：数据契约对齐的最后一道关在**消费端**，不只是入库端——同一字段在不同 source 的填充格式不一样时，下游 query 必须做归一，否则下游业务（这里是 LLM 喂 prompt）会按某一种格式假设走，另一种就静默坏掉。每加新 importer/查询都要问：「这个字段下游用的时候期待什么形状？」
 - **/find 和 chat 视野其实只该差一项**：第一版 fetch_candidates 用 `WHERE type IN ('text','quote')` → chat 看不到链接 / 图片 / 系统 / 转账，"刚才那个链接讲什么"答不了。第二版区分 `for_chat` 模式让 chat 全量、`/find` 仍严格——理由是怕"链接标题污染搜索"。但实际：LLM 自己能区分 `[图片]` 占位 vs 用户文字，"`/find` 关于股票的讨论" 命中"`[链接] 美股周报`" **本来就该算相关结果**（分享文章也是参与）。最后**两模式合并到同一份 SQL，只剩"是否保留 /xxx 命令消息" 这一项差异**——/find 排除（其他人的命令不是当前查询的信号），chat 保留（是对话流程）。**教训**：先别假设"严格更精确"——有现成 LLM 判断力的场景下，过度过滤往往是把信号当噪声扔了。两个貌似不同的查询入口出现"几乎一样的代码 + 一两处岔分支"时，先怀疑是不是抽象划错了，能合则合。
