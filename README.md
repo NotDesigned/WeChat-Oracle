@@ -53,7 +53,7 @@ WeChat 客户端 ──► WeFlow（解密本地 DB 提供 HTTP API）
 | 进程 | 职责 | 入口 |
 |---|---|---|
 | `ingest live` | SSE 订阅 + 写库 + 内嵌 mm 工作线程跑 OCR/ASR 填 `transcript` | `uv run wechat-oracle ingest live` |
-| `dispatcher` | 检测命令 → LLM / agent loop → 群里回复 | `uv run wechat-oracle dispatcher` |
+| `dispatcher` | 检测触发 / 命令 → LLM / agent loop → 群里回复 | `uv run wechat-oracle dispatcher` |
 | `ingest backfill` | 一次性导入历史 | `uv run wechat-oracle ingest backfill <file>` |
 | `worker mm` | 单独跑 OCR/ASR worker（一般不用——`ingest live` 已经包了；想 backfill 后 catch up 或单独调试时用） | `uv run wechat-oracle worker mm` |
 
@@ -139,7 +139,7 @@ uv run wechat-oracle dispatcher
 # @<小号> 引用某条图片消息后 → /explain 或 /ask 这是什么
 ```
 
-> - **要让自动回复工作，WeChat 主窗口必须可见**（不能在托盘里）。dispatcher 启动时会用 wx4py 的 `get_group_nickname` 验证当前登录账号在每个群的昵称，跟 `WO_BOT_NAME` 对不上时 warning（不阻断；可能你登错号了）。
+> - **要让自动回复工作，WeChat 主窗口必须可见**（不能在托盘里）。wx4py 通过 UI 自动化把回复发回 `group_name` 对应的群；如果登录错号或群名不可见，发送会失败并写 warning。
 > - **`ingest live` 首次跑会按需下载 RapidOCR / faster-whisper 模型权重**（几十 MB ~ 几 GB，看 `WO_WHISPER_MODEL` 档位）——OCR/ASR 引擎是懒加载，群里第一张图 / 第一条语音才触发；纯文本流量下不消耗。
 > - **想单独跑 mm**（比如导入历史 backfill 后 catch up，或不开 live 时调试 OCR/ASR）：`uv run wechat-oracle worker mm`。日常部署不需要。
 > - **配了 `WO_VISION_API_KEY` 后才有图片直读能力**——agent 在 chat 自由问答里会用 `read_image` 工具直接看图，`/explain` 和 `/ask` 引用图片时会把字节直接喂视觉模型。没配也能跑，但群里图片只看得到 OCR 文本（残的就是残的）。
@@ -262,7 +262,7 @@ agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`�
 - 两个模型**全本地跑**，识别内容不出本机；引擎都是**懒加载**，群里第一张图 / 第一条语音才触发模型权重下载和 RAM 占用
 - 处理顺序：按消息时间倒序（新的优先），队列空时 30s sleep
 - 三种状态：`transcript IS NULL`（待处理）/ `transcript=''`（处理过没识别出文字 / 文件丢了——不重试）/ `transcript='<text>'`（成功）
-- 出口：`fetch_candidates` 的 SQL CASE 优先用 `transcript`，形状 `[图片] <识别文字>` / `[语音] <转录>`，跟 `[链接]` 等占位前缀一脉相承
+- 出口：`fetch_candidates` 的 SQL CASE 优先用 `transcript`，形状 `[图片·OCR] <识别文字>` / `[语音·ASR] <转录>`；没有识别文字时才是裸 `[图片]` / `[语音]` 事件占位
 
 部署：默认在 `ingest live` 里以 daemon 线程跑——你启动 `uv run wechat-oracle ingest live` 就同时启动了 mm worker，**不用单独再开一个进程**。它和 live 主线程各持有自己的 SQLite 连接，靠 WAL 隔离写。要单独跑（比如导入完 backfill 后追识别、或者调试 OCR/ASR 时不想拉 live 流量）：
 
@@ -391,16 +391,15 @@ WeChat 把所有 `<appmsg>` 包裹的消息（链接卡片 / 文件 / 视频号 
 ### 命令调度（`dispatcher`）
 
 ```
-SQLite poll  ──►  parse_command (regex + dispatch)
+SQLite poll  ──►  _classify_trigger
                        │
-              ┌────────┼─────────┐
-          Command   ParseError  None
-              │         │        │
-              ▼         ▼      (silent)
-          execute   reply with
-          (LLM)     error+help
-              │         │
-              └────┬────┘
+              ┌────────┼──────────────┐
+          mention   reply/probability  None
+              │           │            │
+              ▼           ▼            ▼
+        parse_command   agent loop   (no-trigger)
+              │           │
+              └────┬──────┘
                    ▼
             stdout / log / wx4py send
                    │
@@ -408,10 +407,10 @@ SQLite poll  ──►  parse_command (regex + dispatch)
             UPDATE command_runs
 ```
 
-- 每 3s 扫 DB 找 `@<bot>` 文本消息（`LIKE %@<bot>%` 粗筛）
-- 命中后 Python 端用 `parse_command` 三态 dispatch：`Command` / `ParseError` / `None`（非命令静默）
+- 每 3s 扫 DB 找所有未处理的 live 非 system 消息；廉价 `_classify_trigger` 只看触发消息本身，不烧 LLM
+- `mention` 命中后 Python 端用 `parse_command` 三态 dispatch：`Command` / `ParseError` / `None`（mention 但无有效正文则静默）
 - 命令处理记录在 `command_runs` 表（msg_id 作主键），重启不重跑
-- **启动跳过积压**：dispatcher 启动时把所有未处理的历史 `@<bot>` 一次性写入 `command_runs(status='ok', result='(startup-skip)')`，避免冷启动 / 大批量回灌后向群里灌一通陈年答复。只对启动后新到的消息回复。
+- **启动跳过积压**：dispatcher 启动时把所有未处理的历史 live 非 system 消息一次性写入 `command_runs(status='ok', result='(startup-skip)')`，避免冷启动 / 长时间停机后对历史消息触发 mention / reply / probability。只对启动后新到的消息回复。
 
 ### `/find` 检索流水线
 
@@ -491,7 +490,7 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 
 ## 配置参考
 
-所有变量走 `pydantic-settings`，前缀 `WO_`。可在 `.env` 或环境变量里设。
+除 `WO_WHISPER_MODEL` 由 ASR worker 直接读取外，主要运行时变量走 `pydantic-settings`，前缀 `WO_`。可在 `.env` 或环境变量里设。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -502,6 +501,7 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_LOG_LEVEL` | `INFO` | loguru 级别 |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API |
 | `WO_WEFLOW_TOKEN` | — | WeFlow access token |
+| `WO_WEFLOW_POLL_INTERVAL` | `30.0` | 已废弃；live 现在走 SSE，不再按这个间隔轮询 |
 | `WO_BOT_NAME` | — | 小号在群里的群昵称（dispatcher 必填） |
 | `WO_BOT_WXID` | — | 小号自己的 wxid（可选）。空时 dispatcher 从 `messages` 表里自动发现（看 `sender_display=WO_BOT_NAME` 的回流消息）；要等 WeFlow SSE 回流第一条 bot 消息后才能命中。手填可立刻启用 reply-to-bot 触发 |
 | `WO_LLM_PROVIDER` | `openai-compatible` | LLM 适配器；目前实现 OpenAI 兼容接口 |
@@ -517,7 +517,7 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `stdout`（不发）。openclaw 实测不可用，见下方「实验记录」段 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 单次候选上限 |
-| `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | 自由问答上下文窗口 |
+| `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | 旧 chat 窗口配置名；当前只作为 `/sum` 未显式 `limit:` 时的候选上限来源（实际 capped 到 500）。自由问答 agent 初始窗口用 `WO_AGENT_RECENT_CONTEXT_CHAT` |
 | `WO_VISION_PROVIDER` | `openai-compatible` | vision 适配器 |
 | `WO_VISION_API_KEY` | — | 视觉模型 API key；空 = 关闭功能（chat 退化成纯文本） |
 | `WO_VISION_ENDPOINT` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 默认指向 DashScope 兼容模式 |
@@ -607,8 +607,8 @@ uv run wechat-oracle agent wipe <group_id> --persona-only / --memory-only / -y
 ## 调试 / 可观测性
 
 - `data/dispatcher.log` — 每条命令的完整渲染输出，纯文本可读
-- `data/llm_debug.log` — **每次 LLM 调用**的 system / user / 原始响应 / 解析后 JSON，10MB 滚动（保留 `.1` 备份），排查"为什么没命中"看这个最直接
-- dispatcher 终端实时打印 `candidates=N llm_hits=M keywords=[...] fallback=true/false`
+- `data/llm_debug.log` — `/find` / `/ask` / `/sum` 等单轮 LLM 调用的 system / user / 原始响应；agent run 记录初始 prompt、最终回复和 phase trace。10MB 滚动（保留 `.1` 备份）
+- dispatcher 终端在 `/find` 时打印 `candidates=N llm_hits=M keywords=[...] fallback=true/false`
 
 ```powershell
 uv run wechat-oracle status   # DB 路径 / 总条数 / 按状态分布 / 按群分布
@@ -679,7 +679,7 @@ src/wechat_oracle/
 ├── config.py           # pydantic-settings，所有 WO_ 环境变量
 ├── models.py           # Message dataclass + dedupe_key 计算
 ├── db.py               # SQLite 连接 + transaction 上下文
-├── schema.sql          # DDL（messages, command_runs, group_state, schema_meta）
+├── schema.sql          # DDL（messages, forwarded_records, command_runs, group_state, agent memory, schema_meta）
 ├── dispatcher.py       # 命令解析 + LLM + wx4py 发送
 └── ingest/
     ├── backfill.py     # WeFlow JSON 导入 + 媒体复制

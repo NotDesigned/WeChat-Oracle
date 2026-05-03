@@ -35,6 +35,25 @@ from .config import settings
 _AT_SEP = " "
 
 
+def _strip_leading_requester_mention(text: str, requester: str | None) -> str:
+    """Avoid double-@ when the model starts its reply with @requester.
+
+    `Wx4pyReplier.send` already prefixes outgoing group replies with a real
+    WeChat mention. The LLM still occasionally imitates prior bot messages
+    and emits "@张三 ..." itself; strip only that exact leading requester
+    mention and leave all other text untouched.
+    """
+    if not requester:
+        return text
+    body = text.lstrip()
+    prefix = f"@{requester}"
+    if not body.startswith(prefix):
+        return text
+    body = body[len(prefix):]
+    body = body.lstrip(" \t\r\n\u2005")
+    return body
+
+
 class Replier(Protocol):
     """The dispatcher only needs these two ops."""
 
@@ -76,6 +95,7 @@ class Wx4pyReplier:
     def send(self, group_name: str | None, requester: str | None, text: str) -> None:
         if not group_name:
             return
+        text = _strip_leading_requester_mention(text, requester)
         body = f"@{requester}{_AT_SEP}{text}" if requester else text
         try:
             self._wx.chat_window.send_to(group_name, body, target_type="group")

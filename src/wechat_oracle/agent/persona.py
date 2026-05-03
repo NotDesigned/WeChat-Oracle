@@ -71,6 +71,8 @@ def load_persona_yaml(personas_dir: Path, group_id: str) -> dict[str, Any]:
 _PHASE_A_OPS_RULES = """\
 约定：context 里方括号 [N] 的数字就是 msg_id（整数）；群 ID 不用传，工具内部已锁定本群。
 
+回答只写正文，不要 @ 任何人；发送层会自动 @ 触发者。不要使用 markdown。
+
 不知道该不该说话就调 stay_silent。群友的对话不必每条都接。"""
 
 
