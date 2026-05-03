@@ -338,7 +338,12 @@ class ChatCommand(Command):
     # changing WO_DISPATCHER_CONTEXT_CHAT (or its default in config.py) doesn't
     # leave this string lying about a stale number — kills a drift point
     # between dispatcher.py help text and config.py default.
-    description = f"兜底：直接 @ 机器人 + 提问，把最近 {settings.dispatcher_context_chat} 条群消息当上下文，由 LLM 自由回答"
+    description = (
+        "兜底：直接 @ 机器人 + 提问。多轮 agent loop 决定怎么答——"
+        f"先看最近 {settings.agent_recent_context_chat} 条群消息，"
+        "需要时再调工具搜历史 / 看图 / 读语音 / 查成员笔记，"
+        "也可以判断这次不该回应而保持沉默。"
+    )
     examples = [
         "@<bot> 谁今天提到了股票？",
         "@<bot> 帮我总结一下昨晚的讨论",
@@ -790,7 +795,8 @@ def _help_overview() -> str:
         lines.append(f"/{cls.name} — {cls.description}")
         lines.append(f"  {cls.usage}")
     lines.append(
-        f"不带 /：直接问，会带最近 {settings.dispatcher_context_chat} 条当前群上下文。"
+        f"不带 /：直接问，agent 多轮 loop 处理"
+        f"（最近 {settings.agent_recent_context_chat} 条 + 按需调工具）。"
     )
     lines.append("输入 `/help <命令>` 查看示例，比如 `/help sum`。")
     return "\n".join(lines)

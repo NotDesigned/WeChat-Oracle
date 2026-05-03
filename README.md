@@ -222,9 +222,9 @@ uv run wechat-oracle worker mm
 
 > **图片直读**：如果引用的是一张图片消息，且配置了 `WO_VISION_API_KEY`，会跳过 OCR 文本路径直接把图片字节喂视觉模型。无需 sentinel 协议——用户已经明确指定哪张图。视觉关闭或图片文件不存在时降级回文本路径，看到的就是 `[图片]` 占位。
 
-### 自由问答兜底
+### 自由问答兜底（多轮 agent loop）
 
-不带 `/` 命令的 @ 消息直接进入兜底：把最近 2500 条群消息当上下文，让 LLM 直接回答（条数受 `WO_DISPATCHER_CONTEXT_CHAT` 控制）。
+不带 `/` 命令的 @ 消息进入 agent loop——多轮 tool-calling，自己决定怎么答：
 
 ```
 @小号 谁今天提到了股票？
@@ -232,7 +232,17 @@ uv run wechat-oracle worker mm
 @小号 张三最近在忙什么
 ```
 
-> `/find` 和自由问答的检索池**包含**：直发文本 + **引用回复**（用户的回复正文）+ **合并转发包里的子项**（详见 [appmsg 子类型](#appmsg-子类型-localtype49-family)）+ **图片/语音的 OCR/ASR 文字**（详见 [多媒体识别](#多媒体识别-worker-mm)）。即「张三 2024 年的话被 2026 年某人转发进群」、「李四引用某人发言后说了啥」、「上周谁分享的那张报表显示啥」都搜得到。
+agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（默认 50）条群消息——比老路径的 2500 条小一个量级，token 开销低。要看更多历史就**主动调工具**：
+
+- `recall_group_history(query, since_days?, sender_wxid?)`：在本群历史里 substring 搜（`content_text` + `transcript` 都搜）
+- `view_quoted_chain(msg_id)` / `expand_forward_bundle(msg_id)`：跟引用链上溯 / 展开合并转发的子项
+- `read_image(msg_id, prompt?)` / `read_voice(msg_id)`：让视觉模型直接看一张图 / 拿语音转录（已转写的秒返）
+- `who_is(sender_wxid)` / `read_member_notes` / `read_group_notes`：取成员或群级笔记
+- `stay_silent(reason)`：判断这次不该回应，闭嘴（实际不会发回群）
+
+回答完，进入 **Phase B 反思**（`WO_AGENT_REFLECTION_ENABLED=True` 时）：agent 看自己刚才做了什么，决定要不要把新观察写进 `member_notes` / `group_notes` / `persona_drift`。详见「数据流细节」段。
+
+> agent 触发的检索池**包含**：直发文本 + **引用回复**（用户的回复正文）+ **合并转发包里的子项**（详见 [appmsg 子类型](#appmsg-子类型-localtype49-family)）+ **图片/语音的 OCR/ASR 文字**（详见 [多媒体识别](#多媒体识别-worker-mm)）。即「张三 2024 年的话被 2026 年某人转发进群」、「李四引用某人发言后说了啥」、「上周谁分享的那张报表显示啥」都搜得到。`/find` 用同一份检索池做 LLM 精筛。
 
 ### 多媒体识别 (`worker mm`)
 
@@ -255,30 +265,25 @@ uv run wechat-oracle worker mm
 
 #### 视觉模型集成（可选）
 
-`worker mm` 的离线 OCR 是**检索的主索引**——所有历史问答都依赖 `transcript` 文本。但 PP-OCRv4 在截图模糊、表格、手写、复杂版面这些场景下会漏字。开启 `WO_VISION_API_KEY` 后，dispatcher **三个入口**都能直接读图：
+`worker mm` 的离线 OCR 是**检索的主索引**——所有历史问答都依赖 `transcript` 文本。但 PP-OCRv4 在截图模糊、表格、手写、复杂版面这些场景下会漏字。开启 `WO_VISION_API_KEY` 后，dispatcher 在三个入口可以直接读原图：
 
-**1. chat 自由问答（无 / 命令）→ 二轮 sentinel 协议**
+**1. chat agent loop → `read_image` 工具**
 
-模型自己决定要不要看图：
-1. 第一轮：文本主模型（`WO_LLM_MODEL`）按 `transcript` 文本回答；OCR 残缺/截断时在回答末尾输出 `<NEED_IMAGES>m:12,m:47</NEED_IMAGES>` 列出要看的图
-2. 第二轮：python 解析这些 cand_id → 取文件字节 → 喂视觉模型（默认 Qwen-VL-Plus via DashScope）→ 它的回答覆盖第一轮
-
-适合你不知道用户问的是哪张图、需要模型自己从 2500 条候选里挑的场景。
+agent 在 Phase A 看到 `[图片]` 或 `[图片·OCR] <可疑残文>` 时可以主动调 `read_image(msg_id, prompt?)`，把图字节喂视觉模型（默认 Qwen-VL-Plus via DashScope），把视觉模型的描述放进 trace 继续推理。模型决定要不要看、看哪张——不需要 sentinel 协议。
 
 **2. `/explain` 引用图 → 单轮直读**
 
-用户已经明确指定了哪条消息，跳过 sentinel：图片字节直接喂视觉模型，按 `/explain` 的「简明解释」语气作答。
+用户已经明确指定了哪条消息，图片字节直接喂视觉模型，按 `/explain` 的「简明解释」语气作答。
 
 **3. `/ask` 引用图 → 单轮直读**
 
 同 `/explain` 但走 `/ask` 的「轻量问答」语气；适合「翻译这张图里的文字」「这道题怎么解」「这个截图的报错什么意思」。
 
 **通用特性**：
-- **完全可插拔**：`WO_VISION_API_KEY` 为空时整个 vision 功能关闭，chat / explain / ask 都退化成纯文本（chat 自由问答看到 `[图片·OCR]` 文本，explain / ask 看到 `[图片]` 占位）
-- **硬上限 `WO_VISION_MAX_IMAGES=3`**（仅 chat 二轮）：模型多挑也只取前 3 张，防止失控烧钱
-- **降级安全**：图文件不存在 / 视觉调用失败 → 用第一轮答案 / 兜底文案，用户感知不到
-- **只在用户明确问图时起作用**：`/find` / `/sum` / `/recent` 不走视觉，永远纯文本
-- **`f:` 转发子项不挂图**：合并转发包里的图片不下载到本地，模型挑 `f:N` 会被静默丢弃
+- **完全可插拔**：`WO_VISION_API_KEY` 为空时整个 vision 功能关闭。agent 调 `read_image` 会拿到一个明确的 `ToolError`（"vision 未配置，回退去 recall_group_history"）；`/explain` / `/ask` 引用图会降级到 `[图片]` 占位
+- **硬上限 `WO_VISION_MAX_IMAGES=3`**：单次 vision 请求最多附 3 张图（agent `read_image` 一次只送 1 张，但工具可被多次调用——这条是 vision client 层的最终兜底）
+- **降级安全**：图文件不存在 / 视觉调用失败 → ToolError 给 agent / 兜底文案给 /explain & /ask，用户能感知到失败但不会拿到瞎编内容
+- **只在用户明确问图或 agent 主动判断需要时起作用**：`/find` / `/sum` / `/recent` 不走视觉，永远纯文本
 
 **模型选择**（`WO_VISION_MODEL`）：
 - `qwen-vl-plus`（默认，Qwen2.5-VL）— 便宜，普通截图够用
@@ -420,14 +425,30 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 **关键词兜底**：避免小模型对边缘相关过严漏掉字面命中。LLM 命中为空时按它返回的关键词跑一遍 SQL `LIKE`。
 
-### 自由问答兜底
+### 自由问答兜底（agent loop）
 
-`@<bot> <无 / 命令的文本>` → `ChatCommand`：
+`@<bot> <无 / 命令的文本>` → `ChatCommand` → `chat_via_agent` → `agent.runtime.run_agent`：
 
-- 拉最近 `WO_DISPATCHER_CONTEXT_CHAT` 条（默认 2500）群消息（任意 sender，排除 bot 自己 + `/` 命令消息）
-- 喂 chat-assistant prompt（强调"宁缺勿编、控制 2-6 句、不复制原文"）
-- 配了 `WO_VISION_API_KEY` 时，prompt 末尾会附加二轮 sentinel 指令；模型判断 OCR 不够用时输出 `<NEED_IMAGES>m:N,...</NEED_IMAGES>`，python 提取 → 取原图字节 → 喂视觉模型重答覆盖第一轮（详见上方「视觉模型集成」段）
-- 直接把最终回复发回群
+**Phase A（read-only，最多 `WO_AGENT_MAX_STEPS`=10 步）**
+
+1. 装配 system prompt：`agent/persona.py` 把 `data/personas/<group_id>.yaml`（静态人格核心）+ `persona_drift` 表（agent 自维护的演化补充）+ 操作规则（工具清单 + msg_id 整数约定 + 简短输出风格）拼起来
+2. 装配 user message：当前时间 + 触发原因 + 引用消息（如有）+ 最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（50）条群消息（每行 `[msg_id] (time) sender (wxid): 内容`）+ 用户对你说的话
+3. 进 tool-calling 循环：每步模型可以调一组只读工具（recall / view_quoted / expand_forward / read_image / read_voice / who_is / read_member_notes / read_group_notes / stay_silent）或输出最终回复文字。每步的 tool name + args + result 都进 trace
+4. 终态：模型输出文字 → 是回复；调 `stay_silent` → 标记沉默；用满步数 → 取最后一条 assistant content 兜底
+
+**Phase B（write-only 反思，`WO_AGENT_REFLECTION_ENABLED=True` 时；最多 `WO_AGENT_REFLECT_MAX_STEPS`=5 步）**
+
+5. 模型看完整 Phase A trace + 最终回复，决定要不要写笔记。可调：`read_member_notes` / `read_group_notes` / `read_persona_drift`（先读再写）+ `write_member_note`（替换语义） / `write_group_note`（追加语义） / `update_persona_drift`（替换语义）
+6. 终态：模型输出空文本 = 不写；用满步数 = 强制结束。绝大部分对话 Phase B 应该 0 写入
+
+**两阶段都结束后**：
+
+7. 写一行 `agent_run_log`：group_id / trigger_msg_id / trigger_kind / phase_a_trace JSON / phase_b_trace JSON / reply_text / 时间戳——审计 + 调试主入口
+8. `reply_text` 非空 → 走 `replier.send` 发回群；空（`stay_silent`）→ dispatcher 跳过 send，群里看不到 bot 任何反应
+
+**触发**：今天只有 @ 触发（`parse_command` 撞 `bot_name` 才进 `ChatCommand`）。`WO_AGENT_BASE_PROBABILITY > 0` 的概率触发和「被 reply 必应」需要在 dispatcher 主轮询里加钩子（待做）。
+
+**隔离**：所有 SQL 写死 `WHERE group_id=?`，参数从 `GroupScopedTools.__init__` 锁定——`group_id` 不暴露给 LLM 当 tool 参数，从根上禁止跨群泄密。详见 `agent/tools.py`。
 
 ### 纯模型问答
 
