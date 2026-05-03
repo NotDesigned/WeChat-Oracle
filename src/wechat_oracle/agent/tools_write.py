@@ -24,6 +24,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from .. import prompts
 from ..config import settings
 from .memory import (
     get_group_memory,
@@ -233,32 +234,11 @@ class UpdatePersonaDriftTool(Tool):
 # --- factory ---------------------------------------------------------------
 
 
-_PHASE_B_SYSTEM_PROMPT = (
-    "反思阶段。看刚才的 Phase A trace 和最终回复，决定怎么更新记忆。\n\n"
-    "可用工具：\n"
-    " 读：read_persona_drift / read_group_memory\n"
-    " 写：update_persona_drift / update_group_memory\n\n"
-    "**写之前必须先读现状**——两张表都是整段替换语义；不读就写等于丢历史。"
-    "读完再决定：加什么、删什么、合并怎么写。\n"
-    "group_memory 接近 100k 上限时（write 会 ToolError 提示）主动压缩旧的、低价值的内容。\n\n"
-    "什么值得写进 group_memory：\n"
-    " - 群友的具体事实、偏好、行为模式（明确表达的也算，你观察到的也算）\n"
-    " - 群里的事件、共识、长期话题的进展\n"
-    " - 内部梗、人物关系、历史脉络——任何你以后回答可能会用到的信息\n"
-    " - 之前记过的内容里你发现错了 / 过时了，要修正或合并\n\n"
-    "什么值得写进 persona_drift：\n"
-    " - 群友反馈了你的回答方式（太长 / 太机械 / 太正经 / 答非所问 / ...）\n"
-    " - 你发现自己在这个群说话需要调整某种风格\n\n"
-    "memory 是慢慢长出来的，多写一条（或合并修订一条）远比错过有用信息划算。"
-    "不必等到「重大事件」才动手——零碎但具体的事实也值得记。"
-    "如果这次确实没什么可加的，直接输出空文本结束反思。"
-)
-
-
 def phase_b_system_prompt() -> str:
     """Reflection-phase system prompt (the static "what to do in Phase B"
-    instructions). Persona module composes this with voice/identity from yaml."""
-    return _PHASE_B_SYSTEM_PROMPT
+    instructions). Persona module composes this with voice/identity from yaml.
+    Source text lives in `prompts.PHASE_B_SYSTEM`."""
+    return prompts.PHASE_B_SYSTEM
 
 
 def register_phase_b_tools(tools: "GroupScopedTools") -> None:  # noqa: F821 - structural-only ref

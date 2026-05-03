@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from .. import prompts
 from ..llm import VisionLLM
 from .media_paths import resolve_media_path_for_msg
 from .memory import get_group_memory
@@ -364,13 +365,6 @@ _READ_IMAGE_SPEC = ToolSpec(
 )
 
 
-_READ_IMAGE_DEFAULT_SYSTEM = (
-    "你在帮一个聊天 bot 看图。直接、简洁、客观地描述图里的关键内容："
-    "如果是文字截图就完整摘录文字；如果是表情包、照片、图表就用一两句话描述要点。"
-    "不要加 markdown，不要打招呼，不要说「这是一张图片」之类的废话。"
-)
-
-
 @dataclass
 class ReadImageTool(Tool):
     """Vision-LLM read-through. The vision client is a hard requirement —
@@ -415,11 +409,11 @@ class ReadImageTool(Tool):
                 "may have been cleared, or backfill ran without media)"
             )
 
-        user_prompt = (prompt or "").strip() or "请描述这张图，包含文字时一字一句摘录。"
+        user_prompt = (prompt or "").strip() or prompts.READ_IMAGE_USER_DEFAULT
         try:
             reply = self.vision.complete_with_images(
                 model=self.vision_model,
-                system=_READ_IMAGE_DEFAULT_SYSTEM,
+                system=prompts.READ_IMAGE_SYSTEM,
                 user=user_prompt,
                 images=[path.read_bytes()],
                 temperature=0.2,

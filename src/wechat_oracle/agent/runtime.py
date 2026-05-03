@@ -31,6 +31,7 @@ from typing import Any
 
 from loguru import logger
 
+from .. import prompts
 from ..llm import ToolCall, ToolingLLM
 from .tools import GroupScopedTools, ToolError
 
@@ -220,11 +221,7 @@ def run_phase_a(
     penultimate turn we add a wrap-up nudge; on the last turn we both nudge
     AND set tool_choice='none' so any further tool calls would be ignored.
     """
-    augmented_user = (
-        user_message
-        + f"\n\n[runtime] 你最多有 {max_steps} 个 tool-calling 回合"
-        " (每回合可同时调多个工具)。最后一个回合工具调用会被禁用,你必须输出最终文本或调 stay_silent。"
-    )
+    augmented_user = user_message + prompts.PHASE_A_BUDGET_HINT.format(max_steps=max_steps)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": augmented_user},
@@ -241,9 +238,8 @@ def run_phase_a(
         if is_penultimate and max_steps >= 2:
             messages.append({
                 "role": "system",
-                "content": (
-                    f"[runtime] step {step+1}/{max_steps}: 还剩 1 个回合就要强制收尾。"
-                    " 如果还需要调工具,这一步用完;否则直接输出最终回答。"
+                "content": prompts.PHASE_A_PENULTIMATE_WARNING.format(
+                    step=step + 1, max_steps=max_steps,
                 ),
             })
 
@@ -254,10 +250,8 @@ def run_phase_a(
         if is_last_step:
             messages.append({
                 "role": "system",
-                "content": (
-                    f"[runtime] 这是你最后一回合 (step {step+1}/{max_steps})。"
-                    " 工具调用已禁用。基于已有信息直接输出最终回答,"
-                    " 或如果实在无法回答就在文字里说清楚为什么 — 不要返回空内容。"
+                "content": prompts.PHASE_A_LAST_STEP_FORCE.format(
+                    step=step + 1, max_steps=max_steps,
                 ),
             })
         tool_choice = "none" if is_last_step else "auto"
@@ -301,11 +295,7 @@ def run_phase_a(
             trace.append({"step": step, "kind": "empty_final_retry"})
             messages.append({
                 "role": "system",
-                "content": (
-                    "[runtime] 你刚才的回应是空的。"
-                    " 请要么给出实际回答,要么调用 stay_silent 工具并说明 reason。"
-                    " 不能空着结束。"
-                ),
+                "content": prompts.PHASE_A_EMPTY_FINAL_NUDGE,
             })
             continue
 
@@ -386,12 +376,8 @@ def run_phase_b(
     """Reflection over a chat agent run. The model sees a digest of Phase A
     plus the eventual reply, and decides whether to write notes."""
     digest = json.dumps(phase_a_trace, ensure_ascii=False, indent=2)
-    user_message = (
-        f"刚才的 Phase A trace（按时间正序）：\n{digest}\n\n"
-        f"最终回复：{reply_text!r}\n\n"
-        "现在是反思阶段：根据本次发生的事，决定要不要写笔记。"
-        " 大多数情况下不需要写——只有当出现新事实、关键观点或群文化变化时才写。"
-        " 若不需要写，直接输出空文本结束。"
+    user_message = prompts.PHASE_B_USER.format(
+        trace_digest=digest, reply_text=repr(reply_text),
     )
     return _run_simple_tool_loop(
         llm=llm,
@@ -422,12 +408,7 @@ def run_lurk_reflection(
     caller supplies `user_message` directly (built from observed messages,
     not from a Phase A trace) and we add a runtime hint about the budget so
     the model can pace itself across the few rounds it has."""
-    augmented_user = (
-        user_message
-        + f"\n\n[runtime] 你最多有 {max_steps} 个 tool-calling 回合。"
-        "可以用历史检索工具补上下文，也可以直接读/写记忆。"
-        "如果没有值得写入的长期信息，直接输出空文本结束。"
-    )
+    augmented_user = user_message + prompts.LURK_BUDGET_HINT.format(max_steps=max_steps)
     return _run_simple_tool_loop(
         llm=llm,
         model=model,

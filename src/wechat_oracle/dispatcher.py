@@ -48,6 +48,7 @@ from typing import Callable, ClassVar
 
 from loguru import logger
 
+from . import prompts
 from .agent.orchestrator import chat_via_agent, chat_via_lurk, lurk_due_groups
 from .config import settings
 from .db import get_conn, init_db, transaction
@@ -410,16 +411,6 @@ class ChatCommand(Command):
 
 # ---------- /ask ----------
 
-_ASK_SYSTEM_PROMPT = """你是微信群里的轻量问答助手。用户显式使用 /ask，表示这次不要读取群聊历史，只按通用知识和用户问题本身回答。
-
-回答要求：
-- 直接回答，不要声称看过群聊上下文
-- 信息不足时说明缺少什么，不要编造
-- 中文回答，除非问题明显要求其它语言
-- 控制在 2-6 句
-- 不要 @ 任何人；不要使用 markdown 语法"""
-
-
 @register
 class AskCommand(Command):
     name = "ask"
@@ -465,18 +456,18 @@ class AskCommand(Command):
         user = f"当前时间：{now_str}\n{requester_line}{quoted_line}用户问题：{self.question}"
         reply = ctx.llm.complete_text(
             model=ctx.model,
-            system=_ASK_SYSTEM_PROMPT,
+            system=prompts.ASK_SYSTEM,
             user=user,
             temperature=0.3,
             max_tokens=settings.short_max_tokens,
         )
         if not reply:
-            reply = "（模型没返回内容，再问一次试试）"
+            reply = prompts.LLM_EMPTY_REPLY
         if ctx.llm_log_path:
             dump_llm_call(
                 ctx.llm_log_path,
                 label=f"/ask  ::  {self.question}",
-                system=_ASK_SYSTEM_PROMPT,
+                system=prompts.ASK_SYSTEM,
                 user=user,
                 raw=reply,
                 parsed=None,
@@ -489,34 +480,19 @@ class AskCommand(Command):
     def _execute_vision(
         self, ctx: CommandContext, image_path: Path
     ) -> ExecResult:
-        prompt = (
-            f"用户在群里引用了一张图片并问：{self.question}。"
-            f" 直接基于图片内容作答，必要时指出不确定点。"
-            f" 中文 2-6 句，不用 markdown，不 @ 任何人。"
-        )
         return _run_vision_on_quoted_image(
             ctx, image_path,
-            system_prompt=_ASK_SYSTEM_PROMPT,
-            user_prompt=prompt,
+            system_prompt=prompts.ASK_SYSTEM,
+            user_prompt=prompts.ASK_VISION_USER.format(question=self.question),
             log_label=f"/ask-vision  ::  {self.question[:60]}",
             stdout_header=f"/ask (图片直读)  ::  {self.question}",
             summary_label="ask-vision",
-            fail_message="（视觉模型调用失败，无法直接解读这张图。）",
+            fail_message=prompts.VISION_FAIL,
             temperature=0.3,
         )
 
 
 # ---------- /sum ----------
-
-_SUM_SYSTEM_PROMPT = """你是微信群聊摘要助手。根据用户给出的当前群候选消息，提炼讨论重点。
-
-要求：
-- 只总结候选消息里明确出现的信息，不要编造
-- 如果用户给了主题，只总结与主题相关的内容
-- 按“结论 / 分歧 / 待办或决定”组织，但没有的部分不要硬写
-- 中文回答，控制在 4-10 句
-- 不要 @ 任何人；不要使用 markdown 语法"""
-
 
 @register
 class SumCommand(Command):
@@ -607,7 +583,7 @@ class SumCommand(Command):
             log_path=ctx.llm_log_path,
         )
         if not reply:
-            reply = "（模型没返回内容，再问一次试试）"
+            reply = prompts.LLM_EMPTY_REPLY
         logger.info("sum :: topic={!r} target={!r} candidates={} reply_len={}",
                     self.topic, self.target, len(cands), len(reply))
         stdout = f"/sum :: {self.topic or '(all)'}\n  ({len(cands)} ctx msgs -> {len(reply)} chars)\n{reply}"
@@ -687,16 +663,6 @@ class BalanceCommand(Command):
 
 # ---------- /explain ----------
 
-_EXPLAIN_SYSTEM_PROMPT = """你是微信群里的简明解释助手。用户显式使用 /explain，通常是在引用一条消息后要求解释。
-
-要求：
-- 只解释提供的文本或引用内容，不读取群聊历史
-- 说明这句话可能是什么意思、关键信息是什么、必要时指出不确定点
-- 信息不足时直接说缺少上下文
-- 中文回答，控制在 2-6 句
-- 不要 @ 任何人；不要使用 markdown 语法"""
-
-
 @register
 class ExplainCommand(Command):
     name = "explain"
@@ -744,18 +710,18 @@ class ExplainCommand(Command):
         user = f"当前时间：{now_str}\n{source}"
         reply = ctx.llm.complete_text(
             model=ctx.model,
-            system=_EXPLAIN_SYSTEM_PROMPT,
+            system=prompts.EXPLAIN_SYSTEM,
             user=user,
             temperature=0.2,
             max_tokens=settings.short_max_tokens,
         )
         if not reply:
-            reply = "（模型没返回内容，再问一次试试）"
+            reply = prompts.LLM_EMPTY_REPLY
         if ctx.llm_log_path:
             dump_llm_call(
                 ctx.llm_log_path,
                 label=f"/explain  ::  {explicit or quoted[:60]}",
-                system=_EXPLAIN_SYSTEM_PROMPT,
+                system=prompts.EXPLAIN_SYSTEM,
                 user=user,
                 raw=reply,
                 parsed=None,
@@ -768,18 +734,18 @@ class ExplainCommand(Command):
     def _execute_vision(
         self, ctx: CommandContext, image_path: Path, explicit: str
     ) -> ExecResult:
-        prompt = "用户在群里引用了一张图片，要求你解释。"
+        prompt = prompts.EXPLAIN_VISION_USER_HEAD
         if explicit:
-            prompt += f" 补充说明：{explicit}"
-        prompt += " 请直接说明图里的内容含义、关键信息、必要时指出不确定点。中文 2-6 句，不用 markdown，不 @ 任何人。"
+            prompt += prompts.EXPLAIN_VISION_USER_EXPLICIT.format(explicit=explicit)
+        prompt += prompts.EXPLAIN_VISION_USER_TAIL
         return _run_vision_on_quoted_image(
             ctx, image_path,
-            system_prompt=_EXPLAIN_SYSTEM_PROMPT,
+            system_prompt=prompts.EXPLAIN_SYSTEM,
             user_prompt=prompt,
             log_label=f"/explain-vision  ::  {explicit[:60] or '(quoted image)'}",
             stdout_header="/explain (图片直读)",
             summary_label="explain-vision",
-            fail_message="（视觉模型调用失败，无法直接解读这张图。）",
+            fail_message=prompts.VISION_FAIL,
             temperature=0.2,
         )
 
@@ -1032,35 +998,6 @@ def fetch_candidates(
 
 # ---------- LLM filter ----------
 
-_SYSTEM_PROMPT = """你是聊天记录精筛助手。根据「查询描述」从「候选消息」里挑出相关条目。
-
-候选行格式约定：
-- 普通文字：正文就是该用户打出来的字
-- `[图片·OCR] 文字内容` / `[语音·ASR] 文字内容` —— 中点后是机器识别出来的内容，**视同该 sender 通过图片/语音表达**，要参与匹配
-- 仅 `[图片]` / `[语音]`（没有 ·OCR / ·ASR 后缀） —— 该消息还没识别或无文字可识别，按"事件"算，匹配不到具体内容
-- `...[引用 X：Y]` —— Y 是被引用消息的内容，连同前面的回复一起匹配
-- 合并转发：父行 `[聊天记录]` 后会跟一组 `↳ [f:N] (原时间) 原作者:正文` 缩进子项，子项内容也参与匹配（视同原作者在原时间说了那些话）
-- `[链接] 标题\\nURL` / `[卡片消息]` 等 —— 按字面意义理解
-
-排除规则（先判断，命中即跳过该候选）：
-- 命令消息：形如 `@<某机器人> /xxx ...` 这种向机器人发指令的消息，属于操作指令而非被查询者的发言，一律忽略
-- 机器人自己发出的回复（包括格式化结果、错误提示）也忽略
-
-匹配原则（宁宽勿窄）：
-1. 任何字面/关键词上提到查询所述事物（人名、专有名词、概念、话题）的消息，必须算作相关
-2. 表达了与查询主旨相关的想法/态度/讨论的消息，按语义相关度纳入
-3. 只有所有候选都与查询毫无关联时，才返回空 hits
-
-返回 JSON（只输出 JSON，不要前后文）：
-{
-  "hits": ["<msg_id>", ...],       // 按相关度从高到低，最多 5 条；msg_id 是字符串，照抄候选行 [] 里的 token
-  "keywords": ["<核心检索词>", ...], // 从查询里提取的 1-3 个核心实体/概念，用作 fallback 关键词
-  "reason": "<一句话说明>"
-}
-
-严禁编造 ID，只能从候选中挑。注意 msg_id 形如 "m:123" 或 "f:456"，必须原样保留前缀。"""
-
-
 def _format_candidates_for_llm(cands: list[Candidate]) -> str:
     """Render candidates for the LLM. `m:` rows print at their own time;
     `f:` rows (合并转发 children) get **inlined directly under their parent
@@ -1122,7 +1059,7 @@ def llm_filter(
     user = f"查询：{description}\n\n候选消息：\n{_format_candidates_for_llm(cands)}"
     raw = client.complete_json(
         model=model,
-        system=_SYSTEM_PROMPT,
+        system=prompts.FIND_SYSTEM,
         user=user,
         temperature=0.0,
     )
@@ -1133,12 +1070,12 @@ def llm_filter(
         logger.warning("LLM returned non-JSON: {!r}", raw[:200])
         if log_path:
             dump_llm_call(log_path, f"{label}  ::  {description}",
-                           _SYSTEM_PROMPT, user, raw, None, note=f"JSONDecodeError: {e}")
+                           prompts.FIND_SYSTEM, user, raw, None, note=f"JSONDecodeError: {e}")
         return LLMFilterResult(hits=[], keywords=[], reason=f"bad LLM response: {e}")
 
     if log_path:
         dump_llm_call(log_path, f"{label}  ::  {description}",
-                       _SYSTEM_PROMPT, user, raw, payload)
+                       prompts.FIND_SYSTEM, user, raw, payload)
 
     valid_ids = {c.cand_id for c in cands}
     raw_hits = (payload.get("hits") if isinstance(payload, dict) else []) or []
@@ -1182,7 +1119,7 @@ def _run_vision_on_quoted_image(
     except Exception as e:
         logger.warning("{} vision failed ({}); returning fallback message", log_label, e)
         return ExecResult(stdout=fail_message, chat=fail_message, summary=f"{summary_label}: {e}")
-    reply = (reply_raw or "").strip() or "（模型没返回内容，再问一次试试）"
+    reply = (reply_raw or "").strip() or prompts.LLM_EMPTY_REPLY
     if ctx.llm_log_path:
         dump_llm_call(
             ctx.llm_log_path,
@@ -1226,7 +1163,7 @@ def summarize_chat(
     )
     raw = client.complete_text(
         model=model,
-        system=_SUM_SYSTEM_PROMPT,
+        system=prompts.SUM_SYSTEM,
         user=user,
         temperature=0.2,
         max_tokens=settings.sum_max_tokens,
@@ -1235,7 +1172,7 @@ def summarize_chat(
         dump_llm_call(
             log_path,
             label=f"/sum  ::  {topic or '(all)'}",
-            system=_SUM_SYSTEM_PROMPT,
+            system=prompts.SUM_SYSTEM,
             user=user,
             raw=raw,
             parsed=None,
@@ -1321,7 +1258,6 @@ def keyword_fallback(cands: list[Candidate], keywords: list[str], cap: int = 5) 
 # is acceptable.
 _BOT_LAST_SPOKE_AT: dict[str, float] = {}
 _BOT_LAST_SPOKE_AT_LOCK = threading.Lock()
-_AGENT_ACK_TEXT = "收到，正在处理。"
 
 
 def _resolve_bot_wxid(conn: sqlite3.Connection, bot_name: str) -> str | None:
@@ -1432,7 +1368,7 @@ def _mark_bot_spoke(group_id: str, when: float | None = None) -> None:
 
 
 def _send_agent_ack(replier: "Replier", row: sqlite3.Row, requester: str | None) -> None:
-    replier.send(row["group_name"], requester, _AGENT_ACK_TEXT)
+    replier.send(row["group_name"], requester, prompts.AGENT_ACK)
     _mark_bot_spoke(row["group_id"])
 
 
@@ -1640,29 +1576,12 @@ def _process_agent_only(
         # User replied to one of bot's prior messages. Their reply text is
         # the user_question; quote_text is the bot's prior message we set
         # via ctx.quoted_text and the agent prompt already inlines it.
-        user_question = text or "（用户引用了你之前的话但没说什么）"
+        user_question = text or prompts.REPLY_EMPTY_FALLBACK
     else:  # probability
-        # You are a member of this group; the dice gave you a chance to chime
-        # in. Permissive framing — the bot decides based on whether the
-        # message gives it something to say, not on a checklist of "valid"
-        # triggers. Earlier "默认你不说话 + 4 个白名单" was over-suppressing
-        # (~91% silent rate) and missed natural participation moments.
-        user_question = (
-            f"群里出现了一条消息：「{text or '（非文本消息）'}」\n\n"
-            "你是这个群的成员，刚好「看到」了这条消息。判断要不要接茬：\n\n"
-            "**值得说一句**（任何一类都可以）：\n"
-            " - 你恰好知道答案、能补一个事实、能给出有用的角度\n"
-            " - 看到明显错误能修正\n"
-            " - 之前关心 / 提过 / 帮过的话题在延续，你有新东西可补\n"
-            " - 群友的发言能让你想到一个真有信息量的回应、观察、记忆、玩梗\n"
-            " - 群友间的互动里你能加点新的，而不是复读已有内容\n\n"
-            "**不值得说**（这些 stay_silent）：\n"
-            " - 纯反应（同意 / 笑 / 表情接龙 / 复读别人的话）\n"
-            " - 群友间的私事、技术协调、他们自己能搞定的事\n"
-            " - 你想到的内容只是「接个话」而没有实质信息\n"
-            " - 另一个 bot 已经接了，你再说就是叠音\n\n"
-            "判断标准是「我说这句话有没有信息量」，不是「是否被点名」。"
-            "不被 @ 也可以发言，但发言必须值得发——别为了刷存在感占麦。"
+        # Dice-roll wake; permissive judgment-call framing. See
+        # prompts.PROBABILITY_USER for the full text + history note.
+        user_question = prompts.PROBABILITY_USER.format(
+            text=text or prompts.PROBABILITY_NON_TEXT_PLACEHOLDER,
         )
 
     if kind == "reply":

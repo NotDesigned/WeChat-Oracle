@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from .. import prompts
 from ..config import settings
 from ..db import transaction
 from ..llm import LLMClient
@@ -84,7 +85,7 @@ def _format_recent_for_agent(
         body = body.replace("\n", " ").strip()
         self_tag = " [自己]" if bot_wxid and wxid == bot_wxid else ""
         out.append(f"[{r['msg_id']}] {ts}{self_tag} {sender} ({wxid}): {body}")
-    return "\n".join(out) if out else "（最近群里没消息）"
+    return "\n".join(out) if out else prompts.CHAT_RECENT_EMPTY
 
 
 def _trace_step_line(s: dict[str, Any]) -> str:
@@ -285,30 +286,30 @@ def chat_via_agent(
     recent_block = _format_recent_for_agent(recent_rows, bot_wxid=ctx.bot_wxid)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     requester_line = (
-        f"提问者: {ctx.requester}（即上下文里 sender_display=={ctx.requester!r} 的那位）\n"
+        prompts.CHAT_REQUESTER_LINE.format(
+            requester=ctx.requester, requester_repr=repr(ctx.requester),
+        )
         if ctx.requester else ""
     )
     quoted_line = (
-        f"用户引用的一条消息片段: {ctx.quoted_text.strip()}\n"
+        prompts.CHAT_QUOTED_LINE.format(quoted=ctx.quoted_text.strip())
         if ctx.quoted_text and ctx.quoted_text.strip() else ""
     )
-    trigger_line = (
-        f"触发原因: {trigger_kind}\n"
-        f"触发消息 msg_id: {ctx.trigger_msg_id}\n"
+    trigger_line = prompts.CHAT_TRIGGER_LINE.format(
+        trigger_kind=trigger_kind, trigger_msg_id=ctx.trigger_msg_id,
     )
     self_hint = (
-        f"\n（你自己的 wxid 是 {ctx.bot_wxid}；下面消息列表里标 [自己] 的行是你之前说过的话，"
-        "不要复读自己 / 不要跟自己抬杠。）"
+        prompts.CHAT_SELF_HINT.format(bot_wxid=ctx.bot_wxid)
         if ctx.bot_wxid else ""
     )
-    user_msg = (
-        f"当前时间: {now_str}\n"
-        f"{trigger_line}"
-        f"{requester_line}"
-        f"{quoted_line}"
-        f"{self_hint}"
-        f"\n最近群消息（按时间正序，最旧→最新）：\n{recent_block}\n\n"
-        f"---\n用户对你说: {user_question}"
+    user_msg = prompts.CHAT_USER.format(
+        now=now_str,
+        trigger_line=trigger_line,
+        requester_line=requester_line,
+        quoted_line=quoted_line,
+        self_hint=self_hint,
+        recent_block=recent_block,
+        user_question=user_question,
     )
 
     read_tools = GroupScopedTools(
@@ -466,17 +467,12 @@ def chat_via_lurk(
     oldest_msg_id = min(msg_ids)
     newest_msg_id = max(msg_ids)
     window_label = (
-        f"msg_id > {after_msg_id}" if after_msg_id is not None else "初次运行，取最近窗口"
+        prompts.LURK_WINDOW_LABEL_INCREMENTAL.format(after_msg_id=after_msg_id)
+        if after_msg_id is not None
+        else prompts.LURK_WINDOW_LABEL_FIRST_RUN
     )
 
-    lurk_rules = (
-        phase_b_system_prompt()
-        + "\n\n当前是 lurk 后台学习，不是群聊回复。你永远不会发消息到群里。"
-        "输入是一批新观察到的群消息；如果这些消息暗示了旧上下文，"
-        "可以调用 recall_group_history / view_quoted_chain / expand_forward_bundle 查看老消息。"
-        "只把稳定、可复用、以后回答会用到的信息写入 group_memory；"
-        "只把长期说话风格调整写入 persona_drift。普通闲聊、一次性情绪、无关噪声不要写。"
-    )
+    lurk_rules = phase_b_system_prompt() + prompts.LURK_SYSTEM_ADDENDUM
 
     _, lurk_system = assemble_system_prompts(
         conn=conn,
@@ -487,12 +483,12 @@ def chat_via_lurk(
         base_phase_b_prompt=lurk_rules,
     )
 
-    user_msg = (
-        f"后台学习观察窗口：{window_label}\n"
-        f"本次消息范围：{oldest_msg_id}..{newest_msg_id}，共 {len(rows)} 条。\n\n"
-        f"新观察到的群消息（按时间正序）：\n{recent_block}\n\n"
-        "任务：判断是否需要更新长期记忆。必要时先用历史检索工具查旧消息；"
-        "写之前必须先调用 read_group_memory / read_persona_drift。"
+    user_msg = prompts.LURK_USER.format(
+        window_label=window_label,
+        oldest_msg_id=oldest_msg_id,
+        newest_msg_id=newest_msg_id,
+        n_msgs=len(rows),
+        recent_block=recent_block,
     )
 
     audit_observation_trace: list[dict[str, Any]] = [
@@ -507,7 +503,7 @@ def chat_via_lurk(
                 "newest_msg_id": newest_msg_id,
                 "recent_msgs": len(rows),
             },
-            "result": "[lurk] compact audit only; full prompt is in llm_debug.log",
+            "result": prompts.LURK_OBSERVATION_AUDIT_RESULT,
         }
     ]
 
