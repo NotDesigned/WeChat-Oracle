@@ -1329,6 +1329,9 @@ def _trace_step_line(s: dict[str, object]) -> str:
         return f"  step{step} ↻ empty final → nudge → retry"
     if kind == "max_steps_hit":
         return f"  step{step} ⚠ MAX STEPS HIT"
+    if kind == "lurk_observation":
+        args = s.get("args") or {}
+        return f"  step{step} ◌ lurk_observation: {args.get('recent_msgs', '?')} msgs in window"
     return f"  step{step} ?{kind}: {json.dumps(s, ensure_ascii=False, default=str)[:160]}"
 
 
@@ -1534,6 +1537,154 @@ def chat_via_agent(
     return result.reply_text, trace_block
 
 
+# --- lurk: silent observation that may update memory but never replies -----
+
+
+def chat_via_lurk(
+    *,
+    conn: sqlite3.Connection,
+    llm: LLMClient,
+    model: str,
+    bot_name: str,
+    bot_wxid: str | None,
+    group_id: str,
+    group_name: str | None,
+    log_path: Path | None = None,
+    llm_log_path: Path | None = None,
+) -> str:
+    """One synchronous lurk pass: read recent messages + current memory →
+    decide whether to update group_memory / persona_drift, no chat reply.
+
+    Behaves like a Phase-B-only agent run: no Phase A tool exploration,
+    no `stay_silent` (lurk silence is the default — model just emits empty
+    text to end). Caller passes the dispatcher conn explicitly so this can
+    be invoked from CLI (one-shot) and later from the dispatcher idle loop.
+
+    Returns a human-readable trace block (also appended to dispatcher.log
+    when `log_path` is provided). Writes one `agent_run_log` row with
+    `trigger_kind='lurk'` and links `last_run_id` on any memory rows the
+    model rewrote.
+    """
+    from .agent.memory import (
+        get_group_memory,
+        get_persona_drift,
+        insert_run_log,
+        link_last_run_id,
+    )
+    from .agent.persona import assemble_system_prompts
+    from .agent.runtime import run_phase_b
+    from .agent.tools import GroupScopedTools
+    from .agent.tools_write import (
+        phase_b_system_prompt,
+        register_phase_b_tools,
+        trace_touched_tables,
+    )
+
+    started_at = time.time()
+    rows = _fetch_recent_for_agent(conn, group_id, settings.agent_lurk_recent_msgs)
+    if not rows:
+        logger.info("lurk: no recent messages for group_id={!r}", group_id)
+        return "(lurk: no recent messages)"
+    recent_block = _format_recent_for_agent(rows, bot_wxid=bot_wxid)
+    current_memory = get_group_memory(conn, group_id)
+    current_drift = get_persona_drift(conn, group_id)
+
+    _, phase_b_system = assemble_system_prompts(
+        conn=conn,
+        group_id=group_id,
+        group_name=group_name,
+        bot_name=bot_name,
+        personas_dir=settings.agent_personas_dir,
+        base_phase_b_prompt=phase_b_system_prompt(),
+    )
+
+    # Synthesize a one-step "Phase A trace" describing the observation, so
+    # run_phase_b's existing user-message construction (which serializes the
+    # phase_a_trace into the reflection prompt) carries the recent_block
+    # naturally to the model.
+    synthetic_phase_a_trace: list[dict[str, object]] = [
+        {
+            "step": 0,
+            "kind": "lurk_observation",
+            "tool": "_lurk",
+            "args": {"group_id": group_id, "recent_msgs": len(rows)},
+            "result": (
+                f"[lurk] 后台静默观察, 不会回群. "
+                f"当前 group_memory ({len(current_memory)} 字):\n"
+                f"{current_memory or '(空)'}\n\n"
+                f"当前 persona_drift ({len(current_drift)} 字):\n"
+                f"{current_drift or '(空)'}\n\n"
+                f"最近 {len(rows)} 条群消息:\n{recent_block}"
+            ),
+        }
+    ]
+
+    write_tools = GroupScopedTools(
+        conn=conn, group_id=group_id, group_name=group_name, bot_name=bot_name,
+    )
+    register_phase_b_tools(write_tools)
+
+    phase_b_trace = run_phase_b(
+        llm=llm,  # type: ignore[arg-type]
+        model=model,
+        system_prompt=phase_b_system,
+        phase_a_trace=synthetic_phase_a_trace,
+        reply_text=None,
+        write_tools=write_tools,
+        max_steps=settings.agent_lurk_max_steps,
+        temperature=0.2,
+        max_tokens=settings.chat_max_tokens,
+    )
+    finished_at = time.time()
+
+    try:
+        with transaction(conn):
+            run_id = insert_run_log(
+                conn,
+                group_id=group_id,
+                trigger_msg_id=int(rows[-1]["msg_id"]),  # newest in window, for cursor reference
+                trigger_kind="lurk",
+                phase_a_trace=synthetic_phase_a_trace,
+                phase_b_trace=phase_b_trace,
+                reply_text=None,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            touched_persona, touched_memory = trace_touched_tables(phase_b_trace)
+            if touched_persona or touched_memory:
+                link_last_run_id(
+                    conn,
+                    group_id=group_id,
+                    run_id=run_id,
+                    touched_persona=touched_persona,
+                    touched_memory=touched_memory,
+                )
+    except Exception:
+        logger.exception("lurk: failed to write agent_run_log; trace still returned")
+
+    if llm_log_path:
+        _dump_llm_call(
+            llm_log_path,
+            label=f"lurk  ::  group={group_id}",
+            system=phase_b_system,
+            user=synthetic_phase_a_trace[0]["result"],  # type: ignore[arg-type]
+            raw="(lurk — no reply)",
+            parsed={"phase_b_trace": phase_b_trace},
+        )
+
+    trace_block = _format_trace_for_log(synthetic_phase_a_trace, phase_b_trace)
+    if log_path:
+        _append_log(log_path, int(rows[-1]["t"]),
+                    f"lurk[{group_id}] msgs={len(rows)}\n{trace_block}")
+    logger.info(
+        "lurk :: group_id={} msgs={} writes={} dur={:.1f}s",
+        group_id, len(rows),
+        sum(1 for s in phase_b_trace if s.get("kind") == "tool_call" and s.get("tool", "").startswith("update_")),
+        finished_at - started_at,
+    )
+    return trace_block
+
+
 def summarize_chat(
     client: LLMClient,
     model: str,
@@ -1719,6 +1870,16 @@ def _classify_trigger(
       - mention always wakes (even within cooldown)
       - reply-to-bot always wakes (same)
       - probability is gated by cooldown + WO_AGENT_BASE_PROBABILITY
+
+    Cooldown for probability is enforced under lock with a CAS pattern:
+    with multiple worker threads classifying concurrent batches, a naive
+    "read last; check window; later update" races — each worker sees a
+    stale `_BOT_LAST_SPOKE_AT[gid]` because none of them has finished
+    replying yet, so all of them fire probability simultaneously. We
+    update the timer **inside the same lock** the moment probability
+    is granted, so only one worker per cooldown window wins. Even if
+    Phase A subsequently chooses stay_silent, the cooldown stays — the
+    LLM was burned anyway, the group should get a quiet moment.
     """
     text = row["content_text"] or ""
     if _has_bot_mention(text, bot_name):
@@ -1729,13 +1890,15 @@ def _classify_trigger(
     p = settings.agent_base_probability
     if p <= 0.0:
         return None
+    if random.random() >= p:
+        return None
+    # Won the dice roll. Atomically check + reserve cooldown.
     with _BOT_LAST_SPOKE_AT_LOCK:
         last = _BOT_LAST_SPOKE_AT.get(row["group_id"], 0.0)
-    if now - last < settings.agent_cooldown_seconds:
-        return None
-    if random.random() < p:
-        return "probability"
-    return None
+        if now - last < settings.agent_cooldown_seconds:
+            return None
+        _BOT_LAST_SPOKE_AT[row["group_id"]] = now
+    return "probability"
 
 
 def _mark_bot_spoke(group_id: str, when: float | None = None) -> None:

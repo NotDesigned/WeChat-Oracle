@@ -538,6 +538,8 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | 静态人格 yaml 目录，每群一个 `<group_id>.yaml` |
 | `WO_AGENT_RECENT_CONTEXT_CHAT` | `200` | Phase A 初始 system prompt 注入的最近群消息条数 |
 | `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | `group_memory` 单文档硬上限；超过 update_group_memory 抛 ToolError，agent 必须先压缩 |
+| `WO_AGENT_LURK_RECENT_MSGS` | `100` | 一次 lurk run 看的最近消息窗口（潜水观察 → 自决是否 update memory，不发回群） |
+| `WO_AGENT_LURK_MAX_STEPS` | `4` | lurk reflection 阶段最多 tool-calling 步数 |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `12` | Phase A 单次回答总工具调用预算；超过后把预算错误喂回模型，让它基于已有信息回答 |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Phase A 单轮 LLM 决策最多执行几个工具 |
 | `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Phase A 单次回答最多执行几次 `read_image` |

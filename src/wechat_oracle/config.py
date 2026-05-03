@@ -115,6 +115,14 @@ class Settings(BaseSettings):
     agent_max_image_reads_per_run: int = 2      # expensive read_image budget
     agent_max_voice_reads_per_run: int = 2      # expensive read_voice budget
 
+    # Lurk: bot silently reads recent messages and decides whether to
+    # update group_memory / persona_drift, without sending any reply.
+    # Manual via `wechat-oracle agent lurk <group_id>`. v0 has no auto-
+    # trigger from dispatcher idle loop — opt in by running the CLI on a
+    # cron / one-shot when you want the bot to digest recent activity.
+    agent_lurk_recent_msgs: int = 100          # window of msgs the lurk run sees
+    agent_lurk_max_steps: int = 4              # tool-call rounds for lurk reflection
+
     # Send the dispatcher's result back into the WeChat group. False = local-
     # only (stdout + log). True = use the backend below.
     reply: bool = True

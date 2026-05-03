@@ -240,6 +240,52 @@ def agent_wipe(
     typer.echo(f"wiped: {', '.join(targets)}")
 
 
+@agent_app.command("lurk")
+def agent_lurk(
+    group_id: str = typer.Argument(..., help="messages.group_id of the target group"),
+) -> None:
+    """One-shot 'lurk' run: bot reads recent messages + current memory and
+    decides whether to update group_memory / persona_drift. No reply sent
+    to the group regardless of outcome.
+
+    Useful for periodic background memory consolidation (cron this every
+    30 min for an active group), or to manually nudge the bot to update
+    its impression of group activity after you've imported a backfill.
+    """
+    from .dispatcher import (
+        _build_llm_client, _resolve_bot_wxid, chat_via_lurk,
+    )
+    if not settings.bot_name:
+        typer.echo("⚠️  WO_BOT_NAME is empty — set it before lurking.")
+        raise typer.Exit(1)
+    init_db()
+    settings.ensure_dirs()
+    log_path = settings.data_dir / "dispatcher.log"
+    llm_log_path = settings.data_dir / "llm_debug.log"
+    llm = _build_llm_client()
+    with get_conn() as conn:
+        bot_wxid = _resolve_bot_wxid(conn, settings.bot_name)
+        # Find the group_name for the prompt; OK if missing.
+        row = conn.execute(
+            "SELECT group_name FROM messages WHERE group_id=? AND group_name IS NOT NULL "
+            "ORDER BY t DESC LIMIT 1",
+            (group_id,),
+        ).fetchone()
+        group_name = row["group_name"] if row else None
+        trace_block = chat_via_lurk(
+            conn=conn,
+            llm=llm,
+            model=settings.llm_model,
+            bot_name=settings.bot_name,
+            bot_wxid=bot_wxid,
+            group_id=group_id,
+            group_name=group_name,
+            log_path=log_path,
+            llm_log_path=llm_log_path,
+        )
+    typer.echo(trace_block)
+
+
 def _classify_silent(phase_a_trace: list[dict[str, object]] | None) -> tuple[str, str]:
     """Categorize why an agent run ended without a reply. Returns (label, detail).
     Labels: 'stay_silent' (A) / 'empty' (B) / 'max_steps' (C) / 'unknown'."""
