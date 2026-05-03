@@ -1301,7 +1301,7 @@ def chat_via_agent(
     """
     from .agent.memory import insert_run_log, link_last_run_id
     from .agent.persona import assemble_system_prompts
-    from .agent.runtime import run_agent
+    from .agent.runtime import ToolBudget, run_agent
     from .agent.tools import GroupScopedTools
     from .agent.tools_read import register_phase_a_tools
     from .agent.tools_write import (
@@ -1390,6 +1390,12 @@ def chat_via_agent(
         reflection_enabled=settings.agent_reflection_enabled,
         temperature=0.5,
         max_tokens=settings.chat_max_tokens,
+        tool_budget=ToolBudget(
+            max_per_run=settings.agent_max_tool_calls_per_run,
+            max_per_step=settings.agent_max_tool_calls_per_step,
+            max_image_reads=settings.agent_max_image_reads_per_run,
+            max_voice_reads=settings.agent_max_voice_reads_per_run,
+        ),
     )
     finished_at = time.time()
 
@@ -1581,6 +1587,17 @@ def _resolve_bot_wxid(conn: sqlite3.Connection, bot_name: str) -> str | None:
     return row["sender_wxid"] if row else None
 
 
+def _has_bot_mention(text: str, bot_name: str) -> bool:
+    """Cheap mention test used before the full command parser.
+
+    Keep this aligned with `parse_command`: `@<bot>` must be a real mention,
+    not a prefix of another nickname like `@<bot>x`.
+    """
+    if not text or not bot_name:
+        return False
+    return re.search(rf"@{re.escape(bot_name)}(?:\s|$)", text, re.DOTALL) is not None
+
+
 def _is_reply_to_bot(
     conn: sqlite3.Connection, row: sqlite3.Row, bot_wxid: str | None
 ) -> bool:
@@ -1592,8 +1609,8 @@ def _is_reply_to_bot(
     if not parent_id:
         return False
     parent = conn.execute(
-        "SELECT sender_wxid FROM messages WHERE wx_msg_id = ?",
-        (parent_id,),
+        "SELECT sender_wxid FROM messages WHERE wx_msg_id = ? AND group_id = ?",
+        (parent_id, row["group_id"]),
     ).fetchone()
     return parent is not None and parent["sender_wxid"] == bot_wxid
 
@@ -1614,7 +1631,7 @@ def _classify_trigger(
       - probability is gated by cooldown + WO_AGENT_BASE_PROBABILITY
     """
     text = row["content_text"] or ""
-    if bot_name and f"@{bot_name}" in text:
+    if _has_bot_mention(text, bot_name):
         return "mention"
     if _is_reply_to_bot(conn, row, bot_wxid):
         return "reply"
@@ -1652,7 +1669,10 @@ def _finalize(conn: sqlite3.Connection, msg_id: int, status: str, result: str) -
 
 
 def _next_unprocessed(
-    conn: sqlite3.Connection, bot_name: str, batch: int = 20
+    conn: sqlite3.Connection,
+    bot_name: str,
+    bot_wxid: str | None = None,
+    batch: int = 20,
 ) -> list[sqlite3.Row]:
     """Live messages with no command_runs row yet. Trigger classification
     happens in Python (`_classify_trigger`) — most rows return None and get
@@ -1664,12 +1684,18 @@ def _next_unprocessed(
     its `stay_silent` tool. Quote rows are essential — reply-to-bot lives
     here.
 
-    `sender_display != bot_name` excludes the bot's own echoes (the
-    primary loop-prevention; cheap and good enough for v0). Once
-    bot_wxid is reliably known we could tighten this to wxid-based.
+    `sender_display != bot_name` excludes the bot's own echoes. When
+    bot_wxid is known, also exclude by wxid so group nickname changes do not
+    make the dispatcher process its own replies.
     """
+    own_wxid_clause = ""
+    params: list[object] = [bot_name]
+    if bot_wxid:
+        own_wxid_clause = "AND (m.sender_wxid IS NULL OR m.sender_wxid != ?)"
+        params.append(bot_wxid)
+    params.append(batch)
     return conn.execute(
-        """
+        f"""
         SELECT m.msg_id, m.group_id, m.group_name, m.t, m.type, m.content_text,
                m.sender_display, m.sender_wxid,
                m.quote_text, m.reply_to_wx_msg_id, m.wx_msg_id
@@ -1679,10 +1705,11 @@ def _next_unprocessed(
            AND m.type != 'system'
            AND r.msg_id IS NULL
            AND (m.sender_display IS NULL OR m.sender_display != ?)
+           {own_wxid_clause}
          ORDER BY m.t ASC
          LIMIT ?
         """,
-        (bot_name, batch),
+        params,
     ).fetchall()
 
 
@@ -1934,7 +1961,7 @@ def run_dispatcher() -> None:
         loops_since_wxid_retry = 0
         try:
             while True:
-                rows = _next_unprocessed(conn, settings.bot_name)
+                rows = _next_unprocessed(conn, settings.bot_name, bot_wxid=bot_wxid)
                 for row in rows:
                     if not _claim(conn, row["msg_id"]):
                         continue

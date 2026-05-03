@@ -48,16 +48,73 @@ class AgentRunResult:
     phase_b_trace: list[dict[str, Any]] | None  # None when reflection skipped
 
 
+@dataclass
+class ToolBudget:
+    """Phase A tool-call budget.
+
+    `None` or <=0 means unlimited for a given field. Counters live for one
+    agent run and are shared across steps.
+    """
+    max_per_run: int | None = None
+    max_per_step: int | None = None
+    max_image_reads: int | None = None
+    max_voice_reads: int | None = None
+    total_calls: int = 0
+    image_reads: int = 0
+    voice_reads: int = 0
+
+    @staticmethod
+    def _limited(limit: int | None) -> bool:
+        return limit is not None and limit > 0
+
+    def check_and_count(self, call: ToolCall, step_call_idx: int) -> str | None:
+        max_per_step = self.max_per_step
+        if self._limited(max_per_step) and step_call_idx >= max_per_step:
+            return f"tool budget exceeded: max {max_per_step} tool calls per step"
+        max_per_run = self.max_per_run
+        if self._limited(max_per_run) and self.total_calls >= max_per_run:
+            return f"tool budget exceeded: max {max_per_run} tool calls per run"
+        if call.name == "read_image":
+            max_image_reads = self.max_image_reads
+            if self._limited(max_image_reads) and self.image_reads >= max_image_reads:
+                return f"tool budget exceeded: max {max_image_reads} read_image calls per run"
+            self.image_reads += 1
+        elif call.name == "read_voice":
+            max_voice_reads = self.max_voice_reads
+            if self._limited(max_voice_reads) and self.voice_reads >= max_voice_reads:
+                return f"tool budget exceeded: max {max_voice_reads} read_voice calls per run"
+            self.voice_reads += 1
+        self.total_calls += 1
+        return None
+
+
 def _execute_tool_calls(
     tools: GroupScopedTools,
     calls: list[ToolCall],
     trace: list[dict[str, Any]],
     step_idx: int,
+    budget: ToolBudget | None = None,
 ) -> list[dict[str, Any]]:
     """Run every tool call in order, recording the result in `trace` and
     returning the list of `tool` role messages to feed back to the model."""
     tool_messages: list[dict[str, Any]] = []
-    for call in calls:
+    for step_call_idx, call in enumerate(calls):
+        if budget is not None:
+            budget_error = budget.check_and_count(call, step_call_idx)
+            if budget_error is not None:
+                trace.append({
+                    "step": step_idx,
+                    "kind": "tool_budget_exceeded",
+                    "tool": call.name,
+                    "error": budget_error,
+                })
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": budget_error,
+                })
+                continue
+
         try:
             args: dict[str, Any] = json.loads(call.arguments_json or "{}")
             if not isinstance(args, dict):
@@ -143,6 +200,7 @@ def run_phase_a(
     max_steps: int,
     temperature: float = 0.3,
     max_tokens: int | None = None,
+    tool_budget: ToolBudget | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Run the Phase A read-only loop. Returns `(reply_text, trace)`."""
     messages: list[dict[str, Any]] = [
@@ -168,7 +226,9 @@ def run_phase_a(
             # Special-case stay_silent BEFORE running it: terminate the loop
             # with reply=None even if other calls share this turn.
             silent = any(c.name == "stay_silent" for c in resp.tool_calls)
-            tool_msgs = _execute_tool_calls(tools, resp.tool_calls, trace, step)
+            tool_msgs = _execute_tool_calls(
+                tools, resp.tool_calls, trace, step, budget=tool_budget
+            )
             messages.extend(tool_msgs)
             if silent:
                 trace.append({"step": step, "kind": "terminate", "reason": "stay_silent"})
@@ -202,6 +262,7 @@ def run_phase_b(
     max_steps: int,
     temperature: float = 0.2,
     max_tokens: int | None = None,
+    tool_budget: ToolBudget | None = None,
 ) -> list[dict[str, Any]]:
     """Run the Phase B write-only loop. Returns the trace; no reply."""
     trace: list[dict[str, Any]] = []
@@ -238,7 +299,9 @@ def run_phase_b(
             trace.append({"step": step, "kind": "final", "content": resp.content})
             return trace
 
-        tool_msgs = _execute_tool_calls(write_tools, resp.tool_calls, trace, step)
+        tool_msgs = _execute_tool_calls(
+            write_tools, resp.tool_calls, trace, step, budget=tool_budget
+        )
         messages.extend(tool_msgs)
 
     trace.append({"step": max_steps, "kind": "max_steps_hit"})
@@ -259,6 +322,7 @@ def run_agent(
     reflection_enabled: bool,
     temperature: float = 0.3,
     max_tokens: int | None = None,
+    tool_budget: ToolBudget | None = None,
 ) -> AgentRunResult:
     """Convenience wrapper: run Phase A, then (if enabled) Phase B with the
     Phase A trace fed back in as the reflection input."""
@@ -271,6 +335,7 @@ def run_agent(
         max_steps=max_steps,
         temperature=temperature,
         max_tokens=max_tokens,
+        tool_budget=tool_budget,
     )
     phase_b_trace: list[dict[str, Any]] | None = None
     if reflection_enabled and write_tools is not None and phase_b_system:

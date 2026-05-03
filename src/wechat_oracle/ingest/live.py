@@ -271,6 +271,25 @@ def _resolve_sessions(client: httpx.Client, names: list[str]) -> list[tuple[str,
     return resolved
 
 
+def _resolve_all_group_sessions(client: httpx.Client) -> list[tuple[str, str | None]]:
+    """Return every group session WeFlow currently exposes via /api/v1/sessions.
+
+    This is the "watch all groups" mode for an empty WO_GROUPS. WeFlow's
+    sessions endpoint is the right source here because SSE events also carry
+    `sessionId` values from the same namespace.
+    """
+    resp = client.get("/api/v1/sessions", params={"limit": 10000}, timeout=30.0)
+    resp.raise_for_status()
+    sessions = resp.json().get("sessions", []) or []
+    groups = [
+        (s["username"], s.get("displayName"))
+        for s in sessions
+        if "@chatroom" in (s.get("username") or "")
+    ]
+    groups.sort(key=lambda item: item[1] or item[0])
+    return groups
+
+
 def _poll_session(
     client: httpx.Client,
     conn: sqlite3.Connection,
@@ -376,17 +395,20 @@ def _start_mm_worker_thread() -> threading.Thread:
 
 
 def run_live() -> None:
-    if not settings.groups:
-        logger.warning("settings.groups is empty; nothing to watch. Set WO_GROUPS=...")
-        return
-
     _start_mm_worker_thread()
     logger.info("mm worker thread started (OCR/ASR processing in background)")
 
     with _build_client() as client:
-        sessions = _resolve_sessions(client, settings.groups)
+        if settings.groups:
+            sessions = _resolve_sessions(client, settings.groups)
+        else:
+            sessions = _resolve_all_group_sessions(client)
+            logger.info(
+                "WO_GROUPS is empty; watching all {} group sessions exposed by WeFlow",
+                len(sessions),
+            )
         if not sessions:
-            raise RuntimeError("no resolvable sessions; check WO_GROUPS against WeFlow's session list")
+            raise RuntimeError("no group sessions found in WeFlow; check WeFlow login/API state")
 
         now = int(time.time())
         watermarks: dict[str, int] = {sid: now for sid, _ in sessions}

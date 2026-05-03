@@ -18,7 +18,7 @@ A local-first WeChat group-chat archiver with an LLM-backed in-group Q&A assista
   - `/ask <问题>` — 纯模型问答，不读取群聊上下文，省 token
   - `/explain` — 解释引用消息或给定文本
   - `/help` — 查命令
-  - **自由问答**（无 `/` 命令）：把最近 2500 条群消息当上下文，让 LLM 直接答
+  - **自由问答**（无 `/` 命令）：先看最近 200 条群消息，必要时由 agent 主动调工具查历史 / 看图 / 读语音
 - **本地优先**：消息、媒体、调试日志全在 `data/`，无云端依赖（除了 LLM API）
 
 ## 整体架构
@@ -88,7 +88,7 @@ uv sync
 ```env
 # WeFlow（必填）
 WO_WEFLOW_TOKEN=<WeFlow 设置 → API 服务里复制的 token>
-WO_GROUPS=<你要监听的群名>      # 群名 / 备注 / wxid，逗号分隔多个
+WO_GROUPS=                    # 空 = 监听 WeFlow 当前暴露的所有群聊；也可填群名 / 备注 / wxid，逗号分隔多个
 
 # Dispatcher（用群内问答时必填）
 WO_BOT_NAME=<小号在群里的群昵称>
@@ -106,7 +106,13 @@ WO_LLM_API_KEY=sk-...
 # WO_WHISPER_MODEL=small               # tiny|base|small|medium|large-v3，默认 small
 
 # Agent loop（@<bot> chat 路径，已默认启用）
-# WO_AGENT_BASE_PROBABILITY=0.0        # >0 让 bot 偶尔自主插话（默认 0 = 仅 @ 触发）
+# WO_AGENT_BASE_PROBABILITY=0.25       # >0 让 bot 偶尔自主插话；设 0 = 仅 @ / reply 触发
+# WO_AGENT_COOLDOWN_SECONDS=30         # bot 自己说完后这么久内不被概率触发
+# WO_AGENT_MAX_STEPS=5                 # Phase A 最多 LLM 决策轮数
+# WO_AGENT_MAX_TOOL_CALLS_PER_RUN=12   # Phase A 单次回答总工具调用预算
+# WO_AGENT_MAX_TOOL_CALLS_PER_STEP=4   # Phase A 单轮最多工具调用数
+# WO_AGENT_MAX_IMAGE_READS_PER_RUN=2   # 单次回答最多直读图片数
+# WO_AGENT_MAX_VOICE_READS_PER_RUN=2   # 单次回答最多读语音数
 # WO_AGENT_REFLECTION_ENABLED=True     # 关闭跳过 Phase B（不写任何 member/group/persona 笔记）
 ```
 
@@ -235,7 +241,7 @@ uv run wechat-oracle dispatcher
 @小号 张三最近在忙什么
 ```
 
-agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（默认 50）条群消息——比老路径的 2500 条小一个量级，token 开销低。要看更多历史就**主动调工具**：
+agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（默认 200）条群消息——比老路径的 2500 条小一个量级，token 开销低。要看更多历史就**主动调工具**：
 
 - `recall_group_history(query, since_days?, sender_wxid?)`：在本群历史里 substring 搜（`content_text` + `transcript` 都搜）
 - `view_quoted_chain(msg_id)` / `expand_forward_bundle(msg_id)`：跟引用链上溯 / 展开合并转发的子项
@@ -284,7 +290,7 @@ agent 在 Phase A 看到 `[图片]` 或 `[图片·OCR] <可疑残文>` 时可以
 
 **通用特性**：
 - **完全可插拔**：`WO_VISION_API_KEY` 为空时整个 vision 功能关闭。agent 调 `read_image` 会拿到一个明确的 `ToolError`（"vision 未配置，回退去 recall_group_history"）；`/explain` / `/ask` 引用图会降级到 `[图片]` 占位
-- **硬上限 `WO_VISION_MAX_IMAGES=3`**：单次 vision 请求最多附 3 张图（agent `read_image` 一次只送 1 张，但工具可被多次调用——这条是 vision client 层的最终兜底）
+- **硬上限 `WO_VISION_MAX_IMAGES=3`**：单次 vision 请求最多附 3 张图（agent `read_image` 一次只送 1 张；另有 `WO_AGENT_MAX_IMAGE_READS_PER_RUN` 控制单次回答最多读几张）
 - **降级安全**：图文件不存在 / 视觉调用失败 → ToolError 给 agent / 兜底文案给 /explain & /ask，用户能感知到失败但不会拿到瞎编内容
 - **只在用户明确问图或 agent 主动判断需要时起作用**：`/find` / `/sum` / `/recent` 不走视觉，永远纯文本
 
@@ -432,14 +438,14 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 `@<bot> <无 / 命令的文本>` → `ChatCommand` → `chat_via_agent` → `agent.runtime.run_agent`：
 
-**Phase A（read-only，最多 `WO_AGENT_MAX_STEPS`=10 步）**
+**Phase A（read-only，最多 `WO_AGENT_MAX_STEPS`=5 步）**
 
 1. 装配 system prompt：`agent/persona.py` 把 `data/personas/<group_id>.yaml`（静态人格核心）+ `persona_drift` 表（agent 自维护的演化补充）+ 操作规则（工具清单 + msg_id 整数约定 + 简短输出风格）拼起来
-2. 装配 user message：当前时间 + 触发原因 + 引用消息（如有）+ 最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（50）条群消息（每行 `[msg_id] (time) sender (wxid): 内容`）+ 用户对你说的话
-3. 进 tool-calling 循环：每步模型可以调一组只读工具（recall / view_quoted / expand_forward / read_image / read_voice / read_group_memory / stay_silent）或输出最终回复文字。每步的 tool name + args + result 都进 trace
+2. 装配 user message：当前时间 + 触发原因 + 引用消息（如有）+ 最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（200）条群消息（每行 `[msg_id] (time) sender (wxid): 内容`）+ 用户对你说的话
+3. 进 tool-calling 循环：每步模型可以调一组只读工具（recall / view_quoted / expand_forward / read_image / read_voice / read_group_memory / stay_silent）或输出最终回复文字。每步的 tool name + args + result 都进 trace；默认预算是总计 12 次、每步 4 次、图片/语音各 2 次
 4. 终态：模型输出文字 → 是回复；调 `stay_silent` → 标记沉默；用满步数 → 取最后一条 assistant content 兜底
 
-**Phase B（反思，`WO_AGENT_REFLECTION_ENABLED=True` 时；最多 `WO_AGENT_REFLECT_MAX_STEPS`=5 步）**
+**Phase B（反思，`WO_AGENT_REFLECTION_ENABLED=True` 时；最多 `WO_AGENT_REFLECT_MAX_STEPS`=3 步）**
 
 5. 模型看完整 Phase A trace + 最终回复，决定要不要 update 记忆。可调：读 `read_persona_drift` / `read_group_memory`（先读再写），写 `update_persona_drift`（替换） / `update_group_memory`（替换，100k 上限）
 6. 终态：模型输出空文本 = 不写；用满步数 = 强制结束。绝大部分对话 Phase B 应该 0 写入
@@ -453,14 +459,14 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 
 | kind | 条件 | cooldown |
 |---|---|---|
-| `mention` | `content_text` 含 `@<bot_name>` | 不受 cooldown 限制 |
+| `mention` | `content_text` 含真实 `@<bot_name>` mention（后面是空白或结尾，不把 `@<bot>x` 当命中） | 不受 cooldown 限制 |
 | `reply` | quote-reply 的 parent (`reply_to_wx_msg_id`→`wx_msg_id`) 是 bot 自己 | 不受 cooldown 限制 |
 | `probability` | 上面都不是 + `WO_AGENT_BASE_PROBABILITY > 0` 摇到 + 上次说话超过 `WO_AGENT_COOLDOWN_SECONDS` | **受 cooldown 限制** |
 | `None` | 上面都没命中 → `_finalize` 标 `(no-trigger)` 跳过，不烧 LLM | — |
 
 `mention` 走完整 `parse_command` 流程（slash 命令都能用，纯文本进 `ChatCommand`→agent）；`reply` / `probability` 直接进 agent loop（无 slash 解析），因为它们没有"命令语法"概念。
 
-reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` 配置（手填）；(2) **自动发现**——dispatcher 启动 + 每 5 个 poll 周期重试：`SELECT sender_wxid FROM messages WHERE sender_display=WO_BOT_NAME ...`。只要 WeFlow SSE 把 bot 自己的回复回流到 `messages` 表（生产路径上应该是），第一次回复后下一轮 poll 就发现了。回流不工作时 reply 触发降级（mention + probability 不受影响），日志里有清晰 warning。`uv run wechat-oracle verify roundtrip` 可以一键查这件事。
+reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` 配置（手填）；(2) **自动发现**——dispatcher 启动 + 每 5 个 poll 周期重试：`SELECT sender_wxid FROM messages WHERE sender_display=WO_BOT_NAME ...`。只要 WeFlow SSE 把 bot 自己的回复回流到 `messages` 表（生产路径上应该是），第一次回复后下一轮 poll 就发现了。回流不工作时 reply 触发降级（mention + probability 不受影响），日志里有清晰 warning。`uv run wechat-oracle verify roundtrip` 可以一键查这件事。wxid 已知后，dispatcher 也会在取未处理消息时按 `sender_wxid` 排除自己的回流，避免群昵称变化导致自触发。
 
 **隔离**：所有 SQL 写死 `WHERE group_id=?`，参数从 `GroupScopedTools.__init__` 锁定——`group_id` 不暴露给 LLM 当 tool 参数，从根上禁止跨群泄密。详见 `agent/tools.py`。
 
@@ -492,7 +498,7 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_DATA_DIR` | `data` | 数据根目录 |
 | `WO_DB_PATH` | `data/wechat-oracle.db` | SQLite 文件路径 |
 | `WO_MEDIA_DIR` | `data/media` | 媒体目录 |
-| `WO_GROUPS` | `[]` | 监听的群（群名 / 备注 / wxid，逗号或 JSON 数组） |
+| `WO_GROUPS` | `[]` | 监听的群（群名 / 备注 / wxid，逗号或 JSON 数组）；空 = 自动监听 WeFlow `/api/v1/sessions` 当前暴露的所有 `@chatroom` 群聊 |
 | `WO_LOG_LEVEL` | `INFO` | loguru 级别 |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API |
 | `WO_WEFLOW_TOKEN` | — | WeFlow access token |
@@ -519,14 +525,18 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_VISION_MAX_IMAGES` | `3` | 单次 vision 请求最多附几张图（防失控烧钱） |
 | `WO_VISION_MAX_TOKENS` | `800` | 视觉调用输出上限 |
 | `WO_WHISPER_MODEL` | `small` | `worker mm` 的 ASR 档位：`tiny`/`base`/`small`/`medium`/`large-v3`；越大越准越慢越占内存 |
-| `WO_AGENT_BASE_PROBABILITY` | `0.0` | 非 @ 触发时的概率门槛（v0 默认 0 = 仅 @ 触发；>0 让 bot 偶尔自主插话） |
-| `WO_AGENT_COOLDOWN_SECONDS` | `300` | bot 自己说完后这么久内不被概率触发 |
-| `WO_AGENT_MAX_STEPS` | `10` | Phase A（read-only tools）最多循环步数 |
-| `WO_AGENT_REFLECT_MAX_STEPS` | `5` | Phase B（write-only 反思）最多循环步数 |
+| `WO_AGENT_BASE_PROBABILITY` | `0.25` | 非 @ 触发时的概率门槛（0 = 仅 @ 触发；>0 让 bot 偶尔自主插话） |
+| `WO_AGENT_COOLDOWN_SECONDS` | `30` | bot 自己说完后这么久内不被概率触发 |
+| `WO_AGENT_MAX_STEPS` | `5` | Phase A（read-only tools）最多循环步数 |
+| `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Phase B（write-only 反思）最多循环步数 |
 | `WO_AGENT_REFLECTION_ENABLED` | `True` | 关闭后跳过 Phase B；不写任何 member/group/persona 笔记 |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | 静态人格 yaml 目录，每群一个 `<group_id>.yaml` |
-| `WO_AGENT_RECENT_CONTEXT_CHAT` | `50` | Phase A 初始 system prompt 注入的最近群消息条数 |
+| `WO_AGENT_RECENT_CONTEXT_CHAT` | `200` | Phase A 初始 system prompt 注入的最近群消息条数 |
 | `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | `group_memory` 单文档硬上限；超过 update_group_memory 抛 ToolError，agent 必须先压缩 |
+| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `12` | Phase A 单次回答总工具调用预算；超过后把预算错误喂回模型，让它基于已有信息回答 |
+| `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Phase A 单轮 LLM 决策最多执行几个工具 |
+| `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Phase A 单次回答最多执行几次 `read_image` |
+| `WO_AGENT_MAX_VOICE_READS_PER_RUN` | `2` | Phase A 单次回答最多执行几次 `read_voice` |
 
 ---
 

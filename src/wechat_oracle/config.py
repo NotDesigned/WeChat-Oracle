@@ -98,17 +98,21 @@ class Settings(BaseSettings):
     def short_max_tokens(self) -> int:
         return self.llm_short_max_tokens or min(self.llm_max_tokens, 800)
 
-    # Agent loop (multi-turn tool-calling chat path) — the only @<bot> chat
-    # path. Triggers: only @<bot> today; probability/reply hooks need wider
-    # integration in the dispatcher poll loop (future work).
-    agent_base_probability: float = 0.0       # 0 = mention-only; small >0 lets bot self-initiate
-    agent_cooldown_seconds: int = 300          # min seconds between bot's own utterances per group
-    agent_max_steps: int = 10                  # Phase A read-only loop cap
-    agent_reflect_max_steps: int = 5           # Phase B write-only loop cap
+    # Agent loop (multi-turn tool-calling chat path). Triggers are classified
+    # cheaply in dispatcher: direct @, quote-reply to bot, or optional
+    # probability wakeups.
+    agent_base_probability: float = 0.25      # 0 = mention-only; small >0 lets bot self-initiate
+    agent_cooldown_seconds: int = 30           # min seconds between bot's own utterances per group
+    agent_max_steps: int = 5                   # Phase A read-only loop cap
+    agent_reflect_max_steps: int = 3           # Phase B write-only loop cap
     agent_reflection_enabled: bool = True      # off → skip Phase B entirely
     agent_personas_dir: Path = Field(default=Path("data/personas"))
-    agent_recent_context_chat: int = 50        # initial recent-msg window for Phase A system prompt
+    agent_recent_context_chat: int = 200       # initial recent-msg window for Phase A system prompt
     agent_memory_max_chars: int = 100_000      # group_memory hard cap; agent must compact when full
+    agent_max_tool_calls_per_run: int = 12      # Phase A total tool-call budget
+    agent_max_tool_calls_per_step: int = 4      # Phase A per-LLM-turn tool-call budget
+    agent_max_image_reads_per_run: int = 2      # expensive read_image budget
+    agent_max_voice_reads_per_run: int = 2      # expensive read_voice budget
 
     # Send the dispatcher's result back into the WeChat group. False = local-
     # only (stdout + log). True = use the backend below.
