@@ -70,10 +70,14 @@ class Settings(BaseSettings):
 
     # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
     # long-context chat/summaries breathe while keeping short utility commands cheap.
+    # Memory-write paths (Phase B / lurk) need their own bigger budget because the
+    # update_group_memory tool call wraps multi-KB notes_text as a JSON arg, which
+    # easily blows a 5K cap mid-string and produces "Unterminated string" tool errors.
     llm_max_tokens: int = 5000
     llm_chat_max_tokens: int | None = None
     llm_sum_max_tokens: int | None = None
     llm_short_max_tokens: int | None = None
+    llm_write_max_tokens: int | None = 10_000
 
     # Vision LLM — optional second-pass for `@<bot>` chat when the text model
     # asks to see original images via `<NEED_IMAGES>` sentinel. Empty api_key
@@ -98,6 +102,10 @@ class Settings(BaseSettings):
     @property
     def short_max_tokens(self) -> int:
         return self.llm_short_max_tokens or self.llm_max_tokens
+
+    @property
+    def write_max_tokens(self) -> int:
+        return self.llm_write_max_tokens or self.llm_max_tokens
 
     # Agent loop (multi-turn tool-calling chat path). Triggers are classified
     # cheaply in dispatcher: direct @, quote-reply to bot, or optional

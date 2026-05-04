@@ -96,7 +96,8 @@ WO_LLM_API_KEY=sk-...
 # WO_LLM_ENDPOINT=https://api.deepseek.com
 # WO_LLM_MODEL=deepseek-v4-pro
 # WO_DISPATCHER_WORKER_THREADS=4       # 全局并行 worker 数；wx4py GUI 发送强制走单 sender 队列
-# WO_LLM_MAX_TOKENS=5000               # 默认输出上限；chat/sum/short 可分别覆盖
+# WO_LLM_MAX_TOKENS=5000               # 默认输出上限；chat/sum/short/write 可分别覆盖
+# WO_LLM_WRITE_MAX_TOKENS=10000        # Phase B / lurk 写记忆专用上限；写大段 notes_text 容易超 5K
 # WO_REPLY=0                           # 默认 1 = 自动回到群里；0 = 只本地输出
 
 # 视觉模型（可选 — 让 chat / /explain / /ask 能读图原文，详见「视觉模型集成」段）
@@ -530,6 +531,7 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_LLM_CHAT_MAX_TOKENS` | — | 自由问答输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
 | `WO_LLM_SUM_MAX_TOKENS` | — | `/sum` 输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
 | `WO_LLM_SHORT_MAX_TOKENS` | — | `/ask` / `/explain` 输出上限；不设则用 `WO_LLM_MAX_TOKENS` |
+| `WO_LLM_WRITE_MAX_TOKENS` | `10000` | Phase B / lurk 写记忆专用输出上限；写 `update_group_memory` 时 JSON-wrap 多 KB notes_text 容易撞 5K 上限触发 "Unterminated string" 错误，所以默认更高；不设则用 `WO_LLM_MAX_TOKENS` |
 | `WO_REPLY` | `True` | 是否自动回群里 |
 | `WO_REPLY_BACKEND` | `wx4py` | 回复通道：`wx4py`（UI 自动化，默认）/ `stdout`（不发）。openclaw 实测不可用，见下方「实验记录」段 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | dispatcher 扫 DB 间隔（秒） |

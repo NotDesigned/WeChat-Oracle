@@ -154,7 +154,10 @@ class UpdateGroupMemoryTool(Tool):
                 "read_group_memory must be called immediately before update_group_memory"
             )
         if _text_hash(previous) != self.session.group_memory_hash:
-            self.session.group_memory_hash = _text_hash(previous)
+            # Invalidate the snapshot so a blind retry without re-read
+            # cannot pass the check (and would clobber the concurrent write).
+            # Forces the model to call read_group_memory again before retrying.
+            self.session.group_memory_hash = None
             raise ToolError(
                 "group_memory changed since you read it. Call read_group_memory again, "
                 "merge your update with the current text, then retry."
@@ -219,7 +222,10 @@ class UpdatePersonaDriftTool(Tool):
                 "read_persona_drift must be called immediately before update_persona_drift"
             )
         if _text_hash(previous) != self.session.persona_hash:
-            self.session.persona_hash = _text_hash(previous)
+            # Invalidate the snapshot so a blind retry without re-read
+            # cannot pass the check (and would clobber the concurrent write).
+            # Forces the model to call read_persona_drift again before retrying.
+            self.session.persona_hash = None
             raise ToolError(
                 "persona_drift changed since you read it. Call read_persona_drift again, "
                 "merge your update with the current text, then retry."

@@ -359,6 +359,7 @@ def chat_via_agent(
         reflection_enabled=settings.agent_reflection_enabled,
         temperature=0.5,
         max_tokens=settings.chat_max_tokens,
+        write_max_tokens=settings.write_max_tokens,
         tool_budget=ToolBudget(
             max_per_run=settings.agent_max_tool_calls_per_run,
             max_per_step=settings.agent_max_tool_calls_per_step,
@@ -523,7 +524,7 @@ def chat_via_lurk(
         tools=lurk_tools,
         max_steps=settings.agent_lurk_max_steps,
         temperature=0.2,
-        max_tokens=settings.chat_max_tokens,
+        max_tokens=settings.write_max_tokens,
         tool_budget=ToolBudget(max_per_run=settings.agent_lurk_max_steps * 3, max_per_step=3),
     )
     finished_at = time.time()

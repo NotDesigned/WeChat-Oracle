@@ -436,10 +436,16 @@ def run_agent(
     reflection_enabled: bool,
     temperature: float = 0.3,
     max_tokens: int | None = None,
+    write_max_tokens: int | None = None,
     tool_budget: ToolBudget | None = None,
 ) -> AgentRunResult:
     """Convenience wrapper: run Phase A, then (if enabled) Phase B with the
-    Phase A trace fed back in as the reflection input."""
+    Phase A trace fed back in as the reflection input.
+
+    `max_tokens` caps Phase A (chat reply). `write_max_tokens` caps Phase B
+    (memory write); falls back to `max_tokens` when not given. The split
+    matters because Phase B emits the full new memory document as a JSON
+    arg and easily blows a small token cap mid-string."""
     reply, phase_a_trace = run_phase_a(
         llm=llm,
         model=model,
@@ -461,6 +467,7 @@ def run_agent(
             reply_text=reply,
             write_tools=write_tools,
             max_steps=reflect_max_steps,
+            max_tokens=write_max_tokens or max_tokens,
         )
     return AgentRunResult(
         reply_text=reply,
