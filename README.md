@@ -155,6 +155,8 @@ uv run wechat-oracle dispatcher
 
 ## 命令详解
 
+> 调用方式：以下例子里的 `@小号` 是把 bot @ 出来；**也可以省略 @ 直接发 `/<命令>`**——bot 会识别消息开头的已知 slash 命令并响应（详见上面「触发」段）。`@<bot>` 也支持出现在消息任意位置（`你看 @<bot> 这个`），mention token 会被剥掉、剩余部分进 ChatCommand。
+
 ### `/find` — 语义检索
 
 ```
@@ -481,7 +483,11 @@ lurk 的模型输入是“新观察到的一批消息”，同时可按需调用
 | `probability` | 上面都不是 + `WO_AGENT_BASE_PROBABILITY > 0` 摇到 + 上次说话超过 `WO_AGENT_COOLDOWN_SECONDS` | **受 cooldown 限制** |
 | `None` | 上面都没命中 → `_finalize` 标 `(no-trigger)` 跳过，不烧 LLM | — |
 
-`mention` 走完整 `parse_command` 流程（slash 命令都能用，纯文本进 `ChatCommand`→agent）；`reply` / `probability` 直接进 agent loop（无 slash 解析），因为它们没有"命令语法"概念。
+`mention` 走完整 `parse_command` 流程（slash 命令都能用，纯文本进 `ChatCommand`→agent）；`reply` / `probability` 直接进 agent loop。
+
+**slash 命令现在不需要 `@<bot>` 也能跑**——`_try_parse_slash` 在 trigger 分类**之前**先看消息开头是不是 `/<已知命令>`（`COMMANDS` registry 里的），命中就直接 dispatch，绕过 mention/reply/probability 分类和 cooldown。这覆盖三种以前漏掉的入口：(1) quote-reply 到 bot 同时写 `/ask X`（无 @）；(2) 在群里直接打 `/find xxx`（无 @、无 reply）；(3) 任意地方插入 `@<bot>` + slash 都能 work。未知 slash（`/typo`、`/foo`）和带 `@<bot>` 的格式错误命令照旧——前者静默忽略（不刷屏），后者通过 mention 路径进 `parse_command` 并报 `ParseError` + 帮助。
+
+**`@<bot>` 现在可以出现在消息任意位置**——以前只匹配 mention 后面的内容，现在 mention token 会被剥掉、剩余部分整体进 ChatCommand 或 slash。例如 `"你看 @<bot> 这个问题"` 会把 `"你看  这个问题"` 喂给 ChatCommand；`"问题 @<bot>"` 会把 `"问题"` 喂过去；`"@<bot>"` 单独出现仍然走 `MENTION_NO_BODY` stub。
 
 reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` 配置（手填）；(2) **自动发现**——dispatcher 启动 + 每 5 个 poll 周期重试：`SELECT sender_wxid FROM messages WHERE sender_display=WO_BOT_NAME ...`。只要 WeFlow SSE 把 bot 自己的回复回流到 `messages` 表（生产路径上应该是），第一次回复后下一轮 poll 就发现了。回流不工作时 reply 触发降级（mention + probability 不受影响），日志里有清晰 warning。`uv run wechat-oracle verify roundtrip` 可以一键查这件事。wxid 已知后，dispatcher 也会在取未处理消息时按 `sender_wxid` 排除自己的回流，避免群昵称变化导致自触发。
 

@@ -804,17 +804,23 @@ def parse_command(content_text: str | None, bot_name: str) -> Command | ParseErr
     ParseError  — `@<bot> /<known>` but args malformed, OR `@<bot> /<unknown>`
     Command     — `@<bot> /<known> <args>` parsed cleanly,
                   OR `@<bot> <free text>` → ChatCommand fallback
+
+    The `@<bot>` mention may appear ANYWHERE in the message, not just at the
+    start. Body is the message text with the mention token removed; surrounding
+    text on both sides is preserved so e.g. "你看看 @<bot> 这个问题" hands
+    "你看看  这个问题" to ChatCommand.
+
+    `@<bot>` must be terminated by whitespace or end-of-string so substring
+    `@<bot>x` (a different nick that happens to start with the bot's name)
+    is not treated as a ping.
     """
     if not content_text or not bot_name:
         return None
-    # Match `@<bot>` followed by whitespace and any body. The `\s+` requires
-    # at least one whitespace separator so substring `@<bot>x` (without space)
-    # is not treated as a ping.
-    pattern = rf"@{re.escape(bot_name)}\s+(.+?)$"
-    m = re.search(pattern, content_text, re.DOTALL)
-    if not m:
+    mention_re = rf"@{re.escape(bot_name)}(?=\s|$)"
+    if not re.search(mention_re, content_text):
         return None
-    body = m.group(1).strip()
+    # Strip the @<bot> token(s); keep everything else.
+    body = re.sub(mention_re, "", content_text).strip()
     if not body:
         return None
 
@@ -831,6 +837,41 @@ def parse_command(content_text: str | None, bot_name: str) -> Command | ParseErr
 
     # Fallback: free-form @<bot> question/topic → ChatCommand
     return ChatCommand.parse(body)
+
+
+def _try_parse_slash(content_text: str | None) -> Command | None:
+    """Detect a known slash command at the start of `content_text` (after
+    stripping leading whitespace), with NO `@<bot>` mention required.
+
+    Lets a user invoke `/ask`, `/find`, etc. by:
+      - quote-replying to the bot and writing `/ask X` (no @-mention)
+      - typing `/find xyz` in conversation (no @-mention, no reply)
+      - the existing `@<bot> /ask X` mention path also still works
+        through `parse_command`; this helper returns None when text
+        starts with `@`, so the mention path keeps its semantics.
+
+    Returns the parsed `Command` for clean `/<known_cmd> [args]`. Returns
+    `None` for: empty text, no leading slash, unknown command name, or a
+    known command whose args fail to parse. Quiet on errors so that random
+    `/foo` typed in conversation doesn't spam help into the group —
+    explicit `@<bot> /xxx` still routes through `parse_command` which DOES
+    surface ParseError to the user (preserves the old mention-path UX).
+    """
+    body = (content_text or "").strip()
+    if not body.startswith("/"):
+        return None
+    cm = re.match(r"/(\S+)\s*(.*?)$", body, re.DOTALL)
+    if not cm:
+        return None
+    cmd_name = cm.group(1)
+    args = cm.group(2) or ""
+    cmd_cls = COMMANDS.get(cmd_name)
+    if cmd_cls is None:
+        return None
+    parsed = cmd_cls.parse(args)
+    if isinstance(parsed, ParseError):
+        return None
+    return parsed
 
 
 def _parse_since(s: str) -> int | None:
@@ -1464,19 +1505,40 @@ def _process(
     vision: VisionLLM | None = None,
     bot_wxid: str | None = None,
 ) -> None:
-    """Trigger-classify the row, then route:
-      - 'mention'     → parse_command (slash commands run; bare text → ChatCommand → agent)
-      - 'reply'       → straight to chat_via_agent with the quoted text inlined
-      - 'probability' → straight to chat_via_agent with no question prompt
-      - None          → silently finalize (most messages — bot stays out of group chatter)
+    """Route this row to a slash command or to the agent.
+
+    Two-stage routing:
+      1. **Slash detection** (`_try_parse_slash`) runs FIRST regardless of
+         trigger classification. If text starts with `/<known_cmd>`, dispatch
+         it — works without `@<bot>` mention, so quote-replies-to-bot with
+         `/ask X`, or bare `/find xxx` typed into the group, both reach the
+         right command. Bypasses cooldown (slash commands are explicit user
+         intent).
+      2. **Trigger classification** (`_classify_trigger`) for the rest:
+         - 'mention'     → `parse_command` (slash via `@<bot>` still works
+                           there; bare `@<bot> text` → ChatCommand → agent)
+         - 'reply'       → straight to chat_via_agent with the quoted text
+         - 'probability' → straight to chat_via_agent with no question
+         - None          → silently finalize (most messages — bot stays
+                           out of group chatter)
     """
     msg_id = row["msg_id"]
     requester = row["sender_display"] or row["sender_wxid"]
     now = time.time()
-    kind = _classify_trigger(conn, row, settings.bot_name, bot_wxid, now)
-    if kind is None:
-        _finalize(conn, msg_id, "ok", "(no-trigger)")
-        return
+
+    # Stage 1: standalone slash command? `_try_parse_slash` is silent on
+    # unknown commands / parse errors, so non-slash text or random "/foo"
+    # falls through to classification. `@<bot> /xxx` bodies start with @
+    # so they fall through too — handled by the existing mention path's
+    # `parse_command` (which preserves help-on-error UX for explicit pings).
+    slash_cmd = _try_parse_slash(row["content_text"])
+
+    kind: str | None = None
+    if slash_cmd is None:
+        kind = _classify_trigger(conn, row, settings.bot_name, bot_wxid, now)
+        if kind is None:
+            _finalize(conn, msg_id, "ok", "(no-trigger)")
+            return
 
     quoted_text = None
     quoted_msg_id = None
@@ -1508,15 +1570,20 @@ def _process(
         bot_wxid=bot_wxid,
     )
 
+    if slash_cmd is not None:
+        _run_command(conn, replier, row, ctx, slash_cmd, log_path, now)
+        return
+
     if kind != "mention":
         # reply / probability: skip slash-command parsing, jump straight to
         # the agent. The user's text is the trigger context itself.
         _process_agent_only(conn, replier, row, ctx, log_path, kind)
         return
 
-    # 'mention' path: keep the existing parse_command flow so /find /sum etc.
-    # all still work. Bare `@<bot> <text>` falls into ChatCommand which runs
-    # the agent loop too — same agent, just dispatched through Command.
+    # 'mention' path: keep the existing parse_command flow so `@<bot> /xxx`
+    # surfaces ParseError on malformed args. Bare `@<bot> <text>` falls into
+    # ChatCommand which runs the agent loop too — same agent, just dispatched
+    # through Command.
     parsed = parse_command(row["content_text"], settings.bot_name)
     if parsed is None:
         # @<bot> mention without a body in this message — common when WeChat
@@ -1534,6 +1601,22 @@ def _process(
         _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
         return
 
+    _run_command(conn, replier, row, ctx, parsed, log_path, now)
+
+
+def _run_command(
+    conn: sqlite3.Connection,
+    replier: "Replier",
+    row: sqlite3.Row,
+    ctx: "CommandContext",
+    parsed: "Command",
+    log_path: Path,
+    now: float,
+) -> None:
+    """Execute a parsed Command, dump stdout / log, send chat reply, finalize.
+    Shared by the standalone slash path and the @<bot> mention path."""
+    msg_id = row["msg_id"]
+    requester = row["sender_display"] or row["sender_wxid"]
     try:
         result = parsed.execute(ctx)
     except Exception as e:
