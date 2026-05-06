@@ -273,7 +273,7 @@ uv run wechat-oracle dispatcher
 @小号 张三最近在忙什么
 ```
 
-agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（默认 200）条群消息——比老路径的 2500 条小一个量级，token 开销低。要看更多历史就**主动调工具**：
+agent 看到的「初始上下文」只有最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（默认 100）条群消息——比老路径的 2500 条小一个量级，token 开销低。要看更多历史就**主动调工具**：
 
 - `recall_group_history(query, since_days?, sender_wxid?)`：在本群历史里 substring 搜（`content_text` + `transcript` 都搜）
 - `view_quoted_chain(msg_id)` / `expand_forward_bundle(msg_id)`：跟引用链上溯 / 展开合并转发的子项
@@ -473,7 +473,7 @@ LLM (system prompt 强调字面命中必算 + 同时返回 keywords)
 **Phase A（read-only，最多 `WO_AGENT_MAX_STEPS`=5 步）**
 
 1. 装配 system prompt：`agent/persona.py` 把 `data/personas/<group_id>.yaml`（静态人格核心）+ `persona_drift` 表（agent 自维护的演化补充）+ 操作规则（工具清单 + msg_id 整数约定 + 简短输出风格）拼起来
-2. 装配 user message：当前时间 + 触发原因 + 引用消息（如有）+ 最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（200）条群消息（每行 `[msg_id] (time) sender (wxid): 内容`）+ 用户对你说的话
+2. 装配 user message：当前时间 + 触发原因 + 引用消息（如有）+ 最近 `WO_AGENT_RECENT_CONTEXT_CHAT`（100）条群消息（每行 `[msg_id] (time) sender (wxid): 内容`）+ 用户对你说的话
 3. 进 tool-calling 循环：每步模型可以调一组只读工具（recall / view_quoted / expand_forward / read_image / read_voice / read_group_memory / stay_silent）或输出最终回复文字。每步的 tool name + args + result 都进 trace；默认预算是总计 12 次、每步 4 次、图片/语音各 2 次
 4. 终态：模型输出文字 → 是回复；调 `stay_silent` → 标记沉默；用满步数 → 取最后一条 assistant content 兜底
 
@@ -503,7 +503,7 @@ lurk 的模型输入是“新观察到的一批消息”，同时可按需调用
 |---|---|---|
 | `mention` | `content_text` 含真实 `@<bot_name>` mention（后面是空白或结尾，不把 `@<bot>x` 当命中） | 不受 cooldown 限制 |
 | `reply` | quote-reply 的 parent (`reply_to_wx_msg_id`→`wx_msg_id`) 是 bot 自己 | 不受 cooldown 限制 |
-| `probability` | 上面都不是 + `WO_AGENT_BASE_PROBABILITY > 0` 摇到 + 上次说话超过 `WO_AGENT_COOLDOWN_SECONDS` | **受 cooldown 限制** |
+| `probability` | 上面都不是 + 类型属于 `text` / `quote` / 已识别出 `transcript` 的 `image`/`voice` + `WO_AGENT_BASE_PROBABILITY > 0` 摇到 + 上次说话超过 `WO_AGENT_COOLDOWN_SECONDS` | **受 cooldown 限制** |
 | `None` | 上面都没命中 → `_finalize` 标 `(no-trigger)` 跳过，不烧 LLM | — |
 
 `mention` 走完整 `parse_command` 流程（slash 命令都能用，纯文本进 `ChatCommand`→agent）；`reply` / `probability` 直接进 agent loop。
@@ -584,7 +584,7 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Phase B（write-only 反思）最多循环步数 |
 | `WO_AGENT_REFLECTION_ENABLED` | `True` | 关闭后跳过 Phase B；不写任何 member/group/persona 笔记 |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | 静态人格 yaml 目录，每群一个 `<group_id>.yaml` |
-| `WO_AGENT_RECENT_CONTEXT_CHAT` | `200` | Phase A 初始 system prompt 注入的最近群消息条数 |
+| `WO_AGENT_RECENT_CONTEXT_CHAT` | `100` | Phase A 初始 system prompt 注入的最近群消息条数 |
 | `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | `group_memory` 单文档硬上限；超过 update_group_memory 抛 ToolError，agent 必须先压缩 |
 | `WO_AGENT_LURK_ENABLED` | `False` | 开启 dispatcher 内置后台学习调度；使用独立 lurk worker，不占聊天 worker，不走 wx4py |
 | `WO_AGENT_LURK_INTERVAL_SECONDS` | `1800` | 自动 lurk 扫描间隔（秒） |

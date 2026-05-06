@@ -45,7 +45,7 @@ from ..config import settings
 from ..db import transaction
 from ..llm import LLMClient, OpenClawChatCompletions
 from ..log_utils import append_log, dump_llm_call
-from .memory import get_group_memory, insert_run_log, link_last_run_id
+from .memory import insert_run_log, link_last_run_id
 from .persona import assemble_system_prompts
 from .runtime import ToolBudget, run_agent, run_lurk_reflection
 from .tools import GroupScopedTools
@@ -626,7 +626,6 @@ def _chat_via_lurk_openclaw(
     sends the same reflection task as one chat-completions turn and lets
     OpenClaw perform any `update_*` calls internally.
     """
-    group_memory = get_group_memory(conn, group_id).strip()
     openclaw_contract = f"""
 
 ---
@@ -637,13 +636,16 @@ OpenClaw lurk contract:
 - bot_name: {bot_name}
 - Every WeChat-Oracle MCP tool requires this exact group_id. Never invent,
   omit, or substitute a different group_id.
-- Read before write; when updating group memory/persona, write back the full
+- Group memory / persona are not pre-loaded into this prompt. **By default,
+  call read_group_memory at the start of the pass** — lurk decisions almost
+  always depend on what's already remembered (so you can merge / compress /
+  avoid duplicates). Only skip when the new batch is obviously trivial
+  (pure stickers, system events, etc.) and you already plan to write nothing.
+  Before any update_* write, also read the table you are about to overwrite —
+  both tables are full-replace, so read first, then write back the full
   merged text.
 - Do not answer the chat. Return an empty assistant message after any useful
   memory/persona updates are done.
-
-Current group_memory snapshot:
-{group_memory or "(empty)"}
 """
     system_prompt = lurk_system + openclaw_contract
     client = OpenClawChatCompletions(
