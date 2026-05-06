@@ -254,7 +254,7 @@ dispatcher 会分类每条新的 live 消息：
 | `probability` | 不是 mention/reply，通过类型门槛、随机阈值和 cooldown。 | agent 自己决定说话或 `stay_silent`。 |
 | none | 没有触发。 | 不调用 LLM，消息标记为 no-trigger。 |
 
-直接 @ 和引用回复 bot 会先发送一条简短的收到提示，然后再运行 agent。
+直接 @ 和引用回复 bot 会直接运行 agent。只有当 agent 返回非空回复时，bot 才会在群里发送消息。
 
 native agent 分两阶段：
 

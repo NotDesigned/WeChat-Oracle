@@ -254,7 +254,7 @@ The dispatcher classifies each new live message:
 | `probability` | Not mention/reply, passes type gate, random threshold, and cooldown. | Agent decides whether to speak or `stay_silent`. |
 | none | No trigger. | No LLM call; message is finalized as no-trigger. |
 
-Direct mention and reply-to-bot triggers first send a short acknowledgement before running the agent.
+Direct mention and reply-to-bot triggers run the agent directly. The bot sends a group reply only if the agent returns a non-empty response.
 
 The native agent has two phases:
 
