@@ -170,16 +170,33 @@ REPLY_EMPTY_FALLBACK = "（用户引用了你之前的话但没说什么）"
 # PERSONA
 # ---------------------------------------------------------------------------
 
+# OCR/ASR fallback rule. Reused by both Phase A ops rules (native path) and
+# the openclaw_contract (openclaw path) so the policy stays single-source.
+# Triggered when recent_block contains rows whose body was filled from
+# `transcript` rather than `content_text` — the formatter prefixes those
+# with `[图片·OCR]` / `[语音·ASR]` / `[视频·识别]` / `[表情·OCR]` so the
+# agent can spot them.
+READ_IMAGE_OCR_FALLBACK = (
+    "看到 [图片·OCR] / [语音·ASR] / [视频·识别] 这种识别行时，**默认偏向调用 "
+    "read_image / read_voice 读原图**——除非识别文字明显完整、能独立支撑回答"
+    "（比如纯文字截图清晰摘下来），否则就读原图再回答。"
+    "数学公式、图表、长截图、手写笔记这类 OCR 通常只摘到几段碎片，"
+    "看到这种一定要 read_image。"
+)
+
 # Operational rules appended to every Phase A system prompt. Tool signatures
 # come via the OpenAI tools= parameter — re-listing them here would waste
 # tokens. Style prescriptions deliberately removed; let `persona_drift` learn
 # what fits this group rather than baking in a prior.
-PHASE_A_OPS_RULES = """\
-约定：context 里方括号 [N] 的数字就是 msg_id（整数）；群 ID 不用传，工具内部已锁定本群。
-
-回答只写正文，不要 @ 任何人；发送层会自动 @ 触发者。不要使用 markdown。
-
-不知道该不该说话就调 stay_silent。群友的对话不必每条都接。"""
+PHASE_A_OPS_RULES = (
+    "约定：context 里方括号 [N] 的数字就是 msg_id（整数）；群 ID 不用传，工具内部已锁定本群。\n"
+    "\n"
+    "回答只写正文，不要 @ 任何人；发送层会自动 @ 触发者。不要使用 markdown。\n"
+    "\n"
+    "不知道该不该说话就调 stay_silent。群友的对话不必每条都接。\n"
+    "\n"
+    + READ_IMAGE_OCR_FALLBACK
+)
 
 # Default identity sentence when persona yaml has no identity field.
 # Placeholders: {group}, {bot_name}

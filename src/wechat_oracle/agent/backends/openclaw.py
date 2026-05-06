@@ -201,6 +201,7 @@ OpenClaw runtime contract:
   or a one-line acknowledgement). Also call read_persona_drift / read_group_memory
   before any update_* write — both tables are full-replace, so read first,
   then write back the full merged text.
+- {prompts.READ_IMAGE_OCR_FALLBACK}
 - To stay silent, return an empty assistant message.
 """
     return persona_prompt + openclaw_contract, user_msg

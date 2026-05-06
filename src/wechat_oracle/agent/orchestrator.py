@@ -91,14 +91,44 @@ def _format_recent_for_agent(
         sender = r["sender_display"] or r["sender_wxid"] or "?"
         wxid = r["sender_wxid"] or "?"
         ts = datetime.fromtimestamp(int(r["t"])).strftime("%Y-%m-%d %H:%M")
-        body = r["content_text"] or r["transcript"] or f"[{r['type']}]"
-        body = body.replace("\n", " ").strip()
+        body = _render_recent_body(r)
         self_tag = " [自己]" if bot_wxid and wxid == bot_wxid else ""
         quote_suffix = _quote_suffix_for_row(r)
         out.append(
             f"[{r['msg_id']}] {ts}{self_tag} {sender} ({wxid}): {body}{quote_suffix}"
         )
     return "\n".join(out) if out else prompts.CHAT_RECENT_EMPTY
+
+
+# Source-of-body markers when the row was filled from OCR/ASR rather than
+# user-typed text. Mirrors `dispatcher.fetch_candidates` SQL CASE so the
+# agent and chat paths show the same shape (CLAUDE.md F15). Without these
+# markers the agent can't distinguish OCR fragments from real user text and
+# the `READ_IMAGE_OCR_FALLBACK` rule has nothing to trigger on.
+_TRANSCRIPT_PREFIX = {
+    "image":   "[图片·OCR] ",
+    "voice":   "[语音·ASR] ",
+    "video":   "[视频·识别] ",
+    "sticker": "[表情·OCR] ",
+}
+
+
+def _render_recent_body(r: sqlite3.Row) -> str:
+    """One-line body for a recent_block row.
+
+    Priority: explicit `content_text` (user-typed or live's pre-formatted
+    placeholder like `[图片]`) > `transcript` with type-specific OCR/ASR
+    prefix > bare `[<type>]` placeholder. Newlines collapse to spaces so a
+    single message stays on one line.
+    """
+    content = r["content_text"]
+    if content:
+        return content.replace("\n", " ").strip()
+    transcript = r["transcript"]
+    if transcript:
+        prefix = _TRANSCRIPT_PREFIX.get(r["type"], f"[{r['type']}·识别] ")
+        return prefix + transcript.replace("\n", " ").strip()
+    return f"[{r['type']}]"
 
 
 def _quote_suffix_for_row(r: sqlite3.Row) -> str:
