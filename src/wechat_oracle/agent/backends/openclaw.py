@@ -21,7 +21,7 @@ from ...db import transaction
 from ...llm import OpenClawChatCompletions
 from ...log_utils import dump_llm_call
 from ..media_paths import openclaw_quoted_hint, resolve_quoted_msg_meta
-from ..memory import get_group_memory, insert_run_log
+from ..memory import insert_run_log
 from ..orchestrator import (
     _fetch_recent_for_agent,
     _format_recent_for_agent,
@@ -131,7 +131,6 @@ def _build_messages(
         ctx.conn, ctx.group_id, settings.agent_recent_context_chat
     )
     recent_block = _format_recent_for_agent(recent_rows, bot_wxid=ctx.bot_wxid)
-    group_memory = get_group_memory(ctx.conn, ctx.group_id).strip()
     persona_prompt, _ = assemble_system_prompts(
         conn=ctx.conn,
         group_id=ctx.group_id,
@@ -191,12 +190,16 @@ OpenClaw runtime contract:
   omit, or substitute a different group_id.
 - MCP tools already enforce group isolation. If a tool returns no data for this
   group_id, treat that as no data for this group.
-- You may update group memory/persona through MCP when the current turn reveals
-  stable reusable facts. Read before write; write back the full merged text.
+- Group memory / persona are not pre-loaded into this prompt. **By default,
+  call read_group_memory at the start of the turn** — it carries the group's
+  ongoing context, member profiles, internal jokes, and prior decisions, and
+  most replies depend on at least one of those. Only skip the call when the
+  question is obviously self-contained and clearly does not need group context
+  (e.g., a pure factual lookup the model can answer from general knowledge,
+  or a one-line acknowledgement). Also call read_persona_drift / read_group_memory
+  before any update_* write — both tables are full-replace, so read first,
+  then write back the full merged text.
 - To stay silent, return an empty assistant message.
-
-Current group_memory snapshot:
-{group_memory or "(empty)"}
 """
     return persona_prompt + openclaw_contract, user_msg
 

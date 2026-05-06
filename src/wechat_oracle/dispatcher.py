@@ -1427,6 +1427,21 @@ def _classify_trigger(
     p = settings.agent_base_probability
     if p <= 0.0:
         return None
+    # Type gate: an empty random wake-up burns the entire system prompt + recent
+    # window for one decision, so only let substantive types in. text/quote
+    # carry the user's actual words; image/voice qualify only once OCR/ASR has
+    # produced a non-empty transcript. Stickers, raw image/voice (no
+    # transcript yet), video, link cards, forward bundles, etc. wait for an
+    # explicit @mention or quote-reply instead.
+    msg_type = row["type"]
+    if msg_type in ("text", "quote"):
+        pass
+    elif msg_type in ("image", "voice"):
+        transcript = (row["transcript"] or "").strip() if "transcript" in row.keys() else ""
+        if not transcript:
+            return None
+    else:
+        return None
     if random.random() >= p:
         return None
     # Won the dice roll. Atomically check + reserve cooldown.
@@ -1496,7 +1511,7 @@ def _next_unprocessed(
     return conn.execute(
         f"""
         SELECT m.msg_id, m.group_id, m.group_name, m.t, m.type, m.content_text,
-               m.sender_display, m.sender_wxid,
+               m.transcript, m.sender_display, m.sender_wxid,
                m.quote_text, m.reply_to_wx_msg_id, m.wx_msg_id
           FROM messages m
      LEFT JOIN command_runs r ON r.msg_id = m.msg_id

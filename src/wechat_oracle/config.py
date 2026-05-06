@@ -116,7 +116,7 @@ class Settings(BaseSettings):
     agent_reflect_max_steps: int = 3           # Phase B write-only loop cap
     agent_reflection_enabled: bool = True      # off → skip Phase B entirely
     agent_personas_dir: Path = Field(default=Path("data/personas"))
-    agent_recent_context_chat: int = 200       # initial recent-msg window for Phase A system prompt
+    agent_recent_context_chat: int = 100       # initial recent-msg window for Phase A system prompt
     agent_memory_max_chars: int = 100_000      # group_memory hard cap; agent must compact when full
     agent_max_tool_calls_per_run: int = 12      # Phase A total tool-call budget
     agent_max_tool_calls_per_step: int = 4      # Phase A per-LLM-turn tool-call budget
