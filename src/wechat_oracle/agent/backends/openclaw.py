@@ -113,11 +113,6 @@ class OpenClawBackend:
                 parsed={"phase_a_trace": phase_a_trace, "usage": resp.usage},
             )
 
-        logger.info(
-            "openclaw agent :: trigger={} msg_id={} reply_len={} dur={:.1f}s",
-            trigger_kind, ctx.trigger_msg_id, len(reply_text or ""),
-            finished_at - started_at,
-        )
         return reply_text, _format_trace_for_log(phase_a_trace, [])
 
 

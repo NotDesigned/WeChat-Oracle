@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_display      TEXT,           -- 群昵称 / 备注 / 微信昵称, in that priority
     t                   INTEGER NOT NULL,  -- unix seconds, UTC
     type                TEXT NOT NULL,     -- text|image|voice|video|link|forward|quote|sticker|system
-    content_text        TEXT,           -- raw text; for media filled by mm worker via OCR/ASR
+    content_text        TEXT,           -- normalized visible text, card preview, or media placeholder
     media_path          TEXT,           -- relative path under media/ (content-addressed)
     reply_to_wx_msg_id  TEXT,           -- parent's wx_msg_id when this is a quote/reply
     quote_text          TEXT,           -- snippet of quoted msg, when wxauto can't resolve parent id

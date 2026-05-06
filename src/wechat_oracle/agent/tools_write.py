@@ -26,6 +26,7 @@ from typing import Any
 
 from .. import prompts
 from ..config import settings
+from ..log_utils import append_event
 from .memory import (
     get_group_memory,
     get_persona_drift,
@@ -164,6 +165,13 @@ class UpdateGroupMemoryTool(Tool):
             )
         upsert_group_memory(self.conn, self.group_id, text)
         self.session.group_memory_hash = _text_hash(text)
+        append_event(
+            "memory.write",
+            group_id=self.group_id,
+            table="group_memory",
+            prev_len=len(previous),
+            new_len=len(text),
+        )
         return (
             f"group_memory updated. prev_len={len(previous)} new_len={len(text)} "
             f"({len(text)*100//cap}% of cap)"
@@ -232,6 +240,13 @@ class UpdatePersonaDriftTool(Tool):
             )
         upsert_persona_drift(self.conn, self.group_id, text)
         self.session.persona_hash = _text_hash(text)
+        append_event(
+            "memory.write",
+            group_id=self.group_id,
+            table="persona_drift",
+            prev_len=len(previous),
+            new_len=len(text),
+        )
         return (
             f"persona drift updated. prev_len={len(previous)} new_len={len(text)}"
         )

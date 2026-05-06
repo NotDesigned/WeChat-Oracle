@@ -22,12 +22,37 @@ needed — that's the whole point of this file.
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Protocol
 
 from loguru import logger
 
 from .config import settings
+
+
+def _configure_wx4py_loggers() -> None:
+    level = getattr(logging, settings.wx4py_log_level.upper(), logging.WARNING)
+    for name in (
+        "wx4py",
+        "wx4py.client",
+        "wx4py.core",
+        "wx4py.core.window",
+        "wx4py.features",
+        "wx4py.features.chat",
+    ):
+        logging.getLogger(name).setLevel(level)
+
+
+def _with_wx4py_info_suppressed(fn):
+    if settings.wx4py_log_level.upper() in ("DEBUG", "INFO"):
+        return fn()
+    old_disable = logging.root.manager.disable
+    logging.disable(logging.INFO)
+    try:
+        return fn()
+    finally:
+        logging.disable(old_disable)
 
 
 # Four-per-em space — WeChat displays this after a selected @ mention.
@@ -58,6 +83,10 @@ class Replier(Protocol):
 
     def send(self, group_name: str | None, requester: str | None, text: str) -> None: ...
     def disconnect(self) -> None: ...
+
+
+class ReplySendError(RuntimeError):
+    """Raised when a replier can prove the outgoing message was not delivered."""
 
 
 # ---- stdout (always-available fallback) -----------------------------------
@@ -93,16 +122,18 @@ class Wx4pyReplier:
 
     def send(self, group_name: str | None, requester: str | None, text: str) -> None:
         if not group_name:
-            return
+            raise ReplySendError("missing group name")
         text = _strip_leading_requester_mention(text, requester)
         if requester and self._send_group_mention(group_name, requester, text):
             return
 
         body = f"@{requester}{_AT_SEP}{text}" if requester else text
         try:
-            self._wx.chat_window.send_to(group_name, body, target_type="group")
+            sent = self._wx.chat_window.send_to(group_name, body, target_type="group")
         except Exception as e:
-            logger.warning("wx4py send_to failed (group={!r}): {}", group_name, e)
+            raise ReplySendError(f"wx4py send_to failed for {group_name!r}: {e}") from e
+        if not sent:
+            raise ReplySendError(f"wx4py send_to returned false for {group_name!r}")
 
     def _send_group_mention(self, group_name: str, requester: str, text: str) -> bool:
         """Send a real WeChat group @ mention.
@@ -153,7 +184,6 @@ class Wx4pyReplier:
                     return False
             edit.SendKeys("{Enter}")
             time.sleep(0.3)
-            logger.info("wx4py sent real @ mention to requester={!r}", requester)
             return True
         except Exception as e:
             logger.warning(
@@ -209,14 +239,17 @@ class Wx4pyReplier:
     def try_connect(cls) -> Replier | None:
         """Returns a connected Wx4pyReplier or None if wx4py is unhappy.
         Caller decides whether to fall back to stdout."""
+        _configure_wx4py_loggers()
         try:
             from wx4py import WeChatClient
         except ImportError:
             logger.warning("wx4py not installed; can't use wx4py backend")
             return None
+        _configure_wx4py_loggers()
         try:
-            wx = WeChatClient()
-            wx.connect()
+            wx = _with_wx4py_info_suppressed(WeChatClient)
+            _configure_wx4py_loggers()
+            _with_wx4py_info_suppressed(wx.connect)
         except Exception as e:
             logger.warning(
                 "wx4py connect failed ({}); replies disabled this run. "

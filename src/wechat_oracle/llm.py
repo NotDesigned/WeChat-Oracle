@@ -225,7 +225,7 @@ class OpenClawChatCompletions:
                 self._url,
                 headers={"Authorization": f"Bearer {self._token}"},
                 json=payload,
-                timeout=180.0,
+                timeout=settings.openclaw_timeout_seconds,
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:

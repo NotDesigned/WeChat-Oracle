@@ -22,7 +22,13 @@ from typing import Any
 from loguru import logger
 
 from ..models import Message, MsgType
-from .forwarded import FORWARD_LOCAL_TYPE, base_local_type, parse_record_xml
+from .forwarded import (
+    appmsg_subtype,
+    base_local_type,
+    format_appmsg_content,
+    parse_quote_reply_xml,
+    parse_record_xml,
+)
 from .media_store import (
     MEDIA_MISSING_TAGS as _MEDIA_MISSING_TAGS,
     MEDIA_TYPES as _MEDIA_TYPES,
@@ -65,17 +71,22 @@ _WEFLOW_LOCAL_TYPE_MAP: dict[int, MsgType] = {
 }
 
 def _classify(raw: dict[str, Any]) -> MsgType | None:
-    """Quotes/replies override the localType-based mapping.
+    """Classify a WeFlow export row into our normalized message type.
 
-    WeFlow encodes appmsg subtype in the high 32 bits of localType. We mask
-    those off for the type table lookup, but preserve subtype 19 (合并转发)
-    by mapping it explicitly to MsgType.FORWARD before the generic 49→LINK fall.
+    WeFlow encodes appmsg subtype in the high 32 bits of localType. Match the
+    live path's classification here so historical imports and live capture
+    produce the same type for 49.* app messages.
     """
     if raw.get("quotedContent") or raw.get("replyToMessageId"):
         return MsgType.QUOTE
     lt = raw.get("localType")
-    if lt == FORWARD_LOCAL_TYPE:
+    sub = appmsg_subtype(lt)
+    if sub == 19:
         return MsgType.FORWARD
+    if sub == 57:
+        return MsgType.QUOTE
+    if sub is not None:
+        return MsgType.LINK
     return _WEFLOW_LOCAL_TYPE_MAP.get(base_local_type(lt))
 
 
@@ -93,6 +104,10 @@ def _convert_weflow_message(
     content = raw.get("content")
     media_path: str | None = None
     content_text: str | None = None
+    quote_text: str | None = None
+    reply_to_wx_msg_id: str | None = None
+    sub = appmsg_subtype(raw.get("localType"))
+
     if msg_type in _MEDIA_TYPES:
         ref = _parse_media_ref(content)
         if ref is None:
@@ -103,6 +118,24 @@ def _convert_weflow_message(
             )
             if media_path is None:
                 content_text = _MEDIA_MISSING_TAGS[msg_type]
+    elif msg_type is MsgType.FORWARD:
+        content_text = content
+    elif msg_type is MsgType.QUOTE:
+        parsed = parse_quote_reply_xml(raw.get("rawContent"))
+        if parsed:
+            content_text = parsed.content or None
+            quote_text = parsed.quote_text or raw.get("quotedContent")
+            reply_to_wx_msg_id = parsed.quote_msg_id or (
+                str(raw["replyToMessageId"]) if raw.get("replyToMessageId") else None
+            )
+        else:
+            content_text = content
+            quote_text = raw.get("quotedContent")
+            reply_to_wx_msg_id = (
+                str(raw["replyToMessageId"]) if raw.get("replyToMessageId") else None
+            )
+    elif sub is not None:
+        content_text = format_appmsg_content(raw.get("rawContent"), sub) or content
     else:
         content_text = content
 
@@ -129,8 +162,8 @@ def _convert_weflow_message(
         type=msg_type,
         content_text=content_text,
         media_path=media_path,
-        reply_to_wx_msg_id=str(raw["replyToMessageId"]) if raw.get("replyToMessageId") else None,
-        quote_text=raw.get("quotedContent"),
+        reply_to_wx_msg_id=reply_to_wx_msg_id,
+        quote_text=quote_text,
         source="backfill",
         forwarded_items=forwarded_items,
     )

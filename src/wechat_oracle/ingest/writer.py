@@ -12,11 +12,13 @@ so re-running an import is idempotent end-to-end.
 """
 
 import sqlite3
+from collections import Counter
 from collections.abc import Iterable
 
 from loguru import logger
 
 from ..db import transaction
+from ..log_utils import append_event
 from ..models import ForwardedItem, Message
 
 INSERT_SQL = """
@@ -114,10 +116,27 @@ def write_messages(
         nonlocal inserted, fwd_inserted
         if not batch_msgs:
             return
+        batch_attempted = len(batch_msgs)
+        by_source = Counter(m.source for m in batch_msgs)
+        by_type = Counter(m.type.value for m in batch_msgs)
+        by_group = Counter(m.group_id for m in batch_msgs)
         with transaction(conn):
             cur = conn.executemany(INSERT_SQL, [_row(m) for m in batch_msgs])
-            inserted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-            fwd_inserted += _write_forwarded_for_batch(conn, batch_msgs)
+            batch_inserted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            batch_fwd_inserted = _write_forwarded_for_batch(conn, batch_msgs)
+            inserted += batch_inserted
+            fwd_inserted += batch_fwd_inserted
+        append_event(
+            "ingest.write_batch",
+            attempted=batch_attempted,
+            inserted=batch_inserted,
+            duplicates=batch_attempted - batch_inserted,
+            forwarded_items=batch_fwd_inserted,
+            source=dict(by_source),
+            type=dict(by_type),
+            groups=len(by_group),
+            top_groups=dict(by_group.most_common(5)),
+        )
         batch_msgs.clear()
 
     for msg in messages:

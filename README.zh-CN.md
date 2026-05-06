@@ -112,6 +112,7 @@ WO_AGENT_BACKEND=openclaw
 WO_OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 WO_OPENCLAW_TOKEN=<gateway-token>
 WO_OPENCLAW_AGENT_ID=<your-agent-id>
+WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
 
 然后运行：
@@ -308,6 +309,7 @@ WO_AGENT_BACKEND=openclaw
 WO_OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 WO_OPENCLAW_TOKEN=<gateway-token>
 WO_OPENCLAW_AGENT_ID=<your-agent-id>
+WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
 
 ## 真实微信 @
@@ -332,6 +334,8 @@ transcript 状态：
 如果配置了 `WO_VISION_API_KEY`，agent chat 和 `/explain` / `/ask` 可以把被引用的图片发送给视觉模型直接读取。否则图片处理会回退到 OCR 文本和占位符。
 
 ## 数据模型
+
+完整的消息入库契约，包括 WeFlow `localType` 处理、app-message subtype、媒体归档、引用/合并转发归一，以及 LLM 可见渲染规则，见 [docs/message-model.zh-CN.md](docs/message-model.zh-CN.md)。
 
 关键表：
 
@@ -361,6 +365,7 @@ transcript 状态：
 | `WO_MEDIA_DIR` | `data/media` | 媒体目录。 |
 | `WO_GROUPS` | `[]` | 空表示所有 WeFlow 群会话；接受逗号字符串或 JSON list。 |
 | `WO_LOG_LEVEL` | `INFO` | loguru level。 |
+| `WO_WX4PY_LOG_LEVEL` | `WARNING` | wx4py 内部 Python logging 级别；只有排查 UI 自动化时才建议设为 `INFO`。 |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root。 |
 | `WO_WEFLOW_TOKEN` | empty | WeFlow token。 |
 | `WO_WEFLOW_POLL_INTERVAL` | `30.0` | 已废弃；live 使用 SSE。 |
@@ -406,6 +411,7 @@ transcript 状态：
 | `WO_OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | OpenClaw gateway。 |
 | `WO_OPENCLAW_TOKEN` | empty | OpenClaw gateway token。 |
 | `WO_OPENCLAW_AGENT_ID` | `wechat-bot` | OpenClaw agent id。 |
+| `WO_OPENCLAW_TIMEOUT_SECONDS` | `300` | OpenClaw gateway 请求超时时间。 |
 | `WO_AGENT_BACKEND` | `native` | `native` 或 `openclaw`。 |
 | `WO_REPLY` | `True` | 是否把回复发回微信。 |
 | `WO_REPLY_BACKEND` | `wx4py` | `wx4py` 或 `stdout`。 |
@@ -416,6 +422,9 @@ transcript 状态：
 
 - `data/dispatcher.log`：紧凑的人类可读命令与 agent trace。
 - `data/llm_debug.log`：LLM prompt、原始回复、解析结果和完整 trace。
+- `data/events.jsonl`：轻量、机器可读的生命周期事件，覆盖入库 batch、触发判断、命令/agent 运行、native 工具调用、记忆写入和回复发送。排查“为什么触发/没触发”或“延迟花在哪里”时优先看它，不必先翻完整 prompt。
+- `data/*.process.log`：长跑进程的 loguru 轮转日志，例如 `live` 和 `dispatcher`。
+- `data/openclaw.log` / `data/mcp.log`：OpenClaw gateway 调用和 MCP 工具调用的 JSONL 审计日志。
 - `wx4py_send_audit.jsonl`：wx4py 产生的发送审计记录。
 
 常用检查：

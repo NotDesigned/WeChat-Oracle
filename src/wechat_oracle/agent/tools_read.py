@@ -26,31 +26,19 @@ from typing import Any
 
 from .. import prompts
 from ..llm import VisionLLM
+from ..message_render import format_time, one_line, render_message_line
 from .media_paths import resolve_media_path_for_msg
 from .memory import get_group_memory
 from .tools import Tool, ToolError, ToolSpec, truncate_for_llm
 
 
-_FMT = "%Y-%m-%d %H:%M"
-
-
 def _fmt_t(t: int | None) -> str:
-    if t is None:
-        return "?"
-    return datetime.fromtimestamp(t).strftime(_FMT)
+    return format_time(t)
 
 
 def _fmt_msg_row(row: sqlite3.Row) -> str:
-    """One line per message. Uses content_text + transcript fallback for
-    media; falls back to the type tag when neither has content."""
-    sender = row["sender_display"] or row["sender_wxid"] or "?"
-    body = row["content_text"]
-    if not body:
-        body = row["transcript"]
-    if not body:
-        body = f"[{row['type']}]"
-    body = body.replace("\n", " ").strip()
-    return f"[{row['msg_id']}] {_fmt_t(row['t'])} {sender}: {body}"
+    """One line per message using the shared LLM-visible body renderer."""
+    return render_message_line(row, style="tool", id_style="bare")
 
 
 # --- recall_group_history --------------------------------------------------
@@ -111,37 +99,81 @@ class RecallGroupHistoryTool(Tool):
             limit = 20
         limit = min(limit, 50)
 
-        clauses = ["group_id = ?"]
+        clauses = ["m.group_id = ?"]
         params: list[Any] = [self.group_id]
 
         if query.strip():
-            clauses.append("(content_text LIKE ? OR transcript LIKE ?)")
+            clauses.append("(m.content_text LIKE ? OR m.transcript LIKE ?)")
             like = f"%{query.strip()}%"
             params.extend([like, like])
 
         if isinstance(since_days, int) and since_days > 0:
             cutoff = int(datetime.now().timestamp()) - since_days * 86400
-            clauses.append("t >= ?")
+            clauses.append("m.t >= ?")
             params.append(cutoff)
 
-        if isinstance(sender_wxid, str) and sender_wxid.strip():
-            clauses.append("sender_wxid = ?")
+        sender_filter_active = isinstance(sender_wxid, str) and bool(sender_wxid.strip())
+        if sender_filter_active:
+            clauses.append("m.sender_wxid = ?")
             params.append(sender_wxid.strip())
 
         sql = (
-            "SELECT msg_id, t, type, sender_wxid, sender_display, "
-            "content_text, transcript "
-            "FROM messages WHERE " + " AND ".join(clauses)
-            + " ORDER BY t DESC LIMIT ?"
+            "SELECT m.msg_id, m.t, m.type, m.sender_wxid, m.sender_display, "
+            "m.content_text, m.transcript, m.quote_text, "
+            "p.msg_id AS parent_msg_id, p.type AS parent_type, "
+            "p.sender_display AS parent_sender, p.sender_wxid AS parent_sender_wxid "
+            "FROM messages m "
+            "LEFT JOIN messages p "
+            "ON m.reply_to_wx_msg_id IS NOT NULL "
+            "AND p.wx_msg_id = m.reply_to_wx_msg_id "
+            "AND p.group_id = m.group_id "
+            "WHERE " + " AND ".join(clauses)
+            + " ORDER BY m.t DESC LIMIT ?"
         )
         params.append(limit)
         rows = self.conn.execute(sql, params).fetchall()
 
-        if not rows:
+        fwd_rows: list[sqlite3.Row] = []
+        if not sender_filter_active:
+            fwd_clauses = ["m.group_id = ?", "f.content IS NOT NULL", "f.content <> ''"]
+            fwd_params: list[Any] = [self.group_id]
+            if query.strip():
+                fwd_clauses.append("f.content LIKE ?")
+                fwd_params.append(f"%{query.strip()}%")
+            if isinstance(since_days, int) and since_days > 0:
+                cutoff = int(datetime.now().timestamp()) - since_days * 86400
+                fwd_clauses.append("f.t >= ?")
+                fwd_params.append(cutoff)
+            fwd_sql = (
+                "SELECT f.id, f.t, f.sender_display, f.content, "
+                "m.msg_id AS parent_msg_id "
+                "FROM forwarded_records f "
+                "JOIN messages m ON m.msg_id = f.parent_msg_id "
+                "WHERE " + " AND ".join(fwd_clauses)
+                + " ORDER BY f.t DESC LIMIT ?"
+            )
+            fwd_params.append(limit)
+            fwd_rows = self.conn.execute(fwd_sql, fwd_params).fetchall()
+
+        if not rows and not fwd_rows:
             return "no matches"
-        # Reverse to chronological order (oldest first) for the LLM.
-        lines = [_fmt_msg_row(r) for r in reversed(rows)]
-        header = f"{len(rows)} match(es):"
+        items: list[tuple[int, str]] = [
+            (int(r["t"]), _fmt_msg_row(r)) for r in rows
+        ]
+        items.extend(
+            (
+                int(r["t"]),
+                f"[f:{r['id']}] {_fmt_t(r['t'])} "
+                f"{r['sender_display'] or '?'}: {one_line(r['content'])}"
+                f" [来自合并转发 m:{r['parent_msg_id']}]",
+            )
+            for r in fwd_rows
+        )
+        items.sort(key=lambda item: item[0])
+        if len(items) > limit:
+            items = items[-limit:]
+        lines = [line for _, line in items]
+        header = f"{len(lines)} match(es):"
         return truncate_for_llm("\n".join([header, *lines]))
 
 
@@ -187,9 +219,20 @@ class ViewQuotedChainTool(Tool):
                 break
             seen.add(current_id)
             row = self.conn.execute(
-                "SELECT msg_id, wx_msg_id, t, type, sender_wxid, sender_display, "
-                "content_text, transcript, reply_to_wx_msg_id, quote_text "
-                "FROM messages WHERE msg_id=? AND group_id=?",
+                """
+                SELECT m.msg_id, m.wx_msg_id, m.t, m.type, m.sender_wxid,
+                       m.sender_display, m.content_text, m.transcript,
+                       m.reply_to_wx_msg_id, m.quote_text,
+                       p.msg_id AS parent_msg_id, p.type AS parent_type,
+                       p.sender_display AS parent_sender,
+                       p.sender_wxid AS parent_sender_wxid
+                  FROM messages m
+             LEFT JOIN messages p
+                    ON m.reply_to_wx_msg_id IS NOT NULL
+                   AND p.wx_msg_id = m.reply_to_wx_msg_id
+                   AND p.group_id = m.group_id
+                 WHERE m.msg_id=? AND m.group_id=?
+                """,
                 (current_id, self.group_id),
             ).fetchone()
             if row is None:

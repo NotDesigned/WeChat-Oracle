@@ -35,8 +35,10 @@ from loguru import logger
 
 _DISPATCHER_LOG_LOCK = threading.Lock()
 _LLM_DEBUG_LOG_LOCK = threading.Lock()
+_EVENT_LOG_LOCK = threading.Lock()
 _DISPATCHER_LOG_MAX_BYTES = 10 * 1024 * 1024
 _LLM_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB rotate threshold
+_EVENT_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 
 def append_log(log_path: Path, command_t: int, block: str) -> None:
@@ -95,6 +97,34 @@ def dump_llm_call(
         parts.append("")  # trailing newline
         with log_path.open("a", encoding="utf-8") as f:
             f.write("\n".join(parts))
+
+
+def append_event(event: str, **fields: Any) -> None:
+    """Append one lightweight machine-readable lifecycle event.
+
+    This is the cross-cutting index line for normal operation: small JSONL
+    records that link ingest, trigger decisions, agent runs, tool summaries,
+    memory writes, and reply attempts by shared identifiers (`msg_id`,
+    `run_id`, `group_id`). It intentionally does not duplicate prompts,
+    full tool results, or memory payloads; those stay in llm_debug.log /
+    agent_run_log / mcp.log.
+    """
+    try:
+        from .config import settings
+
+        settings.ensure_dirs()
+        log_path = settings.data_dir / "events.jsonl"
+        entry: dict[str, Any] = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "event": event,
+        }
+        entry.update({k: v for k, v in fields.items() if v is not None})
+        with _EVENT_LOG_LOCK:
+            _maybe_rotate(log_path, _EVENT_LOG_MAX_BYTES)
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception as e:
+        logger.warning("failed to append event log {}: {}", event, e)
 
 
 _PROCESS_SINK_NAMES: set[str] = set()

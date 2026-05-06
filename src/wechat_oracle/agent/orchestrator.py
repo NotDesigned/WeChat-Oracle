@@ -44,7 +44,8 @@ from .. import prompts
 from ..config import settings
 from ..db import transaction
 from ..llm import LLMClient, OpenClawChatCompletions
-from ..log_utils import append_log, dump_llm_call
+from ..log_utils import append_event, append_log, dump_llm_call
+from ..message_render import render_message_line
 from .memory import insert_run_log, link_last_run_id
 from .persona import assemble_system_prompts
 from .runtime import ToolBudget, run_agent, run_lurk_reflection
@@ -86,81 +87,17 @@ def _format_recent_for_agent(
     missed by live) render as `[引用→未入库：<snippet>]` so the agent knows
     not to bother trying to fetch them.
     """
-    out: list[str] = []
-    for r in rows:
-        sender = r["sender_display"] or r["sender_wxid"] or "?"
-        wxid = r["sender_wxid"] or "?"
-        ts = datetime.fromtimestamp(int(r["t"])).strftime("%Y-%m-%d %H:%M")
-        body = _render_recent_body(r)
-        self_tag = " [自己]" if bot_wxid and wxid == bot_wxid else ""
-        quote_suffix = _quote_suffix_for_row(r)
-        out.append(
-            f"[{r['msg_id']}] {ts}{self_tag} {sender} ({wxid}): {body}{quote_suffix}"
+    out = [
+        render_message_line(
+            r,
+            style="agent",
+            id_style="bare",
+            include_wxid=True,
+            self_wxid=bot_wxid,
         )
+        for r in rows
+    ]
     return "\n".join(out) if out else prompts.CHAT_RECENT_EMPTY
-
-
-# Source-of-body markers when the row was filled from OCR/ASR rather than
-# user-typed text. Mirrors `dispatcher.fetch_candidates` SQL CASE so the
-# agent and chat paths show the same shape (CLAUDE.md F15). Without these
-# markers the agent can't distinguish OCR fragments from real user text and
-# the `READ_IMAGE_OCR_FALLBACK` rule has nothing to trigger on.
-_TRANSCRIPT_PREFIX = {
-    "image":   "[图片·OCR] ",
-    "voice":   "[语音·ASR] ",
-    "video":   "[视频·识别] ",
-    "sticker": "[表情·OCR] ",
-}
-
-
-def _render_recent_body(r: sqlite3.Row) -> str:
-    """One-line body for a recent_block row.
-
-    Priority: explicit `content_text` (user-typed or live's pre-formatted
-    placeholder like `[图片]`) > `transcript` with type-specific OCR/ASR
-    prefix > bare `[<type>]` placeholder. Newlines collapse to spaces so a
-    single message stays on one line.
-    """
-    content = r["content_text"]
-    if content:
-        return content.replace("\n", " ").strip()
-    transcript = r["transcript"]
-    if transcript:
-        prefix = _TRANSCRIPT_PREFIX.get(r["type"], f"[{r['type']}·识别] ")
-        return prefix + transcript.replace("\n", " ").strip()
-    return f"[{r['type']}]"
-
-
-def _quote_suffix_for_row(r: sqlite3.Row) -> str:
-    """Render the `[引用→...]` tail for a row. Empty string when the row
-    isn't a quote-reply or the source query didn't include the join columns.
-
-    Tolerates both shapes: rows fetched by `_fetch_recent_for_agent` /
-    `_fetch_lurk_window` (which carry parent_msg_id / parent_type) and any
-    legacy caller that still supplies bare `messages.*` columns.
-    """
-    if r["type"] != "quote":
-        return ""
-    try:
-        parent_msg_id = r["parent_msg_id"]
-        parent_type = r["parent_type"]
-    except (IndexError, KeyError):
-        # Caller didn't request the join columns; degrade silently.
-        return ""
-    snippet = ""
-    try:
-        qt = r["quote_text"]
-    except (IndexError, KeyError):
-        qt = None
-    if qt:
-        snippet = qt.replace("\n", " ").strip()
-    if parent_msg_id is None:
-        return f" [引用→未入库：{snippet}]" if snippet else " [引用→未入库]"
-    pt = parent_type or "?"
-    return (
-        f" [引用→m:{parent_msg_id} {pt}：{snippet}]"
-        if snippet else f" [引用→m:{parent_msg_id} {pt}]"
-    )
 
 
 def _trace_step_line(s: dict[str, Any]) -> str:
@@ -199,6 +136,23 @@ def _trace_step_line(s: dict[str, Any]) -> str:
         return f"  step{step} ✗ {s.get('tool') or '?'} CRASHED: {(s.get('error') or '?')[:120]}"
     if kind == "tool_budget_exceeded":
         return f"  step{step} ✗ BUDGET: {(s.get('error') or '?')[:120]}"
+    if kind == "openclaw_call":
+        args = s.get("args") or {}
+        usage = args.get("usage") if isinstance(args, dict) else None
+        usage_part = ""
+        if isinstance(usage, dict):
+            prompt = usage.get("prompt_tokens")
+            completion = usage.get("completion_tokens")
+            total = usage.get("total_tokens")
+            if prompt is not None or completion is not None or total is not None:
+                usage_part = (
+                    f" usage=prompt:{prompt or 0} "
+                    f"completion:{completion or 0} total:{total or 0}"
+                )
+        return (
+            f"  step{step} ⇄ openclaw agent={args.get('agent_id') or '?'} "
+            f"dur={float(args.get('duration_s') or 0):.1f}s{usage_part}"
+        )
     if kind == "empty_final_retry":
         return f"  step{step} ↻ empty final → nudge → retry"
     if kind == "max_steps_hit":
@@ -248,7 +202,9 @@ def _fetch_recent_for_agent(
         SELECT m.msg_id, m.t, m.type, m.sender_wxid, m.sender_display,
                m.content_text, m.transcript, m.quote_text,
                p.msg_id   AS parent_msg_id,
-               p.type     AS parent_type
+               p.type     AS parent_type,
+               p.sender_display AS parent_sender,
+               p.sender_wxid    AS parent_sender_wxid
           FROM messages m
      LEFT JOIN messages p
             ON m.reply_to_wx_msg_id IS NOT NULL
@@ -280,7 +236,9 @@ def _fetch_lurk_window(
         SELECT m.msg_id, m.t, m.type, m.sender_wxid, m.sender_display,
                m.content_text, m.transcript, m.quote_text,
                p.msg_id   AS parent_msg_id,
-               p.type     AS parent_type
+               p.type     AS parent_type,
+               p.sender_display AS parent_sender,
+               p.sender_wxid    AS parent_sender_wxid
           FROM messages m
      LEFT JOIN messages p
             ON m.reply_to_wx_msg_id IS NOT NULL
@@ -489,6 +447,21 @@ def chat_via_agent(
                     touched_persona=touched_persona,
                     touched_memory=touched_memory,
                 )
+            append_event(
+                "agent.audit_written",
+                run_id=run_id,
+                msg_id=ctx.trigger_msg_id,
+                group_id=ctx.group_id,
+                group_name=ctx.group_name,
+                trigger_kind=trigger_kind,
+                phase_a_steps=len(result.phase_a_trace),
+                phase_b_steps=len(result.phase_b_trace or []),
+                memory_written=touched_memory,
+                persona_written=touched_persona,
+                reply_chars=len(result.reply_text or ""),
+                silent=result.reply_text is None,
+                duration_ms=round((finished_at - started_at) * 1000, 3),
+            )
     except Exception:
         logger.exception("failed to write agent_run_log; agent reply still returned")
 

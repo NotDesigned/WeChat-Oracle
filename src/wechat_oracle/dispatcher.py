@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import abc
 import json
+import logging
 import queue
 import random
 import re
@@ -60,7 +61,8 @@ from .llm import (
     build_llm_client,
     build_vision_client,
 )
-from .log_utils import append_log, dump_llm_call
+from .log_utils import append_event, append_log, dump_llm_call
+from .message_render import render_message_body, render_quote_suffix
 from .replier import Replier, build_replier
 
 
@@ -95,6 +97,14 @@ class ExecResult:
     stdout: str
     chat: str
     summary: str  # short status saved to command_runs.result
+
+
+@dataclass
+class TriggerDecision:
+    kind: str | None
+    reason: str
+    probability: float | None = None
+    cooldown_remaining_s: float | None = None
 
 
 @dataclass
@@ -385,8 +395,43 @@ class ChatCommand(Command):
         chat='' (the silent signal honored by `_process`) when the agent
         chose stay_silent. Full trace in `agent_run_log`; readable trace
         block lands in dispatcher.log via stdout."""
-        reply, trace_block = get_agent_backend().chat(
-            ctx=ctx, user_question=self.message, trigger_kind="mention",
+        started = time.time()
+        append_event(
+            "agent.start",
+            msg_id=ctx.trigger_msg_id,
+            group_id=ctx.group_id,
+            group_name=ctx.group_name,
+            sender=ctx.requester,
+            trigger_kind="mention",
+        )
+        try:
+            reply, trace_block = get_agent_backend().chat(
+                ctx=ctx, user_question=self.message, trigger_kind="mention",
+            )
+        except Exception as e:
+            append_event(
+                "agent.end",
+                msg_id=ctx.trigger_msg_id,
+                group_id=ctx.group_id,
+                group_name=ctx.group_name,
+                sender=ctx.requester,
+                trigger_kind="mention",
+                status="error",
+                duration_ms=round((time.time() - started) * 1000, 3),
+                error=f"{type(e).__name__}: {e}",
+            )
+            raise
+        append_event(
+            "agent.end",
+            msg_id=ctx.trigger_msg_id,
+            group_id=ctx.group_id,
+            group_name=ctx.group_name,
+            sender=ctx.requester,
+            trigger_kind="mention",
+            status="ok",
+            duration_ms=round((time.time() - started) * 1000, 3),
+            reply_chars=len(reply or ""),
+            silent=reply is None,
         )
         if reply is None:
             stdout_parts = [
@@ -935,13 +980,10 @@ def fetch_candidates(
       - direct group messages (`messages`), ID prefixed `m:`
       - children of 合并转发 wrappers (`forwarded_records`), ID prefixed `f:`
 
-    All message types pass through. NULL content_text for media (image / voice
-    / video / sticker) gets replaced by a typed placeholder via SQL CASE so
-    every message at least appears as an event in the timeline. Link cards /
-    files / video shares / transfers / red-packets carry their formatted
-    preview (built by `format_appmsg_content` at ingest time). The LLM is
-    trusted to recognise placeholders like `[图片]` as opaque events vs
-    user-typed text. (See CLAUDE.md F7.)
+    All message types pass through. SQL fetches raw normalized fields; the
+    LLM-visible body is rendered by `message_render.py` so agent paths and
+    command paths share OCR/ASR prefixes, media placeholders, and quote
+    suffixes.
 
     The only behaviour `for_chat` controls is whether to keep `@<bot> /xxx`
     slash-command messages in the candidate set:
@@ -961,49 +1003,21 @@ def fetch_candidates(
     When `bot_name` is given, excludes the bot's own captured replies in both
     modes (the bot's output isn't useful as candidate or as context).
 
-    Quote-reply rendering: we unify the LLM-visible shape so live and backfill
-    look identical. backfill's content_text is already
-    `"<reply>[引用 <orig>:<quoted>]"` (WeFlow file-export pre-parsed). For
-    live, content_text is just `"<reply>"` and `quote_text` is separate; the
-    CASE below appends the `[引用 ...]` suffix and resolves the original
-    sender via LEFT JOIN on `wx_msg_id (== refermsg.svrid)`.
+    Quote-reply rendering: live and backfill are normalized at this output
+    boundary. Parent metadata is joined when available so the shared renderer
+    can append `[引用 ...]` consistently.
     """
-    # SQL note: SQLite WHERE can't reference SELECT aliases, so the `content`
-    # NULL/empty filter happens at the outer UNION level (see `sql` below).
     main_sql = """
         SELECT 'm:' || m.msg_id AS cand_id, m.t,
                COALESCE(m.sender_display, m.sender_wxid, '?') AS sender,
                NULL AS parent_id,
-               CASE
-                   WHEN m.type = 'quote'
-                        AND m.quote_text IS NOT NULL AND m.quote_text <> ''
-                        AND COALESCE(m.content_text, '') NOT LIKE '%[引用%'
-                   THEN COALESCE(m.content_text, '')
-                        || '[引用 '
-                        || COALESCE(orig.sender_display, orig.sender_wxid, '?')
-                        || '：' || m.quote_text || ']'
-                   -- OCR/ASR transcript wins for media when worker has filled it.
-                   -- The `·OCR`/`·ASR` suffix tells the LLM "this text was machine-
-                   -- transcribed, not user-typed" — distinct from the bare `[图片]`
-                   -- placeholder which means we don't have content. (See CLAUDE.md F15.)
-                   WHEN m.transcript IS NOT NULL AND m.transcript <> ''
-                   THEN CASE m.type
-                            WHEN 'image'   THEN '[图片·OCR] '
-                            WHEN 'voice'   THEN '[语音·ASR] '
-                            WHEN 'video'   THEN '[视频·识别] '
-                            WHEN 'sticker' THEN '[表情·OCR] '
-                            ELSE '[' || m.type || '·识别] '
-                        END || m.transcript
-                   WHEN m.content_text IS NOT NULL AND m.content_text <> ''
-                   THEN m.content_text
-                   ELSE CASE m.type
-                       WHEN 'image'   THEN '[图片]'
-                       WHEN 'voice'   THEN '[语音]'
-                       WHEN 'video'   THEN '[视频]'
-                       WHEN 'sticker' THEN '[表情]'
-                       ELSE NULL
-                   END
-               END AS content
+               m.msg_id, m.type, m.sender_wxid, m.sender_display,
+               m.content_text, m.transcript, m.quote_text,
+               orig.msg_id AS parent_msg_id,
+               orig.type AS parent_type,
+               orig.sender_display AS parent_sender,
+               orig.sender_wxid AS parent_sender_wxid,
+               NULL AS fwd_content
           FROM messages m
           LEFT JOIN messages orig
                  ON orig.wx_msg_id = m.reply_to_wx_msg_id
@@ -1031,7 +1045,12 @@ def fetch_candidates(
         SELECT 'f:' || f.id AS cand_id, f.t,
                COALESCE(f.sender_display, '?') AS sender,
                'm:' || m.msg_id AS parent_id,
-               f.content
+               NULL AS msg_id, 'forward_child' AS type,
+               NULL AS sender_wxid, f.sender_display,
+               NULL AS content_text, NULL AS transcript, NULL AS quote_text,
+               NULL AS parent_msg_id, NULL AS parent_type,
+               NULL AS parent_sender, NULL AS parent_sender_wxid,
+               f.content AS fwd_content
           FROM forwarded_records f
           JOIN messages m ON m.msg_id = f.parent_msg_id
          WHERE m.group_id = ?
@@ -1045,27 +1064,31 @@ def fetch_candidates(
         fwd_sql += " AND f.t >= ?"
         fwd_params.append(since_t)
 
-    # Outer SELECT lets us filter NULL/empty content (the inner CASE returns
-    # NULL for unknown types whose content_text is also empty — these would be
-    # useless to the LLM).
     sql = f"""
-        SELECT cand_id, t, sender, parent_id, content FROM (
+        SELECT * FROM (
             {main_sql}
             UNION ALL
             {fwd_sql}
-        ) WHERE content IS NOT NULL AND content <> ''
+        )
         ORDER BY t DESC LIMIT ?
     """
     params = main_params + fwd_params + [limit]
     rows = conn.execute(sql, params).fetchall()
     rows.reverse()  # chronological for the LLM
-    return [
-        Candidate(
-            cand_id=r["cand_id"], t=r["t"], sender=r["sender"],
-            content=r["content"], parent_id=r["parent_id"],
+    candidates: list[Candidate] = []
+    for r in rows:
+        content = (
+            r["fwd_content"]
+            if r["fwd_content"] is not None
+            else render_message_body(r) + render_quote_suffix(r, style="inline")
         )
-        for r in rows
-    ]
+        if not content.strip():
+            continue
+        candidates.append(Candidate(
+            cand_id=r["cand_id"], t=r["t"], sender=r["sender"],
+            content=content, parent_id=r["parent_id"],
+        ))
+    return candidates
 
 
 # ---------- LLM filter ----------
@@ -1397,7 +1420,7 @@ def _classify_trigger(
     bot_name: str,
     bot_wxid: str | None,
     now: float,
-) -> str | None:
+) -> TriggerDecision:
     """Decide whether to wake the agent for this row. Returns one of
     'mention' / 'reply' / 'probability' or None (skip silently).
 
@@ -1418,13 +1441,13 @@ def _classify_trigger(
     """
     text = row["content_text"] or ""
     if _has_bot_mention(text, bot_name):
-        return "mention"
+        return TriggerDecision("mention", "mention_match")
     if _is_reply_to_bot(conn, row, bot_wxid):
-        return "reply"
+        return TriggerDecision("reply", "reply_to_bot")
     # Probability path — bail early if the knob is off.
     p = settings.agent_base_probability
     if p <= 0.0:
-        return None
+        return TriggerDecision(None, "probability_disabled", probability=p)
     # Type gate: an empty random wake-up burns the entire system prompt + recent
     # window for one decision, so only let substantive types in. text/quote
     # carry the user's actual words; image/voice qualify only once OCR/ASR has
@@ -1437,18 +1460,24 @@ def _classify_trigger(
     elif msg_type in ("image", "voice"):
         transcript = (row["transcript"] or "").strip() if "transcript" in row.keys() else ""
         if not transcript:
-            return None
+            return TriggerDecision(None, "type_gate_no_transcript", probability=p)
     else:
-        return None
+        return TriggerDecision(None, "type_gate", probability=p)
     if random.random() >= p:
-        return None
+        return TriggerDecision(None, "dice_miss", probability=p)
     # Won the dice roll. Atomically check + reserve cooldown.
     with _BOT_LAST_SPOKE_AT_LOCK:
         last = _BOT_LAST_SPOKE_AT.get(row["group_id"], 0.0)
-        if now - last < settings.agent_cooldown_seconds:
-            return None
+        cooldown_remaining = settings.agent_cooldown_seconds - (now - last)
+        if cooldown_remaining > 0:
+            return TriggerDecision(
+                None,
+                "cooldown",
+                probability=p,
+                cooldown_remaining_s=round(cooldown_remaining, 3),
+            )
         _BOT_LAST_SPOKE_AT[row["group_id"]] = now
-    return "probability"
+    return TriggerDecision("probability", "probability_won", probability=p)
 
 
 def _mark_bot_spoke(group_id: str, when: float | None = None) -> None:
@@ -1475,6 +1504,307 @@ def _finalize(conn: sqlite3.Connection, msg_id: int, status: str, result: str) -
             "UPDATE command_runs SET finished_at = ?, status = ?, result = ? WHERE msg_id = ?",
             (int(time.time()), status, result, msg_id),
         )
+
+
+def _row_event_fields(row: sqlite3.Row | dict[str, object]) -> dict[str, object]:
+    return {
+        "msg_id": row["msg_id"],
+        "group_id": row["group_id"],
+        "group_name": row["group_name"],
+        "msg_type": row["type"],
+        "sender": row["sender_display"] or row["sender_wxid"],
+    }
+
+
+def _send_with_events(
+    replier: "Replier",
+    row: sqlite3.Row | dict[str, object],
+    requester: str | None,
+    text: str,
+    reply_kind: str,
+    terminal: bool = False,
+) -> bool:
+    fields = _row_event_fields(row)
+    append_event(
+        "reply.attempt",
+        **fields,
+        reply_kind=reply_kind,
+        requester=requester,
+        chars=len(text),
+    )
+    started = time.time()
+    try:
+        replier.send(row["group_name"], requester, text)
+    except Exception as e:
+        duration_ms = round((time.time() - started) * 1000, 3)
+        append_event(
+            "reply.end",
+            **fields,
+            reply_kind=reply_kind,
+            status="error",
+            duration_ms=duration_ms,
+            error=f"{type(e).__name__}: {e}",
+        )
+        if terminal:
+            print(
+                f"  send: failed dur={duration_ms/1000:.1f}s "
+                f"error={type(e).__name__}: {e}",
+                flush=True,
+            )
+        return False
+    duration_ms = round((time.time() - started) * 1000, 3)
+    append_event(
+        "reply.end",
+        **fields,
+        reply_kind=reply_kind,
+        status="ok",
+        duration_ms=duration_ms,
+    )
+    if terminal:
+        print(f"  send: ok dur={duration_ms/1000:.1f}s", flush=True)
+    return True
+
+
+def _terminal_message_body(row: sqlite3.Row | dict[str, object]) -> str:
+    body = render_message_body(row)
+    return _clip_one_line(body, 120) if body else ""
+
+
+def _print_trigger_terminal(
+    row: sqlite3.Row | dict[str, object],
+    *,
+    trigger: str,
+    reason: str,
+    command: str | None = None,
+) -> None:
+    sender = row["sender_display"] or row["sender_wxid"] or "?"
+    group = row["group_name"] or row["group_id"]
+    body = _terminal_message_body(row)
+    suffix = f" command=/{command}" if command else ""
+    print(
+        f"\nmsg={row['msg_id']} group={group} from={sender} type={row['type']}",
+        flush=True,
+    )
+    print(f"  trigger: {trigger} reason={reason}{suffix}", flush=True)
+    if body:
+        print(f"  text: {body}", flush=True)
+
+
+def _read_recent_mcp_events(group_id: str, since_ts: float) -> list[dict[str, object]]:
+    path = settings.data_dir / "mcp.log"
+    if not path.exists():
+        return []
+    out: list[dict[str, object]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    # Historical mcp.log may contain pretty-printed JSON objects and JSONL
+    # entries concatenated as `}{`. Decode it as a stream from the tail rather
+    # than assuming one object per line.
+    start = max(0, len(text) - 500_000)
+    chunk = text[start:]
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(chunk):
+        next_obj = chunk.find("{", idx)
+        if next_obj < 0:
+            break
+        try:
+            item, end = decoder.raw_decode(chunk[next_obj:])
+        except json.JSONDecodeError:
+            idx = next_obj + 1
+            continue
+        idx = next_obj + end
+        if not isinstance(item, dict):
+            continue
+        if item.get("group_id") != group_id:
+            continue
+        ts = item.get("ts")
+        if not isinstance(ts, str):
+            continue
+        try:
+            when = datetime.fromisoformat(ts).timestamp()
+        except ValueError:
+            continue
+        if when >= since_ts - 1.0:
+            out.append(item)
+    return out
+
+
+def _event_epoch(event: dict[str, object]) -> float | None:
+    ts = event.get("ts")
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except ValueError:
+        return None
+
+
+def _format_token_count(value: object) -> str:
+    if not isinstance(value, (int, float)):
+        return "?"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}m"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(int(value))
+
+
+def _openclaw_usage_from_trace(trace_block: str) -> dict[str, int] | None:
+    match = re.search(
+        r"usage=prompt:(\d+)\s+completion:(\d+)\s+total:(\d+)",
+        trace_block,
+    )
+    if not match:
+        return None
+    return {
+        "prompt": int(match.group(1)),
+        "completion": int(match.group(2)),
+        "total": int(match.group(3)),
+    }
+
+
+def _print_openclaw_timing_terminal(
+    *,
+    started_at: float,
+    ended_at: float,
+    trace_block: str,
+    mcp_events: list[dict[str, object]],
+) -> None:
+    if "openclaw" not in trace_block.lower():
+        return
+
+    parts: list[str] = []
+    usage = _openclaw_usage_from_trace(trace_block)
+    if usage:
+        parts.append(
+            "usage="
+            f"{_format_token_count(usage['prompt'])}+"
+            f"{_format_token_count(usage['completion'])}/"
+            f"{_format_token_count(usage['total'])} tok"
+        )
+
+    event_times = sorted(
+        (when for event in mcp_events if (when := _event_epoch(event)) is not None)
+    )
+    if event_times:
+        first_tool = max(0.0, event_times[0] - started_at)
+        tool_span = max(0.0, event_times[-1] - event_times[0])
+        after_tools = max(0.0, ended_at - event_times[-1])
+        parts.extend(
+            [
+                f"first_tool={first_tool:.1f}s",
+                f"tool_span={tool_span:.1f}s",
+                f"after_tools={after_tools:.1f}s",
+            ]
+        )
+
+    if parts:
+        print(f"  openclaw: {' '.join(parts)}", flush=True)
+
+
+def _print_agent_activity_terminal(
+    *,
+    group_id: str,
+    started_at: float,
+    ended_at: float,
+    trace_block: str,
+) -> None:
+    mcp_events = _read_recent_mcp_events(group_id, started_at)
+    _print_openclaw_timing_terminal(
+        started_at=started_at,
+        ended_at=ended_at,
+        trace_block=trace_block,
+        mcp_events=mcp_events,
+    )
+    if mcp_events:
+        reads: list[str] = []
+        writes: list[str] = []
+        seen: dict[str, int] = {}
+        for event in mcp_events:
+            tool = str(event.get("tool") or "?")
+            ok = bool(event.get("ok", False))
+            dur = event.get("dur_s")
+            item = f"{tool}{'' if ok else '!'}"
+            if isinstance(dur, (int, float)):
+                item += f" {dur:.1f}s"
+            if tool.startswith("update_"):
+                writes.append(item)
+            else:
+                reads.append(item)
+            seen[tool] = seen.get(tool, 0) + 1
+        reads = [
+            f"{item} x{seen[item.split()[0].rstrip('!')]}"
+            if seen.get(item.split()[0].rstrip("!"), 0) > 1 else item
+            for item in reads
+            if reads.index(item) == next(i for i, x in enumerate(reads) if x.split()[0] == item.split()[0])
+        ]
+        writes = [
+            f"{item} x{seen[item.split()[0].rstrip('!')]}"
+            if seen.get(item.split()[0].rstrip("!"), 0) > 1 else item
+            for item in writes
+            if writes.index(item) == next(i for i, x in enumerate(writes) if x.split()[0] == item.split()[0])
+        ]
+        if reads:
+            print(f"  tools: {', '.join(reads[:8])}", flush=True)
+        if writes:
+            print(f"  memory: {', '.join(writes[:6])}", flush=True)
+        return
+
+    tool_lines: list[str] = []
+    memory_lines: list[str] = []
+    for line in trace_block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("step") or "→" not in stripped:
+            continue
+        if "update_group_memory" in stripped or "update_persona_drift" in stripped:
+            memory_lines.append(_clip_one_line(stripped, 120))
+        elif "(" in stripped:
+            tool_lines.append(_clip_one_line(stripped, 120))
+    if tool_lines:
+        print(f"  tools: {'; '.join(tool_lines[:4])}", flush=True)
+    if memory_lines:
+        print(f"  memory: {'; '.join(memory_lines[:3])}", flush=True)
+    if not tool_lines and not memory_lines:
+        print(
+            "  tools: none captured via WeChat-Oracle MCP; see data/openclaw.log for the full OpenClaw turn",
+            flush=True,
+        )
+
+
+def _is_expected_runtime_failure(parsed: "Command", exc: Exception) -> bool:
+    if parsed.name == "(chat)":
+        return True
+    msg = str(exc)
+    return (
+        "OpenClaw gateway request failed" in msg
+        or "LLM" in msg
+        or "timed out" in msg
+    )
+
+
+def _print_terminal_result(
+    *,
+    msg_id: int,
+    parsed: "Command",
+    result: ExecResult,
+    duration_ms: float,
+) -> None:
+    """Print the short operator-facing line.
+
+    Full command/agent details still go to dispatcher.log. The terminal should
+    stay useful during long-running dispatcher sessions, so free-form agent
+    chat only prints a one-line summary instead of the Phase trace.
+    """
+    if parsed.name == "(chat)":
+        print(
+            f"  agent: {result.summary} dur={duration_ms/1000:.1f}s",
+            flush=True,
+        )
+        return
+    print(result.stdout, flush=True)
 
 
 def _next_unprocessed(
@@ -1550,6 +1880,19 @@ def _build_vision_client() -> VisionLLM | None:
     )
 
 
+def _configure_wx4py_logging() -> None:
+    level = getattr(logging, settings.wx4py_log_level.upper(), logging.WARNING)
+    for name in (
+        "wx4py",
+        "wx4py.client",
+        "wx4py.core",
+        "wx4py.core.window",
+        "wx4py.features",
+        "wx4py.features.chat",
+    ):
+        logging.getLogger(name).setLevel(level)
+
+
 def _process(
     conn: sqlite3.Connection,
     llm: LLMClient,
@@ -1590,10 +1933,32 @@ def _process(
 
     kind: str | None = None
     if slash_cmd is None:
-        kind = _classify_trigger(conn, row, settings.bot_name, bot_wxid, now)
+        decision = _classify_trigger(conn, row, settings.bot_name, bot_wxid, now)
+        kind = decision.kind
+        if kind is not None:
+            append_event(
+                "trigger.decision",
+                **_row_event_fields(row),
+                decision=kind,
+                reason=decision.reason,
+                probability=decision.probability,
+                cooldown_remaining_s=decision.cooldown_remaining_s,
+            )
+            _print_trigger_terminal(row, trigger=kind, reason=decision.reason)
         if kind is None:
             _finalize(conn, msg_id, "ok", "(no-trigger)")
             return
+    else:
+        append_event(
+            "trigger.decision",
+            **_row_event_fields(row),
+            decision="command",
+            reason="slash_command",
+            command=slash_cmd.name,
+        )
+        _print_trigger_terminal(
+            row, trigger="command", reason="slash_command", command=slash_cmd.name
+        )
 
     quoted_text = None
     quoted_msg_id = None
@@ -1652,7 +2017,7 @@ def _process(
         text = parsed.chat()
         print(text, flush=True)
         append_log(log_path, row["t"], text)
-        replier.send(row["group_name"], requester, text)
+        _send_with_events(replier, row, requester, text, "parse_error")
         _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
         return
 
@@ -1672,23 +2037,74 @@ def _run_command(
     Shared by the standalone slash path and the @<bot> mention path."""
     msg_id = row["msg_id"]
     requester = row["sender_display"] or row["sender_wxid"]
+    started = time.time()
+    append_event("command.start", **_row_event_fields(row), command=parsed.name)
     try:
         result = parsed.execute(ctx)
     except Exception as e:
-        logger.exception("execute() crashed for /{}", parsed.name)
+        if _is_expected_runtime_failure(parsed, e):
+            logger.warning("execute failed for /{}: {}", parsed.name, e)
+        else:
+            logger.exception("execute() crashed for /{}", parsed.name)
         msg = f"⚠️ /{parsed.name} 执行失败：{e}"
+        if parsed.name == "(chat)":
+            duration_ms = round((time.time() - started) * 1000, 3)
+            print(
+                f"  agent: failed dur={duration_ms/1000:.1f}s error={type(e).__name__}: {e}",
+                flush=True,
+            )
         print(msg, flush=True)
         append_log(log_path, row["t"], msg)
-        replier.send(row["group_name"], requester, msg)
+        _send_with_events(replier, row, requester, msg, f"command:{parsed.name}:error")
         _finalize(conn, msg_id, "error", str(e))
+        append_event(
+            "command.end",
+            **_row_event_fields(row),
+            command=parsed.name,
+            status="error",
+            duration_ms=round((time.time() - started) * 1000, 3),
+            error=f"{type(e).__name__}: {e}",
+        )
         return
 
-    print(result.stdout, flush=True)
+    duration_ms = round((time.time() - started) * 1000, 3)
+    _print_terminal_result(
+        msg_id=msg_id,
+        parsed=parsed,
+        result=result,
+        duration_ms=duration_ms,
+    )
     append_log(log_path, row["t"], result.stdout)
+    if parsed.name == "(chat)":
+        _print_agent_activity_terminal(
+            group_id=row["group_id"],
+            started_at=started,
+            ended_at=started + duration_ms / 1000,
+            trace_block=result.stdout,
+        )
+        if result.chat.strip():
+            print(f"  reply: {_clip_one_line(result.chat, 180)}", flush=True)
     if result.chat.strip():
-        replier.send(row["group_name"], requester, result.chat)
-        _mark_bot_spoke(row["group_id"], now)
+        sent = _send_with_events(
+            replier,
+            row,
+            requester,
+            result.chat,
+            f"command:{parsed.name}",
+            terminal=parsed.name == "(chat)",
+        )
+        if sent:
+            _mark_bot_spoke(row["group_id"], now)
     _finalize(conn, msg_id, "ok", result.summary)
+    append_event(
+        "command.end",
+        **_row_event_fields(row),
+        command=parsed.name,
+        status="ok",
+        duration_ms=duration_ms,
+        reply_chars=len(result.chat or ""),
+        summary=result.summary,
+    )
 
 
 def _process_agent_only(
@@ -1706,6 +2122,8 @@ def _process_agent_only(
     msg_id = row["msg_id"]
     text = (row["content_text"] or "").strip()
     requester = row["sender_display"] or row["sender_wxid"]
+    started = time.time()
+    append_event("agent.start", **_row_event_fields(row), trigger_kind=kind)
     if kind == "reply":
         # User replied to one of bot's prior messages. Their reply text is
         # the user_question; quote_text is the bot's prior message we set
@@ -1725,10 +2143,19 @@ def _process_agent_only(
     except Exception as e:
         logger.exception("agent crashed on msg_id={} kind={}", msg_id, kind)
         _finalize(conn, msg_id, "error", f"agent-crash: {e}")
+        append_event(
+            "agent.end",
+            **_row_event_fields(row),
+            trigger_kind=kind,
+            status="error",
+            duration_ms=round((time.time() - started) * 1000, 3),
+            error=f"{type(e).__name__}: {e}",
+        )
         return
 
     summary = f"agent[{kind}]: " + ("silent" if reply is None else f"{len(reply)} chars")
-    print(f"@<bot> agent[{kind}]  ::  msg_id={msg_id}  ->  {summary}", flush=True)
+    duration_ms = round((time.time() - started) * 1000, 3)
+    print(f"  agent: {summary} dur={duration_ms/1000:.1f}s", flush=True)
     log_block_parts = [
         f"agent[{kind}] msg_id={msg_id}",
         reply or "(silent)",
@@ -1736,10 +2163,30 @@ def _process_agent_only(
     if trace_block:
         log_block_parts.append(trace_block)
     append_log(log_path, row["t"], "\n".join(log_block_parts))
+    _print_agent_activity_terminal(
+        group_id=row["group_id"],
+        started_at=started,
+        ended_at=started + duration_ms / 1000,
+        trace_block=trace_block,
+    )
     if reply and reply.strip():
-        replier.send(row["group_name"], requester, reply)
-        _mark_bot_spoke(row["group_id"])
+        print(f"  reply: {_clip_one_line(reply, 180)}", flush=True)
+    if reply and reply.strip():
+        sent = _send_with_events(
+            replier, row, requester, reply, f"agent:{kind}", terminal=True
+        )
+        if sent:
+            _mark_bot_spoke(row["group_id"])
     _finalize(conn, msg_id, "ok", summary)
+    append_event(
+        "agent.end",
+        **_row_event_fields(row),
+        trigger_kind=kind,
+        status="ok",
+        duration_ms=duration_ms,
+        reply_chars=len(reply or ""),
+        silent=reply is None,
+    )
 
 
 @dataclass
@@ -1878,6 +2325,7 @@ class _GlobalScheduler:
                     # rejects duplicates.
                     if not _claim(conn, msg_id):
                         return
+                    append_event("dispatcher.claim", **_row_event_fields(row))
                     _process(
                         conn,
                         self._llm(),
@@ -2004,6 +2452,7 @@ def run_dispatcher() -> None:
             "WO_BOT_NAME is empty; set it to your alt-account's group nickname in .env"
         )
 
+    _configure_wx4py_logging()
     init_db()
     settings.ensure_dirs()
     log_path = settings.data_dir / "dispatcher.log"
@@ -2011,11 +2460,12 @@ def run_dispatcher() -> None:
     llm = _build_llm_client()
     vision = _build_vision_client()
     replier = _SerialReplier(build_replier())
+    _configure_wx4py_logging()
     interval = settings.dispatcher_poll_interval
     worker_threads = max(1, settings.dispatcher_worker_threads)
 
     logger.info(
-        "dispatcher: bot={!r} model={} llm={} vision={} agent_backend={} agent_max_steps={} workers={} interval={}s replier={} commands={} log={} llm_log={}",
+        "dispatcher: bot={!r} model={} llm={} vision={} agent_backend={} agent_max_steps={} workers={} interval={}s replier={} wx4py_log={} commands={} log={} llm_log={}",
         settings.bot_name, settings.llm_model,
         getattr(llm, "name", type(llm).__name__),
         f"{settings.vision_model}" if vision else "off",
@@ -2023,7 +2473,7 @@ def run_dispatcher() -> None:
         settings.agent_max_steps,
         worker_threads,
         interval,
-        type(replier).__name__, list(COMMANDS), log_path, llm_log_path,
+        type(replier).__name__, settings.wx4py_log_level, list(COMMANDS), log_path, llm_log_path,
     )
 
     with get_conn() as conn:

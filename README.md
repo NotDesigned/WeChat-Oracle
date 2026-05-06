@@ -112,6 +112,7 @@ WO_AGENT_BACKEND=openclaw
 WO_OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 WO_OPENCLAW_TOKEN=<gateway-token>
 WO_OPENCLAW_AGENT_ID=<your-agent-id>
+WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
 
 Then run:
@@ -308,6 +309,7 @@ WO_AGENT_BACKEND=openclaw
 WO_OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 WO_OPENCLAW_TOKEN=<gateway-token>
 WO_OPENCLAW_AGENT_ID=<your-agent-id>
+WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
 
 ## Real WeChat Mentions
@@ -332,6 +334,8 @@ Transcript states:
 If `WO_VISION_API_KEY` is configured, agent chat and `/explain` / `/ask` can send referenced images to a vision model for direct reading. Without it, image handling falls back to OCR text and placeholders.
 
 ## Data Model
+
+For the full ingestion contract, including WeFlow `localType` handling, app-message subtypes, media storage, quote/forward normalization, and LLM-visible rendering, see [docs/message-model.md](docs/message-model.md).
 
 Key tables:
 
@@ -361,6 +365,7 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_MEDIA_DIR` | `data/media` | Media directory. |
 | `WO_GROUPS` | `[]` | Empty means all WeFlow group sessions; comma string or JSON list is accepted. |
 | `WO_LOG_LEVEL` | `INFO` | loguru level. |
+| `WO_WX4PY_LOG_LEVEL` | `WARNING` | Python logging level for wx4py internals; set to `INFO` only when debugging UI automation. |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root. |
 | `WO_WEFLOW_TOKEN` | empty | WeFlow token. |
 | `WO_WEFLOW_POLL_INTERVAL` | `30.0` | Deprecated; live uses SSE. |
@@ -406,6 +411,7 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | OpenClaw gateway. |
 | `WO_OPENCLAW_TOKEN` | empty | OpenClaw gateway token. |
 | `WO_OPENCLAW_AGENT_ID` | `wechat-bot` | OpenClaw agent id. |
+| `WO_OPENCLAW_TIMEOUT_SECONDS` | `300` | OpenClaw gateway request timeout. |
 | `WO_AGENT_BACKEND` | `native` | `native` or `openclaw`. |
 | `WO_REPLY` | `True` | Send replies back to WeChat. |
 | `WO_REPLY_BACKEND` | `wx4py` | `wx4py` or `stdout`. |
@@ -416,6 +422,9 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 
 - `data/dispatcher.log`: compact human-readable command and agent traces.
 - `data/llm_debug.log`: LLM prompts, raw replies, parsed results, and full traces.
+- `data/events.jsonl`: lightweight machine-readable lifecycle events for ingest batches, trigger decisions, command/agent runs, native tool calls, memory writes, and reply attempts. Use this to answer operational questions such as "why did this message trigger?" or "where did the latency go?" without reading full prompts.
+- `data/*.process.log`: rotating loguru process logs for long-running processes such as `live` and `dispatcher`.
+- `data/openclaw.log` / `data/mcp.log`: JSONL audit logs for OpenClaw gateway calls and MCP tool invocations.
 - `wx4py_send_audit.jsonl`: wx4py send audit records when wx4py emits them.
 
 Useful checks:

@@ -26,11 +26,13 @@ tool-calling). Currently only `OpenAICompatLLM` implements that Protocol.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
 
+from ..log_utils import append_event
 from .. import prompts
 from ..llm import ToolCall, ToolingLLM
 from .tools import GroupScopedTools, ToolError
@@ -153,6 +155,7 @@ def _execute_tool_calls(
             })
             continue
 
+        started = time.time()
         try:
             result = impl.call(args)
         except ToolError as e:
@@ -182,6 +185,15 @@ def _execute_tool_calls(
                 "args": args,
                 "result": result,
             })
+        append_event(
+            "agent.tool_call",
+            group_id=tools.group_id,
+            tool=call.name,
+            step=step_idx,
+            status="error" if result.startswith("error:") or result.startswith("internal error:") else "ok",
+            duration_ms=round((time.time() - started) * 1000, 3),
+            result_len=len(result),
+        )
 
         tool_messages.append({
             "role": "tool",

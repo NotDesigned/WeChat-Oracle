@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     groups: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     log_level: str = "INFO"
+    wx4py_log_level: str = "WARNING"
 
     # WeFlow HTTP API (used by `ingest live`); enable "HTTP API 服务" in WeFlow settings.
     weflow_base_url: str = "http://127.0.0.1:5031"
@@ -141,6 +142,7 @@ class Settings(BaseSettings):
     openclaw_gateway_url: str = "http://127.0.0.1:18789"
     openclaw_token: str = ""
     openclaw_agent_id: str = "wechat-bot"
+    openclaw_timeout_seconds: float = 300.0
 
     # Which agent backend dispatcher uses for chat-trigger turns:
     #   native    — in-process Phase A + Phase B with tools (default; works
