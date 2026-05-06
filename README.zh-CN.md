@@ -50,7 +50,7 @@ uv run wechat-oracle run
 
 `run` 会同时启动 `ingest live` 和 `dispatcher`。`ingest live` 启动 SSE 订阅，并内嵌一个 mm worker 线程。`dispatcher` 轮询 SQLite，按群串行、跨群并行地处理显式命令和 agent 触发，并把所有 wx4py 发送操作串行化到一个发送线程，保证同一时间只有一个 GUI 操作触碰微信。
 
-默认情况下，`run` 会打开一个 Textual 终端 UI：上方固定显示 bot 配置、当前 Local Ask 群和进程状态，其余区域滚动显示两个子进程的实时日志。按 `a` 会打开一次性的 Local Ask 输入对话框，按 `c` 可以修改 agent 后端和模型配置。保存配置会写回 `.env`，并重启 dispatcher，让微信群回复也使用新的后端。如果想回到原始输出，可以用 `uv run wechat-oracle run --plain`。
+默认情况下，`run` 会打开一个 Textual 终端 UI：上方固定显示 bot 配置、当前 Local Ask 群和进程状态，其余区域滚动显示两个子进程的实时日志。按 `a` 会打开一次性的 Local Ask 输入对话框，按 `c` 可以修改 agent 后端、模型、概率唤醒和 @ 策略。保存配置会写回 `.env`，并重启 dispatcher，让微信群回复也使用新的设置。如果想回到原始输出，可以用 `uv run wechat-oracle run --plain`。
 
 ## 环境要求
 
@@ -87,13 +87,17 @@ WO_GROUPS=
 
 # Bot identity in the target group
 WO_BOT_NAME=<bot-group-nickname>
+# 可选。只有引用回复 bot 不触发时才需要手动填。
+# WO_BOT_WXID=wxid_xxx
 
 # Reply path
 WO_REPLY=True
 WO_REPLY_BACKEND=wx4py
+WO_REPLY_MENTION_POLICY=explicit
 
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
+WO_AGENT_PROACTIVE_MODE=reactive
 WO_AGENT_RECENT_CONTEXT_CHAT=100
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
@@ -110,6 +114,8 @@ WO_AGENT_LURK_ENABLED=False
 WO_AGENT_LURK_INTERVAL_SECONDS=1800
 WO_AGENT_LURK_MIN_NEW_MESSAGES=20
 ```
+
+`WO_BOT_NAME` 和 `WO_BOT_WXID` 不是同一个东西。`WO_BOT_NAME` 是群昵称，用来识别真实的 `@<bot>`；`WO_BOT_WXID` 是 bot 账号自己的 wxid，只用于判断“用户引用回复的是不是 bot 之前说的话”。dispatcher 通常会从已入库的 bot 消息中自动发现它；如果引用回复 bot 没有唤醒 agent，再手动填写。
 
 然后选择一个 agent backend。
 
@@ -290,10 +296,22 @@ dispatcher 会分类每条新的 live 消息：
 |---|---|---|
 | `mention` | 文本包含真实的 `@<WO_BOT_NAME>`。 | 总是唤醒 bot。Slash 命令会被解析，普通文本进入 agent chat。 |
 | `reply` | 消息引用回复了 bot 之前的消息，且 `WO_BOT_WXID` 已知或可自动发现。 | 总是唤醒 bot。 |
-| `probability` | 不是 mention/reply，通过类型门槛、随机阈值和 cooldown。 | agent 自己决定说话或 `stay_silent`。 |
+| `probability` | 不是 mention/reply，`WO_AGENT_PROACTIVE_MODE` 不是 `off`，并通过类型门槛、随机阈值和 cooldown。 | agent 按配置的参与姿态决定说话或 `stay_silent`。 |
 | none | 没有触发。 | 不调用 LLM，消息标记为 no-trigger。 |
 
 直接 @ 和引用回复 bot 会直接运行 agent。只有当 agent 返回非空回复时，bot 才会在群里发送消息。
+
+`WO_REPLY_MENTION_POLICY` 控制群回复是否通知某个成员：
+
+- `always`：每条群回复都尝试真实 `@` 触发者。
+- `explicit`：默认值。直接 @、引用回复 bot、slash 命令和命令错误会 @ 触发者；`probability` / `proactive` 这类普通接话不会 @。
+- `never`：所有群回复都不 @ 人，直接发普通消息。
+
+`WO_AGENT_PROACTIVE_MODE` 只控制非显式的 probability wakeup：
+
+- `off`：不会因为普通群聊自动醒来；只有直接 @、引用回复 bot 和 slash 命令会运行 agent。
+- `reactive`：默认值。概率唤醒后只在有信息量时接当前话题。
+- `proactive`：概率唤醒后，也可以在时机合适时问一个基于上下文的短问题、牵一条旧线，或发起一个轻量相关话题。
 
 native agent 分两阶段：
 
@@ -317,7 +335,7 @@ TUI 使用快捷键：
 g  打开群选择框
 a  打开当前群的 Local Ask 对话框
 m  编辑当前群的 group_memory / persona_drift
-c  修改 agent 后端 / native 模型 / OpenClaw agent id，并重启 dispatcher
+c  修改 agent 后端 / native 模型 / OpenClaw agent id / 概率唤醒 / @ 策略，并重启 dispatcher
 w  切换只读/允许写记忆模式
 ```
 
@@ -374,6 +392,8 @@ WO_OPENCLAW_TIMEOUT_SECONDS=300
 ## 真实微信 @
 
 `Wx4pyReplier` 会尝试创建真实的微信群 @ token：打开群聊、输入 `@`、从微信候选弹窗里选择提问者，然后粘贴回复正文。如果检测不到候选人，会回退为纯文本 `@name` 并记录 warning。
+
+只有当 `WO_REPLY_MENTION_POLICY` 判断当前回复应该 @ 人时，才会走这条路径。
 
 这一路径会通过 `_SerialReplier` 串行化；多个 worker 线程不会同时操作微信 GUI。
 
@@ -449,7 +469,8 @@ transcript 状态：
 | `WO_VISION_MODEL` | `qwen-vl-plus` | Vision 模型。 |
 | `WO_VISION_MAX_IMAGES` | `3` | 每次 vision 请求的图片上限。 |
 | `WO_VISION_MAX_TOKENS` | `800` | Vision 输出上限。 |
-| `WO_AGENT_BASE_PROBABILITY` | `0.25` | 概率触发阈值；设为 `0` 表示只响应显式触发。 |
+| `WO_AGENT_BASE_PROBABILITY` | `0.25` | eligible 普通消息的逐条概率唤醒阈值。 |
+| `WO_AGENT_PROACTIVE_MODE` | `reactive` | `off` 关闭普通群聊概率唤醒；`reactive` 只接当前话题；`proactive` 可问一个基于上下文的短问题或发起轻量相关话题。 |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | 每群 probability cooldown。 |
 | `WO_AGENT_MAX_STEPS` | `8` | Native Phase A 最大轮数。 |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B 最大轮数。 |
@@ -473,6 +494,7 @@ transcript 状态：
 | `WO_AGENT_BACKEND` | `native` | `native` 或 `openclaw`。 |
 | `WO_REPLY` | `True` | 是否把回复发回微信。 |
 | `WO_REPLY_BACKEND` | `wx4py` | `wx4py` 或 `stdout`。 |
+| `WO_REPLY_MENTION_POLICY` | `explicit` | `always` 每条群回复都 @ 触发者；`explicit` 只在直接/命令/引用触发时 @；`never` 发送普通群消息。 |
 
 `WO_WHISPER_MODEL` 由 mm worker 直接读取，默认值为 `small`；可接受值取决于 faster-whisper，常见为 `tiny`、`base`、`small`、`medium`、`large-v3`。
 

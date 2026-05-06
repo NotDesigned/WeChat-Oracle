@@ -106,6 +106,7 @@ class TriggerDecision:
     reason: str
     probability: float | None = None
     cooldown_remaining_s: float | None = None
+    proactive_mode: str | None = None
 
 
 @dataclass
@@ -1434,7 +1435,8 @@ def _classify_trigger(
     Order matters:
       - mention always wakes (even within cooldown)
       - reply-to-bot always wakes (same)
-      - probability is gated by cooldown + WO_AGENT_BASE_PROBABILITY
+      - probability is gated by WO_AGENT_PROACTIVE_MODE, cooldown, and
+        WO_AGENT_BASE_PROBABILITY
 
     Cooldown for probability is enforced under lock with a CAS pattern:
     with multiple worker threads classifying concurrent batches, a naive
@@ -1451,10 +1453,18 @@ def _classify_trigger(
         return TriggerDecision("mention", "mention_match")
     if _is_reply_to_bot(conn, row, bot_wxid):
         return TriggerDecision("reply", "reply_to_bot")
-    # Probability path — bail early if the knob is off.
+    # Probability path — first honor the participation posture, then the
+    # numeric wake chance.
+    proactive_mode = settings.agent_proactive_mode
+    if proactive_mode == "off":
+        return TriggerDecision(
+            None, "proactive_mode_off", probability=0.0, proactive_mode=proactive_mode
+        )
     p = settings.agent_base_probability
     if p <= 0.0:
-        return TriggerDecision(None, "probability_disabled", probability=p)
+        return TriggerDecision(
+            None, "probability_disabled", probability=p, proactive_mode=proactive_mode
+        )
     # Type gate: an empty random wake-up burns the entire system prompt + recent
     # window for one decision, so only let substantive types in. text/quote
     # carry the user's actual words; image/voice qualify only once OCR/ASR has
@@ -1467,11 +1477,20 @@ def _classify_trigger(
     elif msg_type in ("image", "voice"):
         transcript = (row["transcript"] or "").strip() if "transcript" in row.keys() else ""
         if not transcript:
-            return TriggerDecision(None, "type_gate_no_transcript", probability=p)
+            return TriggerDecision(
+                None,
+                "type_gate_no_transcript",
+                probability=p,
+                proactive_mode=proactive_mode,
+            )
     else:
-        return TriggerDecision(None, "type_gate", probability=p)
+        return TriggerDecision(
+            None, "type_gate", probability=p, proactive_mode=proactive_mode
+        )
     if random.random() >= p:
-        return TriggerDecision(None, "dice_miss", probability=p)
+        return TriggerDecision(
+            None, "dice_miss", probability=p, proactive_mode=proactive_mode
+        )
     # Won the dice roll. Atomically check + reserve cooldown.
     with _BOT_LAST_SPOKE_AT_LOCK:
         last = _BOT_LAST_SPOKE_AT.get(row["group_id"], 0.0)
@@ -1482,9 +1501,12 @@ def _classify_trigger(
                 "cooldown",
                 probability=p,
                 cooldown_remaining_s=round(cooldown_remaining, 3),
+                proactive_mode=proactive_mode,
             )
         _BOT_LAST_SPOKE_AT[row["group_id"]] = now
-    return TriggerDecision("probability", "probability_won", probability=p)
+    return TriggerDecision(
+        "probability", "probability_won", probability=p, proactive_mode=proactive_mode
+    )
 
 
 def _mark_bot_spoke(group_id: str, when: float | None = None) -> None:
@@ -1532,16 +1554,20 @@ def _send_with_events(
     terminal: bool = False,
 ) -> bool:
     fields = _row_event_fields(row)
+    mention = bool(requester) and _should_mention_reply(reply_kind)
+    send_requester = requester if mention else None
     append_event(
         "reply.attempt",
         **fields,
         reply_kind=reply_kind,
         requester=requester,
+        mention=mention,
+        mention_policy=settings.reply_mention_policy,
         chars=len(text),
     )
     started = time.time()
     try:
-        replier.send(row["group_name"], requester, text)
+        replier.send(row["group_name"], send_requester, text)
     except Exception as e:
         duration_ms = round((time.time() - started) * 1000, 3)
         append_event(
@@ -1551,10 +1577,12 @@ def _send_with_events(
             status="error",
             duration_ms=duration_ms,
             error=f"{type(e).__name__}: {e}",
+            mention=mention,
+            mention_policy=settings.reply_mention_policy,
         )
         if terminal:
             _terminal_print(
-                f"  send: failed dur={duration_ms/1000:.1f}s "
+                f"  send: failed {_mention_terminal_suffix(mention)}dur={duration_ms/1000:.1f}s "
                 f"error={type(e).__name__}: {e}"
             )
         return False
@@ -1565,10 +1593,25 @@ def _send_with_events(
         reply_kind=reply_kind,
         status="ok",
         duration_ms=duration_ms,
+        mention=mention,
+        mention_policy=settings.reply_mention_policy,
     )
     if terminal:
-        _terminal_print(f"  send: ok dur={duration_ms/1000:.1f}s")
+        _terminal_print(f"  send: ok {_mention_terminal_suffix(mention)}dur={duration_ms/1000:.1f}s")
     return True
+
+
+def _should_mention_reply(reply_kind: str) -> bool:
+    policy = settings.reply_mention_policy
+    if policy == "always":
+        return True
+    if policy == "never":
+        return False
+    return reply_kind != "agent:probability"
+
+
+def _mention_terminal_suffix(mention: bool) -> str:
+    return "" if mention else "no-mention "
 
 
 def _terminal_message_body(row: sqlite3.Row | dict[str, object]) -> str:
@@ -1941,6 +1984,7 @@ def _process(
                 reason=decision.reason,
                 probability=decision.probability,
                 cooldown_remaining_s=decision.cooldown_remaining_s,
+                proactive_mode=decision.proactive_mode,
             )
             _print_trigger_terminal(row, trigger=kind, reason=decision.reason)
         if kind is None:
@@ -2129,8 +2173,14 @@ def _process_agent_only(
     else:  # probability
         # Dice-roll wake; permissive judgment-call framing. See
         # prompts.PROBABILITY_USER for the full text + history note.
+        mode_instruction = (
+            prompts.PROBABILITY_MODE_PROACTIVE
+            if settings.agent_proactive_mode == "proactive"
+            else prompts.PROBABILITY_MODE_REACTIVE
+        )
         user_question = prompts.PROBABILITY_USER.format(
             text=text or prompts.PROBABILITY_NON_TEXT_PLACEHOLDER,
+            mode_instruction=mode_instruction,
         )
 
     try:

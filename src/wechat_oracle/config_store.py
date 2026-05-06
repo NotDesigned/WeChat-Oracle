@@ -2,8 +2,8 @@
 
 The normal runtime still reads configuration through `config.Settings`. This
 module only handles the operator-facing edit/save path and intentionally keeps
-the first supported surface small: agent backend, native model, and OpenClaw
-agent id.
+the first supported surface small: agent backend, native model, OpenClaw agent
+id, probability wake chance, participation posture, and group mention policy.
 """
 
 from __future__ import annotations
@@ -17,6 +17,9 @@ from .config import Settings
 ENV_PATH = Path(".env")
 AGENT_CONFIG_KEYS = (
     "WO_AGENT_BACKEND",
+    "WO_AGENT_BASE_PROBABILITY",
+    "WO_AGENT_PROACTIVE_MODE",
+    "WO_REPLY_MENTION_POLICY",
     "WO_LLM_MODEL",
     "WO_OPENCLAW_AGENT_ID",
 )
@@ -25,8 +28,11 @@ AGENT_CONFIG_KEYS = (
 @dataclass(frozen=True)
 class AgentRuntimeConfig:
     backend: str
+    proactive_mode: str
     llm_model: str
     openclaw_agent_id: str
+    agent_base_probability: float = 0.25
+    reply_mention_policy: str = "explicit"
     native_configured: bool = False
     openclaw_token_configured: bool = False
     openclaw_configured: bool = False
@@ -34,6 +40,9 @@ class AgentRuntimeConfig:
     def env_updates(self) -> dict[str, str]:
         return {
             "WO_AGENT_BACKEND": self.backend,
+            "WO_AGENT_BASE_PROBABILITY": f"{self.agent_base_probability:g}",
+            "WO_AGENT_PROACTIVE_MODE": self.proactive_mode,
+            "WO_REPLY_MENTION_POLICY": self.reply_mention_policy,
             "WO_LLM_MODEL": self.llm_model,
             "WO_OPENCLAW_AGENT_ID": self.openclaw_agent_id,
         }
@@ -43,8 +52,11 @@ def load_agent_runtime_config() -> AgentRuntimeConfig:
     current = Settings()
     return AgentRuntimeConfig(
         backend=(current.agent_backend or "native").lower(),
+        proactive_mode=current.agent_proactive_mode,
         llm_model=current.llm_model,
         openclaw_agent_id=current.openclaw_agent_id,
+        agent_base_probability=current.agent_base_probability,
+        reply_mention_policy=current.reply_mention_policy,
         native_configured=bool(current.llm_api_key),
         openclaw_token_configured=bool(current.openclaw_token),
         openclaw_configured=bool(current.openclaw_token and current.openclaw_agent_id),
@@ -63,16 +75,28 @@ def save_agent_runtime_config(
 
 def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
     backend = config.backend.strip().lower()
+    proactive_mode = config.proactive_mode.strip().lower()
     llm_model = config.llm_model.strip()
     openclaw_agent_id = config.openclaw_agent_id.strip()
+    probability = float(config.agent_base_probability)
+    mention_policy = config.reply_mention_policy.strip().lower()
     if backend not in {"native", "openclaw"}:
         raise ValueError("后端只能是 native 或 openclaw")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("触发概率必须在 0 到 1 之间")
+    if proactive_mode not in {"off", "reactive", "proactive"}:
+        raise ValueError("主动模式只能是 off、reactive 或 proactive")
+    if mention_policy not in {"always", "explicit", "never"}:
+        raise ValueError("@ 策略只能是 always、explicit 或 never")
     if not llm_model:
         raise ValueError("Native 模型不能为空")
     if not openclaw_agent_id:
         raise ValueError("OpenClaw Agent ID 不能为空")
     return {
         "WO_AGENT_BACKEND": backend,
+        "WO_AGENT_BASE_PROBABILITY": f"{probability:g}",
+        "WO_AGENT_PROACTIVE_MODE": proactive_mode,
+        "WO_REPLY_MENTION_POLICY": mention_policy,
         "WO_LLM_MODEL": llm_model,
         "WO_OPENCLAW_AGENT_ID": openclaw_agent_id,
     }

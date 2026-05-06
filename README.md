@@ -2,7 +2,7 @@
 
 Local-first WeChat group archive and agent assistant.
 
-[Simplified Chinese](README.zh-CN.md)
+[简体中文](README.zh-CN.md)
 
 WeChat Oracle records WeChat group messages through [WeFlow](https://github.com/hicccc77/WeFlow), stores them in SQLite, optionally OCRs images and transcribes voice messages locally, and lets an LLM-backed bot answer questions inside the group. The bot can also maintain long-term per-group memory in the background.
 
@@ -50,7 +50,7 @@ uv run wechat-oracle run
 
 `run` starts `ingest live` and `dispatcher` together. `ingest live` starts the SSE subscriber and an embedded mm worker thread. `dispatcher` polls SQLite, processes explicit commands and agent triggers with per-group ordering and cross-group parallelism, and serializes all wx4py sends through one sender thread so only one GUI operation touches WeChat at a time.
 
-By default `run` opens a Textual terminal UI: the top area stays fixed with bot configuration, selected Local Ask group, and process status, while the rest of the screen scrolls live logs from both child processes. Press `a` to open a one-shot Local Ask dialog, or `c` to edit the agent backend/model. Saving the config writes `.env` and restarts the dispatcher so group replies use the new backend. Use `uv run wechat-oracle run --plain` to disable the TUI and let child processes write directly to the terminal.
+By default `run` opens a Textual terminal UI: the top area stays fixed with bot configuration, selected Local Ask group, and process status, while the rest of the screen scrolls live logs from both child processes. Press `a` to open a one-shot Local Ask dialog, or `c` to edit the agent backend/model, probability wakeup, and reply mention policy. Saving the config writes `.env` and restarts the dispatcher so group replies use the new settings. Use `uv run wechat-oracle run --plain` to disable the TUI and let child processes write directly to the terminal.
 
 ## Requirements
 
@@ -87,13 +87,17 @@ WO_GROUPS=
 
 # Bot identity in the target group
 WO_BOT_NAME=<bot-group-nickname>
+# Optional. Set manually if quote-replying to the bot does not trigger.
+# WO_BOT_WXID=wxid_xxx
 
 # Reply path
 WO_REPLY=True
 WO_REPLY_BACKEND=wx4py
+WO_REPLY_MENTION_POLICY=explicit
 
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
+WO_AGENT_PROACTIVE_MODE=reactive
 WO_AGENT_RECENT_CONTEXT_CHAT=100
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
@@ -110,6 +114,8 @@ WO_AGENT_LURK_ENABLED=False
 WO_AGENT_LURK_INTERVAL_SECONDS=1800
 WO_AGENT_LURK_MIN_NEW_MESSAGES=20
 ```
+
+`WO_BOT_NAME` and `WO_BOT_WXID` identify different things. `WO_BOT_NAME` is the nickname used to detect real `@<bot>` mentions in the group. `WO_BOT_WXID` is the bot account's own wxid and is only needed for the reply-to-bot trigger. The dispatcher auto-discovers it from stored bot messages when possible; set it manually if quote-replying to the bot does not wake the agent.
 
 Then choose one agent backend.
 
@@ -290,10 +296,22 @@ The dispatcher classifies each new live message:
 |---|---|---|
 | `mention` | Text contains a real `@<WO_BOT_NAME>` mention. | Always wakes the bot. Slash commands are parsed; bare text enters agent chat. |
 | `reply` | Message quote-replies to a prior bot message, and `WO_BOT_WXID` is known or auto-discovered. | Always wakes the bot. |
-| `probability` | Not mention/reply, passes type gate, random threshold, and cooldown. | Agent decides whether to speak or `stay_silent`. |
+| `probability` | Not mention/reply, `WO_AGENT_PROACTIVE_MODE` is not `off`, and the message passes type gate, random threshold, and cooldown. | Agent decides whether to speak or `stay_silent`, following the configured participation posture. |
 | none | No trigger. | No LLM call; message is finalized as no-trigger. |
 
 Direct mention and reply-to-bot triggers run the agent directly. The bot sends a group reply only if the agent returns a non-empty response.
+
+`WO_REPLY_MENTION_POLICY` controls whether outgoing group replies notify a member:
+
+- `always`: every group reply attempts a real `@requester`.
+- `explicit`: the default. Direct mentions, reply-to-bot turns, slash commands, and command errors `@` the requester; `probability` / `proactive` ambient replies do not.
+- `never`: send plain group messages without `@`.
+
+`WO_AGENT_PROACTIVE_MODE` controls only non-explicit probability wakeups:
+
+- `off`: never wake from ambient chat; only direct mentions, reply-to-bot, and slash commands run the agent.
+- `reactive`: the default. A probability wakeup may join the current topic only when it has useful context.
+- `proactive`: a probability wakeup may also ask one short context-based question, connect an old thread, or start a light related topic when the timing is appropriate.
 
 The native agent has two phases:
 
@@ -317,7 +335,7 @@ In the TUI, use keyboard shortcuts:
 g  open group picker
 a  open Local Ask dialog for the selected group
 m  edit group_memory / persona_drift for the selected group
-c  edit agent backend / native model / OpenClaw agent id, then restart dispatcher
+c  edit agent backend / native model / OpenClaw agent id / probability wakeup / @ policy, then restart dispatcher
 w  toggle read-only/write mode
 ```
 
@@ -374,6 +392,8 @@ WO_OPENCLAW_TIMEOUT_SECONDS=300
 ## Real WeChat Mentions
 
 `Wx4pyReplier` attempts to create a real WeChat group mention token by opening the group, typing `@`, selecting the requester from WeChat's candidate popup, then pasting the reply body. If the candidate cannot be detected, it falls back to plain text `@name` and logs a warning.
+
+This path is used only when `WO_REPLY_MENTION_POLICY` says the current reply should mention someone.
 
 This is intentionally serialized through `_SerialReplier`; multiple worker threads never manipulate the WeChat GUI at the same time.
 
@@ -449,7 +469,8 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_VISION_MODEL` | `qwen-vl-plus` | Vision model. |
 | `WO_VISION_MAX_IMAGES` | `3` | Per vision request image cap. |
 | `WO_VISION_MAX_TOKENS` | `800` | Vision output cap. |
-| `WO_AGENT_BASE_PROBABILITY` | `0.25` | Probability trigger threshold; set `0` for explicit triggers only. |
+| `WO_AGENT_BASE_PROBABILITY` | `0.25` | Per-message probability wake threshold for eligible ambient messages. |
+| `WO_AGENT_PROACTIVE_MODE` | `reactive` | `off` disables ambient probability wakeups; `reactive` only joins the current topic; `proactive` may ask a short context-based question or start a light related topic. |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | Per-group probability cooldown. |
 | `WO_AGENT_MAX_STEPS` | `8` | Native Phase A max rounds. |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B max rounds. |
@@ -473,6 +494,7 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_AGENT_BACKEND` | `native` | `native` or `openclaw`. |
 | `WO_REPLY` | `True` | Send replies back to WeChat. |
 | `WO_REPLY_BACKEND` | `wx4py` | `wx4py` or `stdout`. |
+| `WO_REPLY_MENTION_POLICY` | `explicit` | `always` mentions the requester on every group reply; `explicit` mentions only direct/command/reply triggers; `never` sends plain group messages. |
 
 `WO_WHISPER_MODEL` is read directly by the mm worker and defaults to `small`; accepted values depend on faster-whisper, commonly `tiny`, `base`, `small`, `medium`, and `large-v3`.
 

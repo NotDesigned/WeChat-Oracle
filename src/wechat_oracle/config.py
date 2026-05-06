@@ -110,7 +110,8 @@ class Settings(BaseSettings):
     # Agent loop (multi-turn tool-calling chat path). Triggers are classified
     # cheaply in dispatcher: direct @, quote-reply to bot, or optional
     # probability wakeups.
-    agent_base_probability: float = 0.25      # 0 = mention-only; small >0 lets bot self-initiate
+    agent_base_probability: float = 0.25       # per-message ambient wake chance
+    agent_proactive_mode: str = "reactive"     # off/reactive/proactive probability posture
     agent_cooldown_seconds: int = 30           # min seconds between bot's own utterances per group
     agent_max_steps: int = 8                   # Phase A read-only loop cap
     agent_reflect_max_steps: int = 3           # Phase B write-only loop cap
@@ -163,6 +164,7 @@ class Settings(BaseSettings):
     # (Tencent iLink Bot was prototyped + rejected; can't deliver group msgs.
     #  See README "实验记录" if you're tempted to try again.)
     reply_backend: str = "wx4py"
+    reply_mention_policy: str = "explicit"  # always/explicit/never group @ policy
 
     @field_validator("groups", mode="before")
     @classmethod
@@ -176,6 +178,22 @@ class Settings(BaseSettings):
                 return json.loads(s)
             return [item.strip() for item in s.split(",") if item.strip()]
         return v
+
+    @field_validator("agent_proactive_mode")
+    @classmethod
+    def _validate_agent_proactive_mode(cls, v: str) -> str:
+        mode = (v or "reactive").strip().lower()
+        if mode not in {"off", "reactive", "proactive"}:
+            raise ValueError("WO_AGENT_PROACTIVE_MODE must be one of: off, reactive, proactive")
+        return mode
+
+    @field_validator("reply_mention_policy")
+    @classmethod
+    def _validate_reply_mention_policy(cls, v: str) -> str:
+        policy = (v or "explicit").strip().lower()
+        if policy not in {"always", "explicit", "never"}:
+            raise ValueError("WO_REPLY_MENTION_POLICY must be one of: always, explicit, never")
+        return policy
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

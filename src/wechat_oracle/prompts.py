@@ -140,20 +140,36 @@ MENTION_NO_BODY = (
 # worth saying". History note: an earlier "默认你不说话 + 4 项白名单" version
 # over-suppressed (~91% silent on probability triggers). New version asks the
 # model to judge information-content rather than match a checklist.
-# Placeholder: {text}
+# Placeholders: {text}, {mode_instruction}
+PROBABILITY_MODE_REACTIVE = (
+    "本轮参与姿态：reactive。你只是在当前话题旁边看了一眼，"
+    "只允许顺着这条消息和 recent context 接一句有信息量的话；"
+    "不要主动换话题、不要为了热闹追问、不要把旧记忆硬拉出来开新线。"
+)
+
+PROBABILITY_MODE_PROACTIVE = (
+    "本轮参与姿态：proactive。你可以在有把握时主动提出一个短问题、牵一条旧线、"
+    "或抛出一个和 recent context / 群记忆直接相关的小话题。"
+    "主动发起必须具体、有上下文、一次只问一个点；群里正在严肃讨论、处理事务、"
+    "吵架或已经有人接住时，优先 stay_silent。不要为了存在感开场。"
+)
+
 PROBABILITY_USER = (
     "群里出现了一条消息：「{text}」\n\n"
-    "你是这个群的成员，刚好「看到」了这条消息。判断要不要接茬：\n\n"
+    "你是这个群的成员，刚好「看到」了这条消息。判断要不要接茬。\n"
+    "{mode_instruction}\n\n"
     "**值得说一句**（任何一类都可以）：\n"
     " - 你恰好知道答案、能补一个事实、能给出有用的角度\n"
     " - 看到明显错误能修正\n"
     " - 之前关心 / 提过 / 帮过的话题在延续，你有新东西可补\n"
     " - 群友的发言能让你想到一个真有信息量的回应、观察、记忆、玩梗\n"
+    " - proactive 模式下，你能基于上下文提出一个不打扰人的短问题或小话题\n"
     " - 群友间的互动里你能加点新的，而不是复读已有内容\n\n"
     "**不值得说**（这些 stay_silent）：\n"
     " - 纯反应（同意 / 笑 / 表情接龙 / 复读别人的话）\n"
     " - 群友间的私事、技术协调、他们自己能搞定的事\n"
     " - 你想到的内容只是「接个话」而没有实质信息\n"
+    " - reactive 模式下，你想到的是另开一个新话题，而不是回应当前上下文\n"
     " - 另一个 bot 已经接了，你再说就是叠音\n\n"
     "判断标准是「我说这句话有没有信息量」，不是「是否被点名」。"
     "不被 @ 也可以发言，但发言必须值得发——别为了刷存在感占麦。"
@@ -191,7 +207,7 @@ READ_IMAGE_OCR_FALLBACK = (
 PHASE_A_OPS_RULES = (
     "约定：context 里方括号 [N] 的数字就是 msg_id（整数）；群 ID 不用传，工具内部已锁定本群。\n"
     "\n"
-    "回答只写正文，不要 @ 任何人；发送层会自动 @ 触发者。不要使用 markdown。\n"
+    "回答只写正文，不要 @ 任何人；发送层会按 @ 策略处理触发者。不要使用 markdown。\n"
     "\n"
     "不知道该不该说话就调 stay_silent。群友的对话不必每条都接。\n"
     "\n"

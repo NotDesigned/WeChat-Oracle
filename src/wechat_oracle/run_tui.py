@@ -56,12 +56,12 @@ class BalanceStatus:
 _BALANCE_STATUS = BalanceStatus()
 _BALANCE_LOCK = threading.Lock()
 _BALANCE_REFRESH_SECONDS = 30.0
-_LABEL_STYLE = "bold #8aadf4"
-_OK_STYLE = "#a6da95"
-_WARN_STYLE = "#eed49f"
-_BAD_STYLE = "#ed8796"
+_LABEL_STYLE = "bold #5ccfe6"
+_OK_STYLE = "#8bdc7f"
+_WARN_STYLE = "#f0c674"
+_BAD_STYLE = "#ff6b6b"
 _MUTED_STYLE = "dim"
-_SEP = "[dim]｜[/]"
+_SEP = "[#245b73]｜[/]"
 
 
 class GroupPickerScreen(ModalScreen[LocalAskGroup | None]):
@@ -377,6 +377,160 @@ class ConfigBackendScreen(ModalScreen[str | None]):
                     return
 
 
+class ConfigProactiveModeScreen(ModalScreen[str | None]):
+    """Pick how probability wakeups may participate in group chat."""
+
+    BINDINGS = [
+        ("escape", "cancel", "取消"),
+    ]
+
+    _OPTIONS = (
+        ("off", "Off：只响应 @ 和引用回复"),
+        ("reactive", "Reactive：偶尔接当前话题，不主动开新话题"),
+        ("proactive", "Proactive：可基于上下文主动问一句或牵一条旧线"),
+    )
+
+    def __init__(self, current: str) -> None:
+        super().__init__()
+        self._current = current if current in {"off", "reactive", "proactive"} else "reactive"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-proactive-picker"):
+            yield Static("选择主动模式", id="config-proactive-title")
+            for mode, label in self._OPTIONS:
+                yield Button(
+                    f"{_current_marker(self._current, mode)}{label}",
+                    id=f"config-proactive-{mode}",
+                    classes="config-menu-item",
+                    compact=True,
+                )
+            with Horizontal(id="config-proactive-buttons"):
+                yield Button("取消", id="config-proactive-cancel", compact=True)
+            yield Static(
+                "Off 会关闭 probability；Reactive 只接话；Proactive 允许低频主动抛话题。Esc 取消",
+                id="config-proactive-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(f"#config-proactive-{self._current}", Button).focus()
+
+    def on_key(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key == "down":
+            event.stop()
+            self._focus_next()
+        elif event.key == "up":
+            event.stop()
+            self._focus_previous()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button_id = event.button.id or ""
+        if button_id.startswith("config-proactive-") and button_id != "config-proactive-cancel":
+            self.dismiss(button_id.removeprefix("config-proactive-"))
+        elif button_id == "config-proactive-cancel":
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _focus_controls(self) -> list[Button]:
+        return [
+            self.query_one("#config-proactive-off", Button),
+            self.query_one("#config-proactive-reactive", Button),
+            self.query_one("#config-proactive-proactive", Button),
+            self.query_one("#config-proactive-cancel", Button),
+        ]
+
+    def _focus_next(self) -> None:
+        controls = self._focus_controls()
+        current = self.focused
+        if current in controls:
+            controls[(controls.index(current) + 1) % len(controls)].focus()
+
+    def _focus_previous(self) -> None:
+        controls = self._focus_controls()
+        current = self.focused
+        if current in controls:
+            controls[(controls.index(current) - 1) % len(controls)].focus()
+
+
+class ConfigMentionPolicyScreen(ModalScreen[str | None]):
+    """Pick whether outgoing group replies should @ the requester."""
+
+    BINDINGS = [
+        ("escape", "cancel", "取消"),
+    ]
+
+    _OPTIONS = (
+        ("always", "Always：所有群回复都 @ 触发者"),
+        ("explicit", "Explicit：只在 @ / 引用 / 命令这类显式触发时 @"),
+        ("never", "Never：群回复都不 @ 人"),
+    )
+
+    def __init__(self, current: str) -> None:
+        super().__init__()
+        self._current = current if current in {"always", "explicit", "never"} else "explicit"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-mention-picker"):
+            yield Static("选择 @ 策略", id="config-mention-title")
+            for policy, label in self._OPTIONS:
+                yield Button(
+                    f"{_current_marker(self._current, policy)}{label}",
+                    id=f"config-mention-{policy}",
+                    classes="config-menu-item",
+                    compact=True,
+                )
+            with Horizontal(id="config-mention-buttons"):
+                yield Button("取消", id="config-mention-cancel", compact=True)
+            yield Static(
+                "Explicit 是默认值：显式问答会 @；probability / proactive 普通发送。Esc 取消",
+                id="config-mention-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(f"#config-mention-{self._current}", Button).focus()
+
+    def on_key(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key == "down":
+            event.stop()
+            self._focus_next()
+        elif event.key == "up":
+            event.stop()
+            self._focus_previous()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button_id = event.button.id or ""
+        if button_id.startswith("config-mention-") and button_id != "config-mention-cancel":
+            self.dismiss(button_id.removeprefix("config-mention-"))
+        elif button_id == "config-mention-cancel":
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _focus_controls(self) -> list[Button]:
+        return [
+            self.query_one("#config-mention-always", Button),
+            self.query_one("#config-mention-explicit", Button),
+            self.query_one("#config-mention-never", Button),
+            self.query_one("#config-mention-cancel", Button),
+        ]
+
+    def _focus_next(self) -> None:
+        controls = self._focus_controls()
+        current = self.focused
+        if current in controls:
+            controls[(controls.index(current) + 1) % len(controls)].focus()
+
+    def _focus_previous(self) -> None:
+        controls = self._focus_controls()
+        current = self.focused
+        if current in controls:
+            controls[(controls.index(current) - 1) % len(controls)].focus()
+
+
 class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     """Menu-style editor for the agent runtime config written to `.env`."""
 
@@ -389,6 +543,17 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         super().__init__()
         self._config = config
         self._backend = config.backend if config.backend in {"native", "openclaw"} else "native"
+        self._proactive_mode = (
+            config.proactive_mode
+            if config.proactive_mode in {"off", "reactive", "proactive"}
+            else "reactive"
+        )
+        self._agent_base_probability = _normalize_probability(config.agent_base_probability)
+        self._reply_mention_policy = (
+            config.reply_mention_policy
+            if config.reply_mention_policy in {"always", "explicit", "never"}
+            else "explicit"
+        )
         self._llm_model = config.llm_model
         self._openclaw_agent_id = config.openclaw_agent_id
 
@@ -407,6 +572,9 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             )
             yield Static("改完后需要保存才会写入 .env，并重启调度进程。", id="config-editor-save-hint")
             yield Button("", id="config-menu-backend", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-proactive-mode", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-probability", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-mention-policy", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-native-model", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-openclaw-agent", classes="config-menu-item", compact=True)
             yield Button(
@@ -442,6 +610,24 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                     ConfigBackendScreen(self._config, self._backend),
                     self._on_backend_changed,
                 )
+            case "config-menu-proactive-mode":
+                self.app.push_screen(
+                    ConfigProactiveModeScreen(self._proactive_mode),
+                    self._on_proactive_mode_changed,
+                )
+            case "config-menu-probability":
+                self.app.push_screen(
+                    ConfigValueScreen(
+                        title="概率唤醒阈值",
+                        value=_format_probability(self._agent_base_probability),
+                    ),
+                    self._on_probability_changed,
+                )
+            case "config-menu-mention-policy":
+                self.app.push_screen(
+                    ConfigMentionPolicyScreen(self._reply_mention_policy),
+                    self._on_mention_policy_changed,
+                )
             case "config-menu-native-model":
                 self.app.push_screen(
                     ConfigValueScreen(title="Native 模型", value=self._llm_model),
@@ -475,8 +661,11 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self.dismiss(
             AgentRuntimeConfig(
                 backend=self._backend,
+                proactive_mode=self._proactive_mode,
                 llm_model=llm_model,
                 openclaw_agent_id=openclaw_agent,
+                agent_base_probability=self._agent_base_probability,
+                reply_mention_policy=self._reply_mention_policy,
                 native_configured=self._config.native_configured,
                 openclaw_token_configured=self._config.openclaw_token_configured,
                 openclaw_configured=self._config.openclaw_configured,
@@ -489,6 +678,31 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     def _on_backend_changed(self, backend: str | None) -> None:
         if backend:
             self._backend = backend
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_proactive_mode_changed(self, mode: str | None) -> None:
+        if mode:
+            self._proactive_mode = mode
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_probability_changed(self, value: str | None) -> None:
+        if value is None:
+            return
+        probability = _parse_probability(value)
+        if probability is None:
+            self.query_one("#config-editor-help", Static).update(
+                "概率必须在 0 到 1 之间；可输入 0.05 或 5%。"
+            )
+            return
+        self._agent_base_probability = probability
+        self._refresh_menu()
+        self._mark_dirty()
+
+    def _on_mention_policy_changed(self, policy: str | None) -> None:
+        if policy:
+            self._reply_mention_policy = policy
             self._refresh_menu()
             self._mark_dirty()
 
@@ -508,6 +722,15 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self.query_one("#config-menu-backend", Button).label = (
             f"Agent 后端　{_backend_label(self._backend)}"
         )
+        self.query_one("#config-menu-proactive-mode", Button).label = (
+            f"主动模式　{_proactive_mode_label(self._proactive_mode)}"
+        )
+        self.query_one("#config-menu-probability", Button).label = (
+            f"概率唤醒　{_probability_label(self._agent_base_probability)}"
+        )
+        self.query_one("#config-menu-mention-policy", Button).label = (
+            f"@ 策略　{_mention_policy_label(self._reply_mention_policy)}"
+        )
         self.query_one("#config-menu-native-model", Button).label = (
             f"Native 模型　{_clip(self._llm_model, 52)}"
         )
@@ -523,6 +746,9 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     def _focus_controls(self) -> list[Button]:
         return [
             self.query_one("#config-menu-backend", Button),
+            self.query_one("#config-menu-proactive-mode", Button),
+            self.query_one("#config-menu-probability", Button),
+            self.query_one("#config-menu-mention-policy", Button),
             self.query_one("#config-menu-native-model", Button),
             self.query_one("#config-menu-openclaw-agent", Button),
             self.query_one("#config-menu-save", Button),
@@ -545,6 +771,9 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
 class RunDashboard(App[None]):
     """Fixed status panel, scrolling logs, and modal Local Ask."""
 
+    TITLE = "WeChat Oracle"
+    SUB_TITLE = "ops console"
+
     CSS = """
     Screen {
         layout: vertical;
@@ -553,18 +782,18 @@ class RunDashboard(App[None]):
     #status {
         height: 9;
         padding: 0 1;
-        border: round $panel;
-        background: $surface;
+        border: round #1f6feb;
+        background: #0b1118;
         color: $text;
     }
 
     #logs {
         height: 1fr;
-        border: round $panel;
-        background: $background;
+        border: round #1b3f5f;
+        background: #070b10;
     }
 
-    GroupPickerScreen, AskScreen, MemoryEditorScreen, ConfigScreen, ConfigBackendScreen, ConfigValueScreen {
+    GroupPickerScreen, AskScreen, MemoryEditorScreen, ConfigScreen, ConfigBackendScreen, ConfigProactiveModeScreen, ConfigMentionPolicyScreen, ConfigValueScreen {
         align: center middle;
     }
 
@@ -572,8 +801,8 @@ class RunDashboard(App[None]):
         width: 92;
         height: 24;
         padding: 1 2;
-        border: round $primary;
-        background: $surface;
+        border: round #1f6feb;
+        background: #0b1118;
     }
 
     #group-picker-title {
@@ -597,8 +826,8 @@ class RunDashboard(App[None]):
         width: 84;
         height: 10;
         padding: 1 2;
-        border: round $primary;
-        background: $surface;
+        border: round #1f6feb;
+        background: #0b1118;
     }
 
     #ask-dialog-title {
@@ -627,8 +856,8 @@ class RunDashboard(App[None]):
         width: 110;
         height: 34;
         padding: 1 2;
-        border: round $secondary;
-        background: $surface;
+        border: round #5ccfe6;
+        background: #0b1118;
     }
 
     #memory-editor-title {
@@ -657,8 +886,8 @@ class RunDashboard(App[None]):
         width: 92;
         height: 20;
         padding: 1 2;
-        border: round $secondary;
-        background: $surface;
+        border: round #5ccfe6;
+        background: #0b1118;
     }
 
     #config-editor-title {
@@ -693,8 +922,8 @@ class RunDashboard(App[None]):
         width: 92;
         height: 11;
         padding: 1 2;
-        border: round $secondary;
-        background: $surface;
+        border: round #5ccfe6;
+        background: #0b1118;
     }
 
     #config-backend-title {
@@ -713,12 +942,60 @@ class RunDashboard(App[None]):
         color: $text-muted;
     }
 
+    #config-proactive-picker {
+        width: 92;
+        height: 13;
+        padding: 1 2;
+        border: round #5ccfe6;
+        background: #0b1118;
+    }
+
+    #config-proactive-title {
+        height: 1;
+        text-style: bold;
+        color: $secondary;
+    }
+
+    #config-proactive-buttons {
+        height: 1;
+        margin-top: 0;
+    }
+
+    #config-proactive-help {
+        height: 2;
+        color: $text-muted;
+    }
+
+    #config-mention-picker {
+        width: 92;
+        height: 13;
+        padding: 1 2;
+        border: round #5ccfe6;
+        background: #0b1118;
+    }
+
+    #config-mention-title {
+        height: 1;
+        text-style: bold;
+        color: $secondary;
+    }
+
+    #config-mention-buttons {
+        height: 1;
+        margin-top: 0;
+    }
+
+    #config-mention-help {
+        height: 2;
+        color: $text-muted;
+    }
+
     #config-value-editor {
         width: 84;
         height: 10;
         padding: 1 2;
-        border: round $secondary;
-        background: $surface;
+        border: round #5ccfe6;
+        background: #0b1118;
     }
 
     #config-value-title {
@@ -938,28 +1215,28 @@ class RunDashboard(App[None]):
 
     def _append_local(self, text: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
-        self._log_buffer.append(f"{stamp} 本地 │ {text}")
+        self._log_buffer.append(f"{stamp} {'LOCAL':<8s} │ {text}")
 
     def _local_ask_status_lines(self) -> list[str]:
         if self._selected_group is None:
             group = f"[{_MUTED_STYLE}]未选择[/]"
-            detail = "提示：按 g 选择群"
+            detail = "hint press g to select"
         else:
             group = _markup_clip(self._selected_group.short_label, 28)
             detail = (
-                f"消息：{self._selected_group.msg_count} {_SEP} "
-                f"最近：{escape(self._selected_group.last_seen)} {_SEP} "
+                f"messages {self._selected_group.msg_count} {_SEP} "
+                f"last {escape(self._selected_group.last_seen)} {_SEP} "
                 f"ID：{_markup_clip(self._selected_group.group_id, 28)}"
             )
-        mode = _tag("允许写记忆", _WARN_STYLE) if self._allow_writes else _tag("只读", _OK_STYLE)
-        state = _tag("运行中", _WARN_STYLE) if self._ask_running else _tag("待命", _OK_STYLE)
+        mode = _tag("write", _WARN_STYLE) if self._allow_writes else _tag("read-only", _OK_STYLE)
+        state = _tag("running", _WARN_STYLE) if self._ask_running else _tag("standby", _OK_STYLE)
         return [
             _status_row(
-                "本地问答",
-                f"当前群：{group} {_SEP} 权限：{mode} {_SEP} 状态：{state} {_SEP} {detail}",
+                "LOCAL",
+                f"group {_status_value(group)} {_SEP} mode {mode} {_SEP} state {state} {_SEP} {detail}",
             ),
             _status_row(
-                "快捷操作",
+                "KEYS",
                 "[bold]a[/] 询问  [bold]g[/] 选群  [bold]m[/] 编辑记忆  [bold]c[/] 配置  [bold]w[/] 切换写入  [bold]q[/] 退出",
             ),
         ]
@@ -1047,33 +1324,39 @@ def status_lines_for_processes(
     proc_bits = []
     for name, pid, exit_code in process_rows:
         state = (
-            _tag(f"运行中（PID {pid}）", _OK_STYLE)
+            _tag(f"running PID {pid}", _OK_STYLE)
             if exit_code is None
-            else _tag(f"已退出（退出码 {exit_code}）", _BAD_STYLE)
+            else _tag(f"exited {exit_code}", _BAD_STYLE)
         )
-        proc_bits.append(f"{escape(_process_label(name))}：{state}")
-    watch_label = "所有群聊" if not settings.groups else ", ".join(settings.groups)
-    bot_label = settings.bot_name or "未设置"
-    reply_label = _tag(settings.reply_backend, _OK_STYLE) if settings.reply else _tag("关闭", _MUTED_STYLE)
-    lurk_label = _tag("开启", _OK_STYLE) if settings.agent_lurk_enabled else _tag("关闭", _MUTED_STYLE)
+        proc_bits.append(f"{escape(_process_label(name))} {state}")
+    watch_label = "all groups" if not settings.groups else ", ".join(settings.groups)
+    bot_label = settings.bot_name or "unset"
+    reply_label = _tag(settings.reply_backend, _OK_STYLE) if settings.reply else _tag("off", _MUTED_STYLE)
+    lurk_label = _tag("on", _OK_STYLE) if settings.agent_lurk_enabled else _tag("off", _MUTED_STYLE)
+    stance_label = _proactive_status_label(agent_config.proactive_mode)
+    wake_label = _wake_status_label(
+        agent_config.agent_base_probability, agent_config.proactive_mode
+    )
+    mention_label = _mention_status_label(agent_config.reply_mention_policy)
     return [
-        f"[bold]WeChat Oracle[/] | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"[bold #5ccfe6]WeChat Oracle[/] [#245b73]//[/] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         _status_row(
-            "助手配置",
-            f"昵称：{_markup_clip(bot_label, 24)} {_SEP} "
-            f"智能体：{_markup_clip(agent_label, 40)} {_SEP} "
-            f"余额：{balance_label} {_SEP} 回复：{reply_label} {_SEP} 潜水：{lurk_label}",
+            "BOT",
+            f"name {_markup_clip(bot_label, 24)} {_SEP} "
+            f"agent {_markup_clip(agent_label, 40)} {_SEP} "
+            f"balance {balance_label} {_SEP} reply {reply_label} {_SEP} "
+            f"@ {mention_label} {_SEP} lurk {lurk_label} {_SEP} "
+            f"stance {stance_label} {_SEP} wake {wake_label}",
         ),
         _status_row(
-            "监控范围",
-            f"群聊：{_markup_clip(watch_label, 68)} {_SEP} WeFlow：{_markup_clip(settings.weflow_base_url, 32)}",
+            "WATCH",
+            f"groups {_markup_clip(watch_label, 68)} {_SEP} WeFlow {_markup_clip(settings.weflow_base_url, 32)}",
         ),
         _status_row(
-            "数据状态",
-            f"消息：{total} {_SEP} 群聊：{groups} {_SEP} 路径：{_markup_clip(str(settings.db_path), 52)}",
+            "DB",
+            f"messages {total} {_SEP} groups {groups} {_SEP} path {_markup_clip(str(settings.db_path), 52)}",
         ),
-        _status_row("进程状态", f" {_SEP} ".join(proc_bits) if proc_bits else "未启动"),
-        _status_row("日志文件", "data/*.process.log  data/events.jsonl  data/dispatcher.log"),
+        _status_row("PROC", f" {_SEP} ".join(proc_bits) if proc_bits else "not started"),
     ]
 
 
@@ -1081,7 +1364,7 @@ def _balance_label(backend: str, *, native_configured: bool | None = None) -> st
     if backend != "native":
         return f"[{_MUTED_STYLE}]-[/]"
     if native_configured is False or (native_configured is None and not settings.llm_api_key):
-        return _tag("无 key", _BAD_STYLE)
+        return _tag("no key", _BAD_STYLE)
     now = time.time()
     with _BALANCE_LOCK:
         stale = now - _BALANCE_STATUS.updated_at > _BALANCE_REFRESH_SECONDS
@@ -1093,7 +1376,7 @@ def _balance_label(backend: str, *, native_configured: bool | None = None) -> st
     if label.startswith("error:"):
         shown = _tag(label, _BAD_STYLE)
     elif label == "loading":
-        shown = _tag("加载中", _WARN_STYLE)
+        shown = _tag("loading", _WARN_STYLE)
     else:
         shown = _tag(label, _OK_STYLE)
     return shown + ("*" if refreshing and label != "loading" else "")
@@ -1146,7 +1429,7 @@ def _format_balance_label(payload: dict[str, object]) -> str:
     available = payload.get("is_available")
     infos = payload.get("balance_infos")
     if not isinstance(infos, list) or not infos:
-        return "可用" if available else "不可用"
+        return "available" if available else "unavailable"
     parts: list[str] = []
     for item in infos:
         if not isinstance(item, dict):
@@ -1159,7 +1442,7 @@ def _format_balance_label(payload: dict[str, object]) -> str:
         parts.append(prefix + str(total))
     if parts:
         return ", ".join(parts)
-    return "可用" if available else "不可用"
+    return "available" if available else "unavailable"
 
 
 def _clip(value: object, max_len: int) -> str:
@@ -1167,6 +1450,50 @@ def _clip(value: object, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[: max(0, max_len - 1)] + "~"
+
+
+def _normalize_probability(value: object) -> float:
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        return 0.25
+    if not 0.0 <= probability <= 1.0:
+        return 0.25
+    return probability
+
+
+def _parse_probability(value: str) -> float | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("%"):
+            probability = float(text[:-1].strip()) / 100.0
+        else:
+            probability = float(text)
+    except ValueError:
+        return None
+    if not 0.0 <= probability <= 1.0:
+        return None
+    return probability
+
+
+def _format_probability(value: object) -> str:
+    return f"{_normalize_probability(value):g}"
+
+
+def _probability_label(value: object) -> str:
+    probability = _normalize_probability(value)
+    return f"{probability:g} ({probability * 100:.1f}%)"
+
+
+def _percent_label(value: object) -> str:
+    probability = _normalize_probability(value)
+    if probability == 0:
+        return "0%"
+    if probability < 0.01:
+        return f"{probability * 100:.2f}%"
+    return f"{probability * 100:.1f}%"
 
 
 def _markup_clip(value: object, max_len: int) -> str:
@@ -1178,22 +1505,74 @@ def _tag(text: object, style: str) -> str:
 
 
 def _status_row(label: str, body: str) -> str:
-    return f"[{_LABEL_STYLE}]{escape(label)}[/] ： {body}"
+    return f"[{_LABEL_STYLE}]{escape(label):<6s}[/] {body}"
+
+
+def _status_value(value: str) -> str:
+    return f"[#d6deeb]{value}[/]"
 
 
 def _process_label(name: str) -> str:
     return {
-        "live": "采集",
-        "dispatcher": "调度",
-        "mm": "识别",
-        "run": "系统",
-    }.get(name, name)
+        "live": "INGEST",
+        "dispatcher": "DISPATCH",
+        "mm": "MEDIA",
+        "run": "SYSTEM",
+    }.get(name, name.upper())
 
 
 def _backend_label(backend: str) -> str:
     if backend == "openclaw":
         return "OpenClaw：外部 Agent runtime"
     return "Native：本进程工具链"
+
+
+def _proactive_mode_label(mode: str) -> str:
+    match mode:
+        case "off":
+            return "Off：只响应 @ / 引用"
+        case "proactive":
+            return "Proactive：允许低频主动抛话题"
+        case _:
+            return "Reactive：只接当前话题"
+
+
+def _proactive_status_label(mode: str) -> str:
+    match mode:
+        case "off":
+            return _tag("off", _MUTED_STYLE)
+        case "proactive":
+            return _tag("proactive", _WARN_STYLE)
+        case _:
+            return _tag("reactive", _OK_STYLE)
+
+
+def _mention_policy_label(policy: str) -> str:
+    match policy:
+        case "always":
+            return "Always：所有群回复都 @"
+        case "never":
+            return "Never：群回复都不 @"
+        case _:
+            return "Explicit：只 @ 显式触发"
+
+
+def _mention_status_label(policy: str) -> str:
+    match policy:
+        case "always":
+            return _tag("always", _WARN_STYLE)
+        case "never":
+            return _tag("never", _MUTED_STYLE)
+        case _:
+            return _tag("explicit", _OK_STYLE)
+
+
+def _wake_status_label(probability: object, proactive_mode: str) -> str:
+    value = _normalize_probability(probability)
+    if proactive_mode == "off" or value <= 0:
+        return _tag("off", _MUTED_STYLE)
+    style = _WARN_STYLE if value >= 0.15 else _OK_STYLE
+    return _tag(_percent_label(value), style)
 
 
 def _current_marker(current: str, value: str) -> str:

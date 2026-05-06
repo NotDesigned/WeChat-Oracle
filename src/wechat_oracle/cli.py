@@ -19,6 +19,7 @@ from pathlib import Path
 from collections import deque
 from datetime import datetime
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -139,8 +140,10 @@ def setup(
         "WO_BOT_NAME": bot_name,
         "WO_REPLY": _env_bool(reply),
         "WO_REPLY_BACKEND": reply_backend,
+        "WO_REPLY_MENTION_POLICY": settings.reply_mention_policy,
         "WO_AGENT_BACKEND": backend,
         "WO_AGENT_BASE_PROBABILITY": str(settings.agent_base_probability),
+        "WO_AGENT_PROACTIVE_MODE": settings.agent_proactive_mode,
         "WO_AGENT_RECENT_CONTEXT_CHAT": str(settings.agent_recent_context_chat),
         "WO_LLM_MAX_TOKENS": str(settings.llm_max_tokens),
         "WO_LLM_WRITE_MAX_TOKENS": str(settings.llm_write_max_tokens or ""),
@@ -388,23 +391,53 @@ def _looks_like_model_call_log(text: str) -> bool:
 
 def _dashboard_log_line(source: str, text: str) -> str:
     stamp = datetime.now().strftime("%H:%M:%S")
-    return f"{stamp} {_dashboard_source_label(source)} │ {text}"
+    return f"{stamp} {_dashboard_source_label(source)} │ {_compact_child_log(text)}"
+
+
+_LOGURU_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s*\|\s*"
+    r"(?P<level>[A-Z]+)\s*\|\s*(?P<body>.*)$"
+)
+
+
+def _compact_child_log(text: str) -> str:
+    match = _LOGURU_LINE_RE.match(text)
+    if not match:
+        return text
+    level = match.group("level")
+    body = _shorten_loguru_body(match.group("body"))
+    return f"{level:<7s} │ {body}"
+
+
+_LOGURU_BODY_RE = re.compile(
+    r"^(?:wechat_oracle\.)?(?P<module>[\w.]+):(?P<func>\w+):(?P<line>\d+)\s+-\s+(?P<msg>.*)$"
+)
+
+
+def _shorten_loguru_body(body: str) -> str:
+    match = _LOGURU_BODY_RE.match(body)
+    if not match:
+        return body
+    module = match.group("module").replace("wechat_oracle.", "")
+    module = module.removeprefix("ingest.")
+    return f"{module}.{match.group('func')}:{match.group('line')}  {match.group('msg')}"
 
 
 def _dashboard_source_label(source: str) -> str:
-    return {
-        "run": "系统",
-        "live": "采集",
-        "dispatcher": "调度",
-        "mm": "识别",
-    }.get(source, source[:4])
+    label = {
+        "run": "SYSTEM",
+        "live": "INGEST",
+        "dispatcher": "DISPATCH",
+        "mm": "MEDIA",
+    }.get(source, source[:8].upper())
+    return f"{label:<8s}"
 
 
 def _dashboard_process_label(name: str) -> str:
     return {
-        "live": "采集进程",
-        "dispatcher": "调度进程",
-        "mm": "识别进程",
+        "live": "INGEST",
+        "dispatcher": "DISPATCH",
+        "mm": "MEDIA",
     }.get(name, name)
 
 
@@ -446,7 +479,7 @@ def run(
     log_lock = threading.Lock()
     readers: list[threading.Thread] = []
     if plain:
-        typer.echo("正在启动 WeChat Oracle：")
+        typer.echo("starting WeChat Oracle:")
 
     def start_process(name: str) -> subprocess.Popen[str]:
         cmd = commands[name]
@@ -457,7 +490,7 @@ def run(
         else:
             with log_lock:
                 log_lines.append(
-                    _dashboard_log_line("run", f"启动{_dashboard_process_label(name)}：{' '.join(cmd)}")
+                    _dashboard_log_line("run", f"starting {_dashboard_process_label(name)}  {' '.join(cmd)}")
                 )
             proc = subprocess.Popen(
                 cmd,
@@ -480,7 +513,7 @@ def run(
             manual_restarts.add(name)
         if proc is not None:
             with log_lock:
-                log_lines.append(_dashboard_log_line("run", f"正在重启{_dashboard_process_label(name)}"))
+                log_lines.append(_dashboard_log_line("run", f"restarting {_dashboard_process_label(name)}"))
             _terminate_process_tree(proc)
             deadline = time.time() + (2.0 if os.name == "nt" else 10.0)
             while proc.poll() is None and time.time() < deadline:
@@ -491,7 +524,7 @@ def run(
         with process_lock:
             manual_restarts.discard(name)
         with log_lock:
-            log_lines.append(_dashboard_log_line("run", f"{_dashboard_process_label(name)}已重启"))
+            log_lines.append(_dashboard_log_line("run", f"{_dashboard_process_label(name)} restarted"))
 
     for name in commands:
         start_process(name)
@@ -510,7 +543,7 @@ def run(
                     code = proc.poll()
                     if code is not None:
                         typer.echo(
-                            f"{_dashboard_process_label(name)}已退出，退出码 {code}；正在停止其他进程"
+                            f"{_dashboard_process_label(name)} exited with code {code}; stopping remaining processes"
                         )
                         raise KeyboardInterrupt
                 time.sleep(1.0)
@@ -532,7 +565,7 @@ def run(
                     log_lines.append(
                         _dashboard_log_line(
                             "run",
-                            "配置已写入 .env；正在让新的调度配置生效",
+                            "config saved to .env; restarting DISPATCH to apply it",
                         )
                     )
                 restart_process("dispatcher")
@@ -561,7 +594,7 @@ def run(
                                 log_lines.append(
                                     _dashboard_log_line(
                                         "run",
-                                        f"{_dashboard_process_label(child_name)}已退出，退出码 {code}；正在停止其他进程",
+                                        f"{_dashboard_process_label(child_name)} exited with code {code}; stopping remaining processes",
                                     )
                                 )
                             try:
@@ -583,9 +616,9 @@ def run(
     finally:
         if not stop_requested and not plain:
             with log_lock:
-                log_lines.append(_dashboard_log_line("run", "正在停止 WeChat Oracle..."))
+                log_lines.append(_dashboard_log_line("run", "stopping WeChat Oracle"))
         if plain:
-            typer.echo("正在停止 WeChat Oracle...")
+            typer.echo("stopping WeChat Oracle...")
         with process_lock:
             current_procs = list(procs.values())
         for proc in current_procs:
@@ -597,10 +630,10 @@ def run(
             if proc.poll() is None:
                 _terminate_process_tree(proc, force=True)
         if plain:
-            typer.echo("已停止")
+            typer.echo("stopped")
         else:
             with log_lock:
-                log_lines.append(_dashboard_log_line("run", "已停止"))
+                log_lines.append(_dashboard_log_line("run", "stopped"))
 
 
 @verify_app.command("roundtrip")
