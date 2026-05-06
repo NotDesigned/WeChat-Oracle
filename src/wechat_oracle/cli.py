@@ -359,12 +359,14 @@ def _start_log_reader(
 ) -> threading.Thread:
     def read() -> None:
         assert proc.stdout is not None
+        formatter = _DashboardLogFormatter(name)
         for line in proc.stdout:
             text = line.rstrip()
             if not text:
                 continue
             with lock:
-                log_lines.append(_dashboard_log_line(name, text))
+                for rendered in formatter.feed(text):
+                    log_lines.append(rendered)
             if _looks_like_model_call_log(text):
                 try:
                     from .run_tui import request_balance_refresh
@@ -372,6 +374,9 @@ def _start_log_reader(
                     request_balance_refresh()
                 except Exception:
                     pass
+        with lock:
+            for rendered in formatter.flush():
+                log_lines.append(rendered)
 
     thread = threading.Thread(target=read, name=f"wechat-oracle-{name}-log", daemon=True)
     thread.start()
@@ -392,6 +397,99 @@ def _looks_like_model_call_log(text: str) -> bool:
 def _dashboard_log_line(source: str, text: str) -> str:
     stamp = datetime.now().strftime("%H:%M:%S")
     return f"{stamp} {_dashboard_source_label(source)} │ {_compact_child_log(text)}"
+
+
+class _DashboardLogFormatter:
+    """Stateful formatter for child stdout shown in the TUI.
+
+    Dispatcher agent output is printed as a small burst of related lines. Group
+    those bursts into a single card-like block, while leaving ordinary process
+    logs as compact one-line records.
+    """
+
+    def __init__(self, source: str) -> None:
+        self._source = source
+        self._pending_stamp: str | None = None
+        self._pending_lines: list[str] = []
+
+    def feed(self, text: str) -> list[str]:
+        if self._source != "dispatcher":
+            return [_dashboard_log_line(self._source, text)]
+        if text.startswith("msg="):
+            out = self.flush()
+            self._pending_stamp = datetime.now().strftime("%H:%M:%S")
+            self._pending_lines = [text]
+            return out
+        if self._pending_lines and text.startswith("  "):
+            self._pending_lines.append(text)
+            if text.strip().startswith("send:"):
+                return self.flush()
+            return []
+        out = self.flush()
+        out.append(_dashboard_log_line(self._source, text))
+        return out
+
+    def flush(self) -> list[str]:
+        if not self._pending_lines:
+            return []
+        rendered = _dashboard_event_card(
+            self._source,
+            self._pending_stamp or datetime.now().strftime("%H:%M:%S"),
+            self._pending_lines,
+        )
+        self._pending_stamp = None
+        self._pending_lines = []
+        return [rendered]
+
+
+_EVENT_START_RE = re.compile(
+    r"^msg=(?P<msg_id>\d+)\s+group=(?P<group>.*?)\s+from=(?P<sender>.*?)\s+type=(?P<msg_type>\S+)"
+)
+
+
+def _dashboard_event_card(source: str, stamp: str, lines: list[str]) -> str:
+    label = _dashboard_source_label(source)
+    prefix = f"{stamp} {label} │ "
+    cont = " " * len(prefix)
+    start = lines[0]
+    match = _EVENT_START_RE.match(start)
+    if match:
+        header = (
+            f"msg {match.group('msg_id')} · {match.group('group')} · "
+            f"{match.group('sender')} · {match.group('msg_type')}"
+        )
+    else:
+        header = start
+    body: list[str] = [prefix + f"╭─ {header}"]
+    closing = cont + "╰─"
+    for raw in lines[1:]:
+        line = raw.strip()
+        if line.startswith("trigger:"):
+            body.append(cont + "│ " + line.replace("trigger:", "trigger", 1))
+        elif line.startswith("text:"):
+            body.append(cont + "│ text   " + _clip_dashboard_payload(line.removeprefix("text:").strip(), 220))
+        elif line.startswith("agent:"):
+            body.append(cont + "│ agent  " + line.removeprefix("agent:").strip())
+        elif line.startswith("openclaw:"):
+            body.append(cont + "│ llm    " + line.removeprefix("openclaw:").strip())
+        elif line.startswith("tools:"):
+            body.append(cont + "│ tools  " + _clip_dashboard_payload(line.removeprefix("tools:").strip(), 220))
+        elif line.startswith("memory:"):
+            body.append(cont + "│ memory " + _clip_dashboard_payload(line.removeprefix("memory:").strip(), 220))
+        elif line.startswith("reply:"):
+            body.append(cont + "│ reply  " + _clip_dashboard_payload(line.removeprefix("reply:").strip(), 260))
+        elif line.startswith("send:"):
+            closing = cont + "╰─ send   " + line.removeprefix("send:").strip()
+        else:
+            body.append(cont + "│ " + _clip_dashboard_payload(line, 220))
+    body.append(closing)
+    return "\n".join(body)
+
+
+def _clip_dashboard_payload(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
 
 
 _LOGURU_LINE_RE = re.compile(

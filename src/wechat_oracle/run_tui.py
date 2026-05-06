@@ -1235,10 +1235,6 @@ class RunDashboard(App[None]):
                 "LOCAL",
                 f"group {_status_value(group)} {_SEP} mode {mode} {_SEP} state {state} {_SEP} {detail}",
             ),
-            _status_row(
-                "KEYS",
-                "[bold]a[/] 询问  [bold]g[/] 选群  [bold]m[/] 编辑记忆  [bold]c[/] 配置  [bold]w[/] 切换写入  [bold]q[/] 退出",
-            ),
         ]
 
     def _select_default_group(self) -> None:
@@ -1344,9 +1340,11 @@ def status_lines_for_processes(
             "BOT",
             f"name {_markup_clip(bot_label, 24)} {_SEP} "
             f"agent {_markup_clip(agent_label, 40)} {_SEP} "
-            f"balance {balance_label} {_SEP} reply {reply_label} {_SEP} "
-            f"@ {mention_label} {_SEP} lurk {lurk_label} {_SEP} "
-            f"stance {stance_label} {_SEP} wake {wake_label}",
+            f"balance {balance_label} {_SEP} reply {reply_label} {_SEP} @ {mention_label}",
+        ),
+        _status_row(
+            "AMBIENT",
+            f"stance {stance_label} {_SEP} wake {wake_label} {_SEP} lurk {lurk_label}",
         ),
         _status_row(
             "WATCH",
@@ -1505,7 +1503,7 @@ def _tag(text: object, style: str) -> str:
 
 
 def _status_row(label: str, body: str) -> str:
-    return f"[{_LABEL_STYLE}]{escape(label):<6s}[/] {body}"
+    return f"[{_LABEL_STYLE}]{escape(label):<7s}[/] {body}"
 
 
 def _status_value(value: str) -> str:
