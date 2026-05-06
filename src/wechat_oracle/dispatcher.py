@@ -41,6 +41,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1229,11 +1230,9 @@ def _run_vision_on_quoted_image(
     return ExecResult(stdout=stdout, chat=reply, summary=f"{summary_label} ({len(reply)} chars)")
 
 
-# Image-path resolution moved to agent/media_paths.py (single source) so
-# the agent's read_image tool and dispatcher's /explain & /ask paths share
-# one implementation. The legacy `m:N` cand_id resolver
-# (resolve_image_paths_by_cand) is no longer imported here — it was only
-# wired into the deleted vision-sentinel two-pass.
+# Image-path resolution lives in agent/media_paths.py so the agent's
+# read_image tool and dispatcher's /explain & /ask paths share one
+# implementation.
 from .agent.media_paths import (
     openclaw_quoted_hint as _openclaw_quoted_hint,
     resolve_quoted_image_path as _resolve_quoted_image_path,
@@ -1815,11 +1814,10 @@ def _next_unprocessed(
 ) -> list[sqlite3.Row]:
     """Oldest `batch` live messages with no command_runs row yet, globally.
 
-    No per-group serialization: same-group messages may be processed in
-    parallel (multiple agent runs on the one connection-per-thread + WAL).
-    De-duplication of in-flight msg_ids happens in `_GlobalScheduler.submit`;
-    `_claim` is the source-of-truth gate that turns a row into a
-    command_runs row and removes it from this query's output.
+    `_GlobalScheduler` serializes processing per group while allowing
+    different groups to run in parallel. `_GlobalScheduler.submit` claims rows
+    before queueing them, so queued/in-flight rows immediately disappear from
+    this query's output and cannot starve later groups behind a same-group batch.
 
     Includes all message types except 'system' (撤回 / 入群 / 退群 — ambient
     events, not user speech). `forward` / `link` / `image` / `voice` /
@@ -2241,13 +2239,11 @@ class _SerialReplier:
 
 
 class _GlobalScheduler:
-    """Global thread pool — all messages run in parallel, dedup by msg_id.
+    """Global thread pool with per-conversation FIFO queues.
 
-    No per-group serialization: agent runs for two messages in the same group
-    can execute concurrently. Trade-off: if a single user fires two
-    @-mentions back-to-back and the second's run finishes first, the bot's
-    replies arrive in completion order rather than message order. Accepted
-    for throughput.
+    Messages from the same group run serially; different groups can occupy
+    different worker threads. This prevents a probability wake-up from
+    racing a preceding mention before the mention has updated cooldown/state.
 
     The replier is a `_SerialReplier` — wx4py drives one GUI window, so
     the actual `send` call must happen from a single thread. Workers
@@ -2276,8 +2272,9 @@ class _GlobalScheduler:
             max_workers=max(1, max_workers),
             thread_name_prefix="wechat-oracle-msg",
         )
-        self._lock = threading.Lock()
-        self._scheduled_msg_ids: set[int] = set()
+        self._lock = threading.Condition(threading.Lock())
+        self._group_queues: dict[str, deque[dict[str, object]]] = {}
+        self._active_group_ids: set[str] = set()
         self._closed = False
 
     def _llm(self) -> LLMClient:
@@ -2299,33 +2296,72 @@ class _GlobalScheduler:
         sleeps."""
         row_dict = dict(row)
         msg_id = int(row_dict["msg_id"])
+        group_key = self._group_key(row_dict)
         with self._lock:
-            if self._closed or msg_id in self._scheduled_msg_ids:
+            if self._closed:
                 return False
-            self._scheduled_msg_ids.add(msg_id)
-            self._executor.submit(self._handle, row_dict)
+
+        with get_conn() as conn:
+            if not _claim(conn, msg_id):
+                return False
+            append_event("dispatcher.claim", **_row_event_fields(row_dict))
+
+        next_row: dict[str, object] | None = None
+        with self._lock:
+            if self._closed:
+                self._finalize_abandoned_claim(msg_id)
+                return False
+            queue_for_group = self._group_queues.setdefault(group_key, deque())
+            queue_for_group.append(row_dict)
+            if group_key not in self._active_group_ids:
+                self._active_group_ids.add(group_key)
+                next_row = queue_for_group.popleft()
+        if next_row is not None:
+            self._executor.submit(self._handle, group_key, next_row)
         return True
+
+    @staticmethod
+    def _group_key(row: dict[str, object]) -> str:
+        group_id = row.get("group_id")
+        if group_id:
+            return f"group:{group_id}"
+        sender = row.get("sender_wxid") or row.get("sender_display") or row["msg_id"]
+        return f"direct:{sender}"
+
+    @staticmethod
+    def _finalize_abandoned_claim(msg_id: int) -> None:
+        try:
+            with get_conn() as conn:
+                _finalize(conn, msg_id, "error", "scheduler closed after claim")
+        except Exception:
+            logger.exception("failed to finalize abandoned claimed msg_id={}", msg_id)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            while self._active_group_ids:
+                self._lock.wait(timeout=1)
         self._executor.shutdown(wait=True)
 
-    def _forget(self, msg_id: int) -> None:
+    def _complete_one(self, group_key: str) -> None:
+        next_row: dict[str, object] | None = None
         with self._lock:
-            self._scheduled_msg_ids.discard(msg_id)
+            queue_for_group = self._group_queues.get(group_key)
+            if queue_for_group:
+                next_row = queue_for_group.popleft()
+            else:
+                self._group_queues.pop(group_key, None)
+                self._active_group_ids.discard(group_key)
+                if not self._active_group_ids:
+                    self._lock.notify_all()
+        if next_row is not None:
+            self._executor.submit(self._handle, group_key, next_row)
 
-    def _handle(self, row: dict[str, object]) -> None:
+    def _handle(self, group_key: str, row: dict[str, object]) -> None:
         msg_id = int(row["msg_id"])
         try:
             try:
                 with get_conn() as conn:
-                    # Source-of-truth dedup: even if our in-memory set somehow
-                    # missed, _claim is an atomic INSERT into command_runs and
-                    # rejects duplicates.
-                    if not _claim(conn, msg_id):
-                        return
-                    append_event("dispatcher.claim", **_row_event_fields(row))
                     _process(
                         conn,
                         self._llm(),
@@ -2344,7 +2380,7 @@ class _GlobalScheduler:
                 except Exception:
                     logger.exception("failed to finalize crashed msg_id={}", msg_id)
         finally:
-            self._forget(msg_id)
+            self._complete_one(group_key)
 
 
 class _LurkScheduler:

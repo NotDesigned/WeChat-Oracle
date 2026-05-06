@@ -193,7 +193,8 @@ The agent can extend its view with tools:
 | `get_message_context` | Read nearby messages before/after a specific `messages.msg_id`. |
 | `view_quoted_chain` | Walk quote-reply parents up to a small depth. |
 | `expand_forward_bundle` | Show children of a merged-forward wrapper. |
-| `read_image` | Send one image file to the configured vision model. |
+| `read_image` | Send one image file to the configured vision model and return a textual reading. |
+| `load_image` | OpenClaw MCP only: return the original image bytes as an MCP image block so the agent can inspect pixels directly. |
 | `read_voice` | Return or compute ASR transcript for one voice message. |
 | `read_group_memory` | Read the current long-term group memory document. |
 

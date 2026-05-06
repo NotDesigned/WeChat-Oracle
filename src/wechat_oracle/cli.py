@@ -1,6 +1,6 @@
 """Typer CLI entry point: `wechat-oracle <subcommand>`.
 
-Three production subcommands (each is a long-running process or one-shot job):
+Production entry points include long-running processes, one-shot imports, and diagnostics:
   - `init-db`           - create schema (idempotent)
   - `ingest backfill`   - one-shot import of historical export files
   - `ingest live`       - long-running SSE subscriber -> DB writer
@@ -533,14 +533,14 @@ def openclaw_mcp_test() -> None:
                             typer.echo("      " + text.replace("\n", "\n      ")[:300])
 
                 if img_row is None:
-                    typer.echo("[4/4] skip read_image - no image rows with media_path in DB")
+                    typer.echo("[4/4] skip load_image - no image rows with media_path in DB")
                 else:
                     typer.echo(
-                        f"[4/4] read_image(group_id={img_row['group_id']!r}, "
+                        f"[4/4] load_image(group_id={img_row['group_id']!r}, "
                         f"msg_id={img_row['msg_id']}) ..."
                     )
                     img_result = await session.call_tool(
-                        "read_image",
+                        "load_image",
                         {"group_id": img_row["group_id"], "msg_id": int(img_row["msg_id"])},
                     )
                     typer.echo(f"      isError={getattr(img_result, 'isError', None)}")

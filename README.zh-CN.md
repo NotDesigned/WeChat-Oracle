@@ -46,7 +46,7 @@ uv run wechat-oracle ingest live
 uv run wechat-oracle dispatcher
 ```
 
-`ingest live` 启动 SSE 订阅，并内嵌一个 mm worker 线程。`dispatcher` 轮询 SQLite，处理显式命令和 agent 触发，并把所有 wx4py 发送操作串行化到一个发送线程，保证同一时间只有一个 GUI 操作触碰微信。
+`ingest live` 启动 SSE 订阅，并内嵌一个 mm worker 线程。`dispatcher` 轮询 SQLite，按群串行、跨群并行地处理显式命令和 agent 触发，并把所有 wx4py 发送操作串行化到一个发送线程，保证同一时间只有一个 GUI 操作触碰微信。
 
 ## 环境要求
 
@@ -331,7 +331,7 @@ transcript 状态：
 - `''`：已处理，但没有识别出文字。
 - 非空文本：可用的 OCR/ASR 结果。
 
-如果配置了 `WO_VISION_API_KEY`，agent chat 和 `/explain` / `/ask` 可以把被引用的图片发送给视觉模型直接读取。否则图片处理会回退到 OCR 文本和占位符。
+如果配置了 `WO_VISION_API_KEY`，agent chat 和 `/explain` / `/ask` 可以把被引用的图片发送给视觉模型直接读取。否则 native 图片处理会回退到 OCR 文本和占位符。OpenClaw 模式下，MCP 还会暴露 `load_image`，它返回原始图片 block 供具备视觉能力的 OpenClaw agent 直接看图；`read_image` 仍然表示“返回文字化读图结果”。
 
 ## 数据模型
 
@@ -368,7 +368,6 @@ transcript 状态：
 | `WO_WX4PY_LOG_LEVEL` | `WARNING` | wx4py 内部 Python logging 级别；只有排查 UI 自动化时才建议设为 `INFO`。 |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root。 |
 | `WO_WEFLOW_TOKEN` | empty | WeFlow token。 |
-| `WO_WEFLOW_POLL_INTERVAL` | `30.0` | 已废弃；live 使用 SSE。 |
 | `WO_BOT_NAME` | empty | bot 在群里的昵称。dispatcher 必填。 |
 | `WO_BOT_WXID` | empty | 可选 bot wxid，用于 reply-to-bot 触发。 |
 | `WO_LLM_PROVIDER` | `openai-compatible` | LLM provider adapter。 |
@@ -377,7 +376,7 @@ transcript 状态：
 | `WO_LLM_MODEL` | `deepseek-v4-pro` | 模型名。 |
 | `WO_LLM_JSON_MODE` | `native` | `native` 或 `prompt` JSON mode。 |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | DB 轮询间隔，单位秒。 |
-| `WO_DISPATCHER_WORKER_THREADS` | `4` | 全局消息 worker；wx4py 发送仍然串行。 |
+| `WO_DISPATCHER_WORKER_THREADS` | `4` | 全局消息 worker；同群消息串行处理，不同群可并行，wx4py 发送仍然串行。 |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` 候选上限。 |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | 旧聊天上下文上限，部分总结路径仍使用。 |
 | `WO_LLM_MAX_TOKENS` | `5000` | 通用输出上限。 |

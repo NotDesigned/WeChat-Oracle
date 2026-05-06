@@ -46,7 +46,7 @@ uv run wechat-oracle ingest live
 uv run wechat-oracle dispatcher
 ```
 
-`ingest live` starts the SSE subscriber and an embedded mm worker thread. `dispatcher` polls SQLite, processes explicit commands and agent triggers, and serializes all wx4py sends through one sender thread so only one GUI operation touches WeChat at a time.
+`ingest live` starts the SSE subscriber and an embedded mm worker thread. `dispatcher` polls SQLite, processes explicit commands and agent triggers with per-group ordering and cross-group parallelism, and serializes all wx4py sends through one sender thread so only one GUI operation touches WeChat at a time.
 
 ## Requirements
 
@@ -331,7 +331,7 @@ Transcript states:
 - `''`: processed but no text recognized.
 - non-empty text: usable OCR/ASR result.
 
-If `WO_VISION_API_KEY` is configured, agent chat and `/explain` / `/ask` can send referenced images to a vision model for direct reading. Without it, image handling falls back to OCR text and placeholders.
+If `WO_VISION_API_KEY` is configured, agent chat and `/explain` / `/ask` can send referenced images to a vision model for direct reading. Without it, native image handling falls back to OCR text and placeholders. In OpenClaw mode, MCP also exposes `load_image`, which returns the original image block for a vision-capable OpenClaw agent to inspect directly; `read_image` still means "return a textual vision-model reading".
 
 ## Data Model
 
@@ -368,7 +368,6 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_WX4PY_LOG_LEVEL` | `WARNING` | Python logging level for wx4py internals; set to `INFO` only when debugging UI automation. |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root. |
 | `WO_WEFLOW_TOKEN` | empty | WeFlow token. |
-| `WO_WEFLOW_POLL_INTERVAL` | `30.0` | Deprecated; live uses SSE. |
 | `WO_BOT_NAME` | empty | Bot's group nickname. Required by dispatcher. |
 | `WO_BOT_WXID` | empty | Optional bot wxid for reply-to-bot trigger. |
 | `WO_LLM_PROVIDER` | `openai-compatible` | LLM provider adapter. |
@@ -377,7 +376,7 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_LLM_MODEL` | `deepseek-v4-pro` | Model name. |
 | `WO_LLM_JSON_MODE` | `native` | `native` or `prompt` JSON mode. |
 | `WO_DISPATCHER_POLL_INTERVAL` | `3.0` | DB polling interval in seconds. |
-| `WO_DISPATCHER_WORKER_THREADS` | `4` | Global message workers; wx4py sends remain serialized. |
+| `WO_DISPATCHER_WORKER_THREADS` | `4` | Global message workers. Messages are serialized per group but different groups can run in parallel; wx4py sends remain serialized. |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` candidate cap. |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | Legacy chat context cap, still used by some summary paths. |
 | `WO_LLM_MAX_TOKENS` | `5000` | General output cap. |

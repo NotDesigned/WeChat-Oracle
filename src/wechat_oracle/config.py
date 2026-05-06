@@ -38,7 +38,6 @@ class Settings(BaseSettings):
     # WeFlow HTTP API (used by `ingest live`); enable "HTTP API 服务" in WeFlow settings.
     weflow_base_url: str = "http://127.0.0.1:5031"
     weflow_token: str = ""
-    weflow_poll_interval: float = 30.0  # deprecated; live uses SSE now
 
     # Dispatcher: bot's @-mention nickname (its 群昵称 in the watched group).
     # Required for `wechat-oracle dispatcher` to recognize commands.
@@ -67,7 +66,7 @@ class Settings(BaseSettings):
     dispatcher_poll_interval: float = 3.0
     dispatcher_worker_threads: int = 4       # global parallel workers; wx4py send is serialized separately
     dispatcher_candidate_limit: int = 500   # /find candidates per call
-    dispatcher_context_chat: int = 2500     # @<bot> free-text context window
+    dispatcher_context_chat: int = 2500     # legacy candidate cap for summary-style paths
 
     # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
     # long-context chat/summaries breathe while keeping short utility commands cheap.

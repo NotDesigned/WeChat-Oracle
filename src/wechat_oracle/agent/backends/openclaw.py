@@ -199,6 +199,9 @@ OpenClaw runtime contract:
 - For historical questions, prefer search_group_messages with start_date /
   end_date and sender filters over repeated broad substring guesses. After a
   key msg_id is found, call get_message_context to inspect nearby messages.
+- For images, load_image returns the original MCP image block for direct
+  visual inspection; read_image uses the configured WO_VISION_* model and
+  returns a textual reading/OCR summary.
 - {prompts.READ_IMAGE_OCR_FALLBACK}
 - To stay silent, return an empty assistant message.
 """

@@ -29,6 +29,7 @@ from .agent.tools import ToolError
 from .agent.tools_read import (
     ExpandForwardBundleTool,
     GetMessageContextTool,
+    ReadImageTool,
     ReadVoiceTool,
     SearchGroupMessagesTool,
     ViewQuotedChainTool,
@@ -42,7 +43,7 @@ from .agent.tools_write import (
 )
 from .config import settings
 from .db import get_conn, transaction
-from .llm import _sniff_image_mime
+from .llm import _sniff_image_mime, build_vision_client
 from .log_utils import append_mcp_audit
 
 
@@ -129,7 +130,7 @@ def _audit(*audit_args_keys: str) -> Callable[[Callable[..., str]], Callable[...
                 result_for_log = result
                 error_for_log = None
             else:
-                # Non-string success: e.g. read_image returns FastMCP Image. Log
+                # Non-string success: e.g. load_image returns FastMCP Image. Log
                 # a short summary instead of dumping bytes into mcp.log.
                 data = getattr(result, "data", None)
                 fmt = getattr(result, "format", None) or "?"
@@ -271,7 +272,7 @@ def expand_forward_bundle(group_id: str, msg_id: int) -> str:
 
 
 @_mcp.tool(
-    name="read_image",
+    name="load_image",
     description=(
         "Return the actual image bytes of an image message in this group as "
         "an MCP image content block. The vision-capable agent (e.g. Claude "
@@ -281,7 +282,8 @@ def expand_forward_bundle(group_id: str, msg_id: int) -> str:
         "itself (chart, meme, screenshot) is the answer's substance."
     ),
 )
-def read_image(group_id: str, msg_id: int) -> Image:
+@_audit("msg_id")
+def load_image(group_id: str, msg_id: int) -> Image:
     """Return image bytes for direct vision-model viewing.
 
     Returns an MCP `Image` content block; the agent's next turn sees the
@@ -290,60 +292,55 @@ def read_image(group_id: str, msg_id: int) -> Image:
     `Image | str` return is unfriendly to FastMCP's pydantic schema gen, so
     success/error are split across return vs. raise.
     """
-    started = time.time()
-    detail: dict[str, Any] = {
-        "msg_id": msg_id,
-        "db_path": str(settings.db_path),
-        "data_dir": str(settings.data_dir),
-        "cwd": str(Path.cwd()),
-    }
-    try:
-        detail["stage"] = "open_db"
-        with _open_conn() as conn:
-            detail["stage"] = "select_row"
-            row = conn.execute(
-                "SELECT type, media_path FROM messages WHERE msg_id=? AND group_id=?",
-                (msg_id, group_id),
-            ).fetchone()
-            if row is None:
-                raise ToolError(f"msg_id {msg_id} not found in this group; detail={detail}")
-            detail["row_type"] = row["type"]
-            detail["media_path"] = row["media_path"]
-            if row["type"] != "image":
-                raise ToolError(
-                    f"msg_id {msg_id} is type {row['type']!r}, not 'image'; detail={detail}"
-                )
-            if not row["media_path"]:
-                raise ToolError(f"msg_id {msg_id} has empty media_path; detail={detail}")
-            detail["stage"] = "resolve_path"
-            path = resolve_path(row["media_path"])
-            detail["resolved_path"] = str(path)
-            detail["stage"] = "stat_path"
-            exists = path.exists()
-            detail["exists"] = exists
-            if not exists:
-                raise ToolError(f"msg_id {msg_id} image file missing; detail={detail}")
-            detail["stage"] = "read_bytes"
-            data = path.read_bytes()
-            detail["bytes"] = len(data)
-        detail["stage"] = "sniff_mime"
-        fmt = _sniff_image_mime(data).split("/", 1)[1]
-        detail["format"] = fmt
-        append_mcp_audit(
-            _mcp_audit_path(),
-            tool="read_image", group_id=group_id, args=detail,
-            duration_s=time.time() - started, ok=True,
-            result=f"<Image path={detail['resolved_path']} format={fmt} bytes={len(data)}>",
+    with _open_conn() as conn:
+        row = conn.execute(
+            "SELECT type, media_path FROM messages WHERE msg_id=? AND group_id=?",
+            (msg_id, group_id),
+        ).fetchone()
+    if row is None:
+        raise ToolError(f"msg_id {msg_id} not found in this group")
+    if row["type"] != "image":
+        raise ToolError(f"msg_id {msg_id} is type {row['type']!r}, not 'image'")
+    if not row["media_path"]:
+        raise ToolError(f"msg_id {msg_id} has empty media_path")
+    path = resolve_path(row["media_path"])
+    if not path.exists():
+        raise ToolError(f"msg_id {msg_id} image file missing: {path}")
+    data = path.read_bytes()
+    return Image(data=data, format=_sniff_image_mime(data).split("/", 1)[1])
+
+
+@_mcp.tool(
+    name="read_image",
+    description=(
+        "Read an image message through the configured WO_VISION_* model and "
+        "return a textual description/OCR result. Use when you need a stable "
+        "text summary for reasoning, logging, or memory. If WO_VISION_API_KEY "
+        "is not configured and your model can see images, use load_image instead."
+    ),
+)
+@_audit("msg_id", "prompt")
+def read_image(group_id: str, msg_id: int, prompt: str | None = None) -> str:
+    """Return a textual vision-model reading of one image message."""
+    vision = build_vision_client(
+        provider=settings.vision_provider,
+        api_key=settings.vision_api_key,
+        endpoint=settings.vision_endpoint,
+    )
+    with _open_conn() as conn:
+        tool = ReadImageTool(
+            conn=conn,
+            group_id=group_id,
+            vision=vision,
+            vision_model=settings.vision_model,
+            vision_max_tokens=settings.vision_max_tokens,
         )
-        return Image(data=data, format=fmt)
-    except Exception as e:
-        append_mcp_audit(
-            _mcp_audit_path(),
-            tool="read_image", group_id=group_id, args=detail,
-            duration_s=time.time() - started, ok=False,
-            error=f"{type(e).__name__}: {e}; detail={detail}",
-        )
-        raise
+        args: dict[str, Any] = {"msg_id": msg_id}
+        if prompt:
+            args["prompt"] = prompt
+        return _tool_result(tool, args)
+
+
 @_mcp.tool(
     name="read_voice",
     description=(

@@ -44,31 +44,6 @@ def resolve_media_path_for_msg(
     return p if p.exists() else None
 
 
-def resolve_image_paths_by_cand(
-    conn: sqlite3.Connection, cand_ids: list[str]
-) -> list[Path]:
-    """Resolve a list of `m:<msg_id>` cand_ids (the legacy /find / chat
-    sentinel format) to image paths on disk.
-
-    Skips silently:
-      - `f:<...>` forwarded children (their inline images aren't downloaded)
-      - cand_ids that aren't `type='image'` or have no `media_path`
-      - files that don't exist on disk
-    """
-    paths: list[Path] = []
-    for cid in cand_ids:
-        if not cid.startswith("m:"):
-            continue
-        try:
-            msg_id = int(cid[2:])
-        except ValueError:
-            continue
-        p = resolve_media_path_for_msg(conn, msg_id, expected_type="image")
-        if p is not None:
-            paths.append(p)
-    return paths
-
-
 def resolve_quoted_image_path(
     conn: sqlite3.Connection, wx_msg_id: str | None
 ) -> Path | None:
@@ -123,14 +98,15 @@ def openclaw_quoted_hint(
         return (
             "OpenClaw MCP hint: the user quoted a message that is NOT in our DB "
             "(sent before our ingest cutoff, missed by live ingest, or sourced "
-            "from outside this group). MCP read_image/read_voice/expand_forward_bundle "
+            "from outside this group). MCP load_image/read_image/read_voice/expand_forward_bundle "
             "cannot fetch it. Tell the user to re-share the original message "
             "directly instead of guessing what's quoted."
         )
     if msg_type == "image":
         return (
             f"OpenClaw MCP hint: the user quoted an image message. "
-            f"To see the image, call read_image(group_id={group_id!r}, msg_id={msg_id})."
+            f"To see the original image, call load_image(group_id={group_id!r}, msg_id={msg_id}); "
+            f"to get a textual vision-model reading, call read_image(group_id={group_id!r}, msg_id={msg_id})."
         )
     if msg_type == "voice":
         return (

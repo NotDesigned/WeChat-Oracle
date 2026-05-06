@@ -193,7 +193,8 @@ agent 可以用工具扩展视野：
 | `get_message_context` | 读取某个 `messages.msg_id` 前后的消息。 |
 | `view_quoted_chain` | 沿引用回复链上溯。 |
 | `expand_forward_bundle` | 展开一个合并转发 wrapper。 |
-| `read_image` | 把一张图片发送给已配置的视觉模型读取。 |
+| `read_image` | 把一张图片发送给已配置的视觉模型，返回文字化读图结果。 |
+| `load_image` | 仅 OpenClaw MCP：返回原始图片 bytes 作为 MCP image block，让 agent 直接看像素。 |
 | `read_voice` | 返回或即时计算一条语音消息的 ASR 文本。 |
 | `read_group_memory` | 读取当前长期群记忆文档。 |
 

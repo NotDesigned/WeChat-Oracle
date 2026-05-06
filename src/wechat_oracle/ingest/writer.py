@@ -1,7 +1,7 @@
 """Persists normalized Message objects to SQLite.
 
 Every importer (live, backfill, ...) funnels through `write_messages`. Dedupe is enforced by
-the (source, dedupe_key) UNIQUE index in schema, so re-running an importer is safe.
+the UNIQUE(dedupe_key) constraint in schema, so re-running an importer is safe.
 
 Messages of type='forward' may carry `forwarded_items` — children of a 合并转发
 bundle. After the parent row is inserted, those children are written into
@@ -19,7 +19,7 @@ from loguru import logger
 
 from ..db import transaction
 from ..log_utils import append_event
-from ..models import ForwardedItem, Message
+from ..models import Message
 
 INSERT_SQL = """
 INSERT OR IGNORE INTO messages (
@@ -158,9 +158,3 @@ def write_messages(
             attempted, inserted, skipped,
         )
     return attempted, inserted
-
-
-# Re-export for callers that want to write forwarded items independently
-# (currently nothing uses it; keeping the symbol exported in case a future
-# importer wants to attach items to an existing parent).
-__all__ = ["write_messages", "INSERT_SQL", "INSERT_FWD_SQL", "ForwardedItem"]
