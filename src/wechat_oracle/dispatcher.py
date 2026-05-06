@@ -465,14 +465,13 @@ class AskCommand(Command):
             quoted_msg_id, quoted_type = _resolve_quoted_msg_meta(
                 ctx.conn, ctx.quoted_msg_id,
             )
-            if quoted_msg_id is not None:
-                hint = _openclaw_quoted_hint(
-                    group_id=ctx.group_id,
-                    msg_id=quoted_msg_id,
-                    msg_type=quoted_type,
-                )
-                if hint:
-                    quoted_line += hint + "\n"
+            hint = _openclaw_quoted_hint(
+                group_id=ctx.group_id,
+                msg_id=quoted_msg_id,
+                msg_type=quoted_type,
+            )
+            if hint:
+                quoted_line += hint + "\n"
         user = f"当前时间：{now_str}\n{requester_line}{quoted_line}用户问题：{self.question}"
         reply = ctx.llm.complete_text(
             model=ctx.model,
@@ -730,14 +729,13 @@ class ExplainCommand(Command):
             quoted_msg_id, quoted_type = _resolve_quoted_msg_meta(
                 ctx.conn, ctx.quoted_msg_id,
             )
-            if quoted_msg_id is not None:
-                hint = _openclaw_quoted_hint(
-                    group_id=ctx.group_id,
-                    msg_id=quoted_msg_id,
-                    msg_type=quoted_type,
-                )
-                if hint:
-                    source += "\n" + hint
+            hint = _openclaw_quoted_hint(
+                group_id=ctx.group_id,
+                msg_id=quoted_msg_id,
+                msg_type=quoted_type,
+            )
+            if hint:
+                source += "\n" + hint
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         user = f"当前时间：{now_str}\n{source}"

@@ -106,17 +106,27 @@ def resolve_quoted_msg_meta(
 
 
 def openclaw_quoted_hint(
-    *, group_id: str, msg_id: int, msg_type: str | None
+    *, group_id: str, msg_id: int | None, msg_type: str | None
 ) -> str:
-    """Single-line hint for OpenClaw mode telling wechat-bot which MCP tool
-    to call for the quoted message's content. Empty string when there's no
-    matching rich-content tool — text/link/etc. quotes are already inlined as
-    `quoted_text` so the bot doesn't need a tool for them.
+    """Single-line hint for OpenClaw mode telling wechat-bot what to do with
+    the quoted message. Empty string when the quote is plain text/link/etc.
+    that's already inlined as `quoted_text` (no MCP tool needed).
 
-    The hint exists because the dispatcher only inlines `quoted_text` (which
-    can be a placeholder like `[图片]` or `[卡片消息]`); without this hint the
-    bot has no way to know it can expand the quote via MCP.
+    `msg_id is None` means we couldn't resolve the quote's `<refermsg><svrid>`
+    to a row in our DB — the parent message was sent before our ingest cutoff,
+    live ingest missed it, or it was sourced from outside this group. In that
+    case we still emit a hint so the bot doesn't waste a tool call on the
+    trigger msg_id (which is a quote row, not the rich content) and end up
+    explaining a confusing `type='quote' not 'image'` error to the user.
     """
+    if msg_id is None:
+        return (
+            "OpenClaw MCP hint: the user quoted a message that is NOT in our DB "
+            "(sent before our ingest cutoff, missed by live ingest, or sourced "
+            "from outside this group). MCP read_image/read_voice/expand_forward "
+            "cannot fetch it. Tell the user to re-share the original message "
+            "directly instead of guessing what's quoted."
+        )
     if msg_type == "image":
         return (
             f"OpenClaw MCP hint: the user quoted an image message. "

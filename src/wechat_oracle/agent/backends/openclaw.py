@@ -158,14 +158,16 @@ def _build_messages(
         quoted_msg_id_int, quoted_type = resolve_quoted_msg_meta(
             ctx.conn, ctx.quoted_msg_id,
         )
-        if quoted_msg_id_int is not None:
-            hint = openclaw_quoted_hint(
-                group_id=ctx.group_id,
-                msg_id=quoted_msg_id_int,
-                msg_type=quoted_type,
-            )
-            if hint:
-                quoted_line = (quoted_line + "\n" + hint + "\n") if quoted_line else (hint + "\n")
+        # Always emit a hint — the unresolved-parent branch tells the bot the
+        # quoted message isn't in our DB so it doesn't try read_image on the
+        # trigger msg_id (which is the quote wrapper, not the image).
+        hint = openclaw_quoted_hint(
+            group_id=ctx.group_id,
+            msg_id=quoted_msg_id_int,
+            msg_type=quoted_type,
+        )
+        if hint:
+            quoted_line = (quoted_line + "\n" + hint + "\n") if quoted_line else (hint + "\n")
     self_hint = prompts.CHAT_SELF_HINT.format(bot_wxid=ctx.bot_wxid) if ctx.bot_wxid else ""
     user_msg = prompts.CHAT_USER.format(
         now=now_str,

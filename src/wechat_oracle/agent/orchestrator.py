@@ -78,6 +78,13 @@ def _format_recent_for_agent(
     When `bot_wxid` is known, mark the bot's own rows with `[自己]` after the
     timestamp — without this the LLM tends to read its prior replies as
     just-another-user and may parrot them or argue with itself.
+
+    Quote-reply rows get a `[引用→m:N <type>：<snippet>]` suffix so the agent
+    can see the quote relationship at a glance — without this, a row like
+    `调用read image工具读这个图片` looks like plain text instead of a pointer
+    at an in-DB image. Unresolvable parents (older than ingest cutoff or
+    missed by live) render as `[引用→未入库：<snippet>]` so the agent knows
+    not to bother trying to fetch them.
     """
     out: list[str] = []
     for r in rows:
@@ -87,8 +94,43 @@ def _format_recent_for_agent(
         body = r["content_text"] or r["transcript"] or f"[{r['type']}]"
         body = body.replace("\n", " ").strip()
         self_tag = " [自己]" if bot_wxid and wxid == bot_wxid else ""
-        out.append(f"[{r['msg_id']}] {ts}{self_tag} {sender} ({wxid}): {body}")
+        quote_suffix = _quote_suffix_for_row(r)
+        out.append(
+            f"[{r['msg_id']}] {ts}{self_tag} {sender} ({wxid}): {body}{quote_suffix}"
+        )
     return "\n".join(out) if out else prompts.CHAT_RECENT_EMPTY
+
+
+def _quote_suffix_for_row(r: sqlite3.Row) -> str:
+    """Render the `[引用→...]` tail for a row. Empty string when the row
+    isn't a quote-reply or the source query didn't include the join columns.
+
+    Tolerates both shapes: rows fetched by `_fetch_recent_for_agent` /
+    `_fetch_lurk_window` (which carry parent_msg_id / parent_type) and any
+    legacy caller that still supplies bare `messages.*` columns.
+    """
+    if r["type"] != "quote":
+        return ""
+    try:
+        parent_msg_id = r["parent_msg_id"]
+        parent_type = r["parent_type"]
+    except (IndexError, KeyError):
+        # Caller didn't request the join columns; degrade silently.
+        return ""
+    snippet = ""
+    try:
+        qt = r["quote_text"]
+    except (IndexError, KeyError):
+        qt = None
+    if qt:
+        snippet = qt.replace("\n", " ").strip()
+    if parent_msg_id is None:
+        return f" [引用→未入库：{snippet}]" if snippet else " [引用→未入库]"
+    pt = parent_type or "?"
+    return (
+        f" [引用→m:{parent_msg_id} {pt}：{snippet}]"
+        if snippet else f" [引用→m:{parent_msg_id} {pt}]"
+    )
 
 
 def _trace_step_line(s: dict[str, Any]) -> str:
@@ -163,14 +205,27 @@ def _format_trace_for_log(
 def _fetch_recent_for_agent(
     conn: sqlite3.Connection, group_id: str, limit: int
 ) -> list[sqlite3.Row]:
-    """Newest `limit` messages in this group, returned oldest-first."""
+    """Newest `limit` messages in this group, returned oldest-first.
+
+    For quote-reply rows we LEFT JOIN to surface the parent's `msg_id` and
+    `type`, so `_format_recent_for_agent` can render
+    `[引用→m:N <type>：<snippet>]`. Without that the agent sees a quote
+    body as plain text and has no signal that it points at an earlier
+    image / voice / forward bundle in this same group.
+    """
     rows = conn.execute(
         """
-        SELECT msg_id, t, type, sender_wxid, sender_display,
-               content_text, transcript
-          FROM messages
-         WHERE group_id=?
-         ORDER BY t DESC
+        SELECT m.msg_id, m.t, m.type, m.sender_wxid, m.sender_display,
+               m.content_text, m.transcript, m.quote_text,
+               p.msg_id   AS parent_msg_id,
+               p.type     AS parent_type
+          FROM messages m
+     LEFT JOIN messages p
+            ON m.reply_to_wx_msg_id IS NOT NULL
+           AND p.wx_msg_id = m.reply_to_wx_msg_id
+           AND p.group_id  = m.group_id
+         WHERE m.group_id=?
+         ORDER BY m.t DESC
          LIMIT ?
         """,
         (group_id, limit),
@@ -192,12 +247,18 @@ def _fetch_lurk_window(
         return _fetch_recent_for_agent(conn, group_id, limit)
     rows = conn.execute(
         """
-        SELECT msg_id, t, type, sender_wxid, sender_display,
-               content_text, transcript
-          FROM messages
-         WHERE group_id=?
-           AND msg_id > ?
-         ORDER BY msg_id ASC
+        SELECT m.msg_id, m.t, m.type, m.sender_wxid, m.sender_display,
+               m.content_text, m.transcript, m.quote_text,
+               p.msg_id   AS parent_msg_id,
+               p.type     AS parent_type
+          FROM messages m
+     LEFT JOIN messages p
+            ON m.reply_to_wx_msg_id IS NOT NULL
+           AND p.wx_msg_id = m.reply_to_wx_msg_id
+           AND p.group_id  = m.group_id
+         WHERE m.group_id=?
+           AND m.msg_id > ?
+         ORDER BY m.msg_id ASC
          LIMIT ?
         """,
         (group_id, after_msg_id, limit),
