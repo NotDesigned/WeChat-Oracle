@@ -23,6 +23,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+import httpx
 from openai import OpenAI
 
 
@@ -168,6 +169,203 @@ class OpenAICompatLLM:
             tool_calls=tool_calls,
             assistant_message=_coerce_assistant_message(msg),
         )
+
+
+@dataclass(frozen=True)
+class OpenClawChatResponse:
+    content: str
+    usage: dict[str, Any]
+    raw: dict[str, Any]
+
+
+class OpenClawChatCompletions:
+    """Small shared client for OpenClaw's OpenAI-compatible gateway."""
+
+    name = "openclaw-completion"
+
+    def __init__(self, *, gateway_url: str, token: str, agent_id: str):
+        self._url = f"{gateway_url.rstrip('/')}/v1/chat/completions"
+        self._token = token
+        self._model = f"openclaw/{agent_id}"
+        self.agent_id = agent_id
+
+    def complete(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+        label: str = "",
+    ) -> OpenClawChatResponse:
+        """POST /v1/chat/completions to the configured gateway.
+
+        Every roundtrip is recorded to `data/openclaw.log` (JSONL) — full
+        request payload + full response body + duration + ok flag. `label`
+        tags the entry (e.g. "agent-chat", "lurk", "ping") so you can grep
+        one call site at a time. Auth headers are never logged.
+        """
+        import time as _time
+        from .config import settings
+        from .log_utils import append_openclaw_audit
+        if not self._token:
+            raise RuntimeError("WO_OPENCLAW_TOKEN is empty; set it before using WO_AGENT_BACKEND=openclaw")
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        audit_path = settings.data_dir / "openclaw.log"
+        started = _time.time()
+        try:
+            resp = httpx.post(
+                self._url,
+                headers={"Authorization": f"Bearer {self._token}"},
+                json=payload,
+                timeout=180.0,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            snippet = e.response.text[:600] if e.response is not None else ""
+            error_msg = (
+                f"OpenClaw gateway HTTP {e.response.status_code if e.response is not None else '?'}: {snippet}"
+            )
+            err_body: dict[str, Any] | None
+            try:
+                err_body = e.response.json() if e.response is not None else None
+            except Exception:
+                err_body = {"raw_text": snippet}
+            append_openclaw_audit(
+                audit_path,
+                label=label or "<unlabeled>",
+                request=payload,
+                response=err_body,
+                duration_s=_time.time() - started,
+                ok=False,
+                error=error_msg,
+            )
+            raise RuntimeError(error_msg) from e
+        except httpx.HTTPError as e:
+            error_msg = f"OpenClaw gateway request failed: {e}"
+            append_openclaw_audit(
+                audit_path,
+                label=label or "<unlabeled>",
+                request=payload,
+                response=None,
+                duration_s=_time.time() - started,
+                ok=False,
+                error=error_msg,
+            )
+            raise RuntimeError(error_msg) from e
+
+        body = resp.json()
+        choices = body.get("choices") if isinstance(body, dict) else None
+        content = ""
+        if choices:
+            message = choices[0].get("message") or {}
+            raw_content = message.get("content") or ""
+            content = raw_content if isinstance(raw_content, str) else str(raw_content)
+        usage = body.get("usage") if isinstance(body, dict) else None
+
+        append_openclaw_audit(
+            audit_path,
+            label=label or "<unlabeled>",
+            request=payload,
+            response=body if isinstance(body, dict) else {"raw_text": str(body)[:1000]},
+            duration_s=_time.time() - started,
+            ok=True,
+        )
+
+        return OpenClawChatResponse(
+            content=content,
+            usage=usage if isinstance(usage, dict) else {},
+            raw=body if isinstance(body, dict) else {},
+        )
+
+
+class OpenClawCompletionLLM:
+    """Route dispatcher-level text/JSON completions through OpenClaw."""
+
+    name = "openclaw-completion"
+
+    def __init__(
+        self,
+        *,
+        gateway_url: str,
+        token: str,
+        agent_id: str,
+        delegate: Any | None = None,
+    ):
+        self._client = OpenClawChatCompletions(
+            gateway_url=gateway_url, token=token, agent_id=agent_id,
+        )
+        self._delegate = delegate
+
+    def complete_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float = 0.0,
+    ) -> str:
+        return self._complete(system=system, user=user, temperature=temperature) or "{}"
+
+    def complete_text(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+    ) -> str:
+        return self._complete(system=system, user=user, temperature=temperature, max_tokens=max_tokens).strip()
+
+    def complete_with_tools(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float = 0.3,
+        max_tokens: int | None = None,
+        tool_choice: str = "auto",
+    ) -> "ToolingResponse":
+        if self._delegate is None:
+            raise RuntimeError(
+                "OpenClawCompletionLLM does not expose native tool-calling; "
+                "route agent/lurk turns through OpenClaw backend instead"
+            )
+        return self._delegate.complete_with_tools(
+            model=model,
+            messages=messages,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_choice=tool_choice,
+        )
+
+    def _complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int | None,
+    ) -> str:
+        return self._client.complete(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            label="slash-command",
+        ).content
 
 
 # --- tool-calling (multi-turn agent loop) ----------------------------------

@@ -1,14 +1,8 @@
 """Resolve `messages.media_path` values to filesystem paths.
 
-Two storage conventions coexist (see worker/mm.py:_resolve_path):
-  - live    → absolute path into WeFlow's cache directory
-  - backfill → relative path under settings.data_dir
-
-This module is the single source of truth for that resolution; previously
-the same logic was inlined in `worker/mm.py`, `dispatcher._resolve_image_paths`,
-and `dispatcher._resolve_quoted_image_path`. The agent's `read_image` tool
-also routes through here, and dispatcher's legacy /explain & /ask paths
-import these helpers (CLAUDE.md F16 keeps them around).
+New live/backfill rows store data_dir-relative paths under `data/media`.
+Absolute paths are still accepted so older DB rows can be read before running
+`scripts/normalize_media_paths.py`.
 """
 
 from __future__ import annotations
@@ -91,3 +85,51 @@ def resolve_quoted_image_path(
     if row is None:
         return None
     return resolve_media_path_for_msg(conn, int(row["msg_id"]), expected_type="image")
+
+
+def resolve_quoted_msg_meta(
+    conn: sqlite3.Connection, wx_msg_id: str | None
+) -> tuple[int | None, str | None]:
+    """Resolve a quote-reply's wx_msg_id (from `<refermsg><svrid>`) to the
+    referenced message's integer `msg_id` and `type`. Returns `(None, None)`
+    when the quote target isn't in our DB (parent never ingested, or no quote).
+    """
+    if not wx_msg_id:
+        return None, None
+    row = conn.execute(
+        "SELECT msg_id, type FROM messages WHERE wx_msg_id=?",
+        (wx_msg_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    return int(row["msg_id"]), row["type"]
+
+
+def openclaw_quoted_hint(
+    *, group_id: str, msg_id: int, msg_type: str | None
+) -> str:
+    """Single-line hint for OpenClaw mode telling wechat-bot which MCP tool
+    to call for the quoted message's content. Empty string when there's no
+    matching rich-content tool — text/link/etc. quotes are already inlined as
+    `quoted_text` so the bot doesn't need a tool for them.
+
+    The hint exists because the dispatcher only inlines `quoted_text` (which
+    can be a placeholder like `[图片]` or `[卡片消息]`); without this hint the
+    bot has no way to know it can expand the quote via MCP.
+    """
+    if msg_type == "image":
+        return (
+            f"OpenClaw MCP hint: the user quoted an image message. "
+            f"To see the image, call read_image(group_id={group_id!r}, msg_id={msg_id})."
+        )
+    if msg_type == "voice":
+        return (
+            f"OpenClaw MCP hint: the user quoted a voice message. "
+            f"For the transcript, call read_voice(group_id={group_id!r}, msg_id={msg_id})."
+        )
+    if msg_type == "forward":
+        return (
+            f"OpenClaw MCP hint: the user quoted a merged-forward bundle (聊天记录 / [卡片消息]). "
+            f"To list its children, call expand_forward(group_id={group_id!r}, msg_id={msg_id})."
+        )
+    return ""

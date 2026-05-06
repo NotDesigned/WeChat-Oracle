@@ -8,10 +8,8 @@ WeChat conversation. Two backends:
   - `StdoutReplier`  — no-op fallback. Prints to logs only. Used when
     WO_REPLY=False or wx4py fails to initialize.
 
-(An openclaw HTTP backend was prototyped but proven incapable of group
-delivery — see `openclaw.py` and the README "实验记录" section. The lower-
-level `OpenclawClient` is retained for DM-only future use; the Replier
-adapter was deleted as dead code.)
+(A Tencent iLink Bot HTTP backend was prototyped but proven incapable of
+group delivery — see README "实验记录" section.)
 
 `build_replier()` is the single factory call from the dispatcher. It reads
 `settings.reply_backend` and tries the chosen backend; on failure (wx4py

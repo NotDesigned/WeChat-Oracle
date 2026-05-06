@@ -132,6 +132,26 @@ class Settings(BaseSettings):
     agent_lurk_recent_msgs: int = 100          # max new msgs per lurk run
     agent_lurk_max_steps: int = 4              # tool-call rounds for lurk reflection
 
+    # OpenClaw agent runtime — the recommended backend (see WO_AGENT_BACKEND
+    # below, added in a later phase). Lets the bot use a Claude subscription
+    # via OpenClaw's local gateway instead of paying per-token API rates.
+    # Gateway must have its OpenAI-compatible /v1/chat/completions endpoint
+    # enabled. Empty token = backend unusable; smoke-test with
+    # `wechat-oracle openclaw ping`.
+    openclaw_gateway_url: str = "http://127.0.0.1:18789"
+    openclaw_token: str = ""
+    openclaw_agent_id: str = "wechat-bot"
+
+    # Which agent backend dispatcher uses for chat-trigger turns:
+    #   native    — in-process Phase A + Phase B with tools (default; works
+    #               with just an LLM API key, no extra component to install)
+    #   openclaw  — delegate the whole loop to OpenClaw's wechat-bot agent
+    #               via /v1/chat/completions (requires WO_OPENCLAW_*; recommended
+    #               for production because of subscription pricing)
+    # In openclaw mode, mention/free-chat, slash-command text/JSON completions,
+    # and lurk reflection all go through the OpenClaw gateway.
+    agent_backend: str = "native"
+
     # Send the dispatcher's result back into the WeChat group. False = local-
     # only (stdout + log). True = use the backend below.
     reply: bool = True
@@ -139,7 +159,7 @@ class Settings(BaseSettings):
     # Reply backend choice. See replier.py for trade-offs.
     #   wx4py  — UI automation. Requires Windows + WeChat main window visible.
     #   stdout — No-op. Equivalent to reply=False.
-    # (openclaw was prototyped + rejected; ClawBots can't deliver group msgs.
+    # (Tencent iLink Bot was prototyped + rejected; can't deliver group msgs.
     #  See README "实验记录" if you're tempted to try again.)
     reply_backend: str = "wx4py"
 

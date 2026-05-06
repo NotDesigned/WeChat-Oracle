@@ -1,0 +1,11 @@
+{
+  // Example only. Match these names to the OpenClaw version you run.
+  // The important part is enabling the OpenAI-compatible endpoint used by
+  // WO_OPENCLAW_GATEWAY_URL + /v1/chat/completions and requiring a bearer token.
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 18789,
+    "openaiCompatible": true,
+    "authToken": "change-me"
+  }
+}

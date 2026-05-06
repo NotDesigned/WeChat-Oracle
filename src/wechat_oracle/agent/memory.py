@@ -48,7 +48,8 @@ def upsert_persona_drift(
         VALUES (?, ?, ?)
         ON CONFLICT(group_id) DO UPDATE SET
             drift_text = excluded.drift_text,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            last_run_id = NULL
         """,
         (group_id, drift_text, time.time()),
     )
@@ -78,7 +79,8 @@ def upsert_group_memory(
         ON CONFLICT(group_id) DO UPDATE SET
             notes_text = excluded.notes_text,
             size_chars = excluded.size_chars,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            last_run_id = NULL
         """,
         (group_id, notes_text, len(notes_text), time.time()),
     )

@@ -1,18 +1,17 @@
 """Typer CLI entry point: `wechat-oracle <subcommand>`.
 
 Three production subcommands (each is a long-running process or one-shot job):
-  - `init-db`           — create schema (idempotent)
-  - `ingest backfill`   — one-shot import of historical export files
-  - `ingest live`       — long-running SSE subscriber → DB writer
-  - `dispatcher`        — long-running DB poller → LLM → wx4py reply
-  - `status`            — quick row count health check
+  - `init-db`           - create schema (idempotent)
+  - `ingest backfill`   - one-shot import of historical export files
+  - `ingest live`       - long-running SSE subscriber -> DB writer
+  - `dispatcher`        - long-running DB poller -> LLM -> wx4py reply
+  - `status`            - quick row count health check
 
 Plus `weflow find` / `weflow sessions` for diagnosing WO_GROUPS resolution.
 
-Adding a subcommand: also update README「快速上手」段 + 「三进程」表
-(CLAUDE.md「易漂移点 F5」; the doc-sync hook will remind you).
+Adding a subcommand: also update README quickstart + process table
+(CLAUDE.md F5; the doc-sync hook will remind you).
 """
-import json
 from pathlib import Path
 
 import typer
@@ -26,16 +25,16 @@ from .ingest.writer import write_messages
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 ingest_app = typer.Typer(no_args_is_help=True)
 weflow_app = typer.Typer(no_args_is_help=True, help="Inspect what WeFlow's HTTP API exposes (diagnose WO_GROUPS issues, etc.)")
-openclaw_app = typer.Typer(no_args_is_help=True, help="Tencent iLink Bot API experiments (verifying group_id support).")
 worker_app = typer.Typer(no_args_is_help=True, help="Background workers that fill in derived data on messages rows.")
 verify_app = typer.Typer(no_args_is_help=True, help="Health checks for the dispatch pipeline.")
 agent_app = typer.Typer(no_args_is_help=True, help="Inspect & manage agent memory (persona_drift / group_memory / run logs).")
+openclaw_app = typer.Typer(no_args_is_help=True, help="OpenClaw runtime backend (the recommended agent path; uses subscription instead of per-token API).")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
-app.add_typer(openclaw_app, name="openclaw")
 app.add_typer(worker_app, name="worker")
 app.add_typer(verify_app, name="verify")
 app.add_typer(agent_app, name="agent")
+app.add_typer(openclaw_app, name="openclaw")
 
 
 @verify_app.command("roundtrip")
@@ -49,7 +48,7 @@ def verify_roundtrip() -> None:
     `sender_display == WO_BOT_NAME` (i.e. the bot's own messages).
     """
     if not settings.bot_name:
-        typer.echo("⚠️  WO_BOT_NAME is empty — set it to the bot's group nickname first.")
+        typer.echo("WARNING:  WO_BOT_NAME is empty - set it to the bot's group nickname first.")
         raise typer.Exit(1)
     init_db()
     with get_conn() as conn:
@@ -73,22 +72,22 @@ def verify_roundtrip() -> None:
     typer.echo(f"messages where sender_display matches: {total}")
     if total == 0:
         typer.echo("")
-        typer.echo("❌ No bot messages echoed back.")
+        typer.echo("ERROR: No bot messages echoed back.")
         typer.echo("   Either the bot hasn't replied yet, OR WeFlow SSE doesn't")
         typer.echo("   roundtrip self-sent messages. Reply-to-bot trigger will be")
-        typer.echo("   permanently disabled in this case — set WO_BOT_WXID manually.")
+        typer.echo("   permanently disabled in this case - set WO_BOT_WXID manually.")
         return
     if wxid_row is None:
         typer.echo("")
-        typer.echo("⚠️  Bot messages found but their sender_wxid is NULL.")
+        typer.echo("WARNING:  Bot messages found but their sender_wxid is NULL.")
         typer.echo("   Auto-discovery can't recover wxid; set WO_BOT_WXID manually.")
     else:
         typer.echo(f"discovered bot wxid: {wxid_row['sender_wxid']}")
         if not settings.bot_wxid:
-            typer.echo(f"  → consider setting WO_BOT_WXID={wxid_row['sender_wxid']} in .env")
+            typer.echo(f"  consider setting WO_BOT_WXID={wxid_row['sender_wxid']} in .env")
             typer.echo("    (skips the wxid discovery delay on cold start)")
         elif settings.bot_wxid != wxid_row["sender_wxid"]:
-            typer.echo(f"⚠️  WO_BOT_WXID={settings.bot_wxid!r} but DB shows {wxid_row['sender_wxid']!r}")
+            typer.echo(f"WARNING:  WO_BOT_WXID={settings.bot_wxid!r} but DB shows {wxid_row['sender_wxid']!r}")
     typer.echo("")
     typer.echo("recent bot messages:")
     from datetime import datetime
@@ -100,18 +99,20 @@ def verify_roundtrip() -> None:
 
 @worker_app.command("mm")
 def worker_mm() -> None:
-    """Standalone OCR/ASR worker. Usually you don't need to run this — `ingest
+    """Standalone OCR/ASR worker. Usually you don't need to run this - `ingest
     live` already starts an mm worker thread alongside SSE capture, so a
     normal "live + dispatcher" deployment covers it.
 
-    Use this command when you want to run mm on its own — e.g. to drain a
+    Use this command when you want to run mm on its own - e.g. to drain a
     backfill queue without ingesting new messages, or to debug OCR/ASR in
     isolation. Long-running. Polls newest-first. Models lazy-load on first
     use: rapidocr-onnxruntime for images, faster-whisper (`small` by default;
     set WO_WHISPER_MODEL=tiny|base|medium|large-v3 to override) for voice.
-    Both run locally on CPU — no data leaves the machine.
+    Both run locally on CPU - no data leaves the machine.
     """
+    from .log_utils import setup_process_log
     from .worker.mm import run_mm_worker
+    setup_process_log("mm")
     run_mm_worker()
 
 
@@ -143,9 +144,11 @@ def ingest_live() -> None:
 
     Combined process so a normal deployment is just two terminals:
     `ingest live` (this) + `dispatcher`. The mm thread shares the SQLite
-    file via WAL — no separate process needed.
+    file via WAL - no separate process needed.
     """
     from .ingest.live import run_live
+    from .log_utils import setup_process_log
+    setup_process_log("live")
     run_live()
 
 
@@ -157,6 +160,8 @@ def dispatcher_cmd() -> None:
     Ctrl+C to stop. Safe to run alongside `ingest live`.
     """
     from .dispatcher import run_dispatcher
+    from .log_utils import setup_process_log
+    setup_process_log("dispatcher")
     run_dispatcher()
 
 
@@ -226,12 +231,12 @@ def agent_wipe(
     persona_only: bool = typer.Option(False, "--persona-only", help="Wipe persona_drift only, keep group_memory"),
     memory_only: bool = typer.Option(False, "--memory-only", help="Wipe group_memory only, keep persona_drift"),
 ) -> None:
-    """Clear persona_drift and/or group_memory for one group. Destructive —
+    """Clear persona_drift and/or group_memory for one group. Destructive -
     bot resets to its defaults in this group. agent_run_log is NOT touched
     (audit trail stays).
     """
     if persona_only and memory_only:
-        typer.echo("⚠️  --persona-only and --memory-only are mutually exclusive")
+        typer.echo("WARNING:  --persona-only and --memory-only are mutually exclusive")
         raise typer.Exit(1)
     targets = []
     if not memory_only:
@@ -269,7 +274,7 @@ def agent_lurk(
     from .agent.orchestrator import chat_via_lurk
     from .dispatcher import _build_llm_client, _resolve_bot_wxid
     if not settings.bot_name:
-        typer.echo("⚠️  WO_BOT_NAME is empty — set it before lurking.")
+        typer.echo("WARNING:  WO_BOT_NAME is empty - set it before lurking.")
         raise typer.Exit(1)
     init_db()
     settings.ensure_dirs()
@@ -335,7 +340,7 @@ def agent_show_runs(
     Silent runs are tagged with one of three causes:
       stay_silent: model called the stay_silent tool (healthy decision)
       empty:       model returned empty final text without calling stay_silent
-                   (likely confused / refused — investigate the trigger msg)
+                   (likely confused / refused - investigate the trigger msg)
       max_steps:   model burned all tool-calling rounds without emitting text
                    (rare since runtime forces final on last step)
     """
@@ -360,7 +365,7 @@ def agent_show_runs(
             except _json.JSONDecodeError:
                 pa = []
             label, detail = _classify_silent(pa)
-            reply = f"(silent: {label}{' — ' + detail if detail else ''})"
+            reply = f"(silent: {label}{' - ' + detail if detail else ''})"
         else:
             reply = reply_text.replace("\n", " ")[:80]
         typer.echo(
@@ -378,7 +383,7 @@ def agent_show_runs(
             args = w.get("args", {})
             preview_key = "drift_text" if w["tool"] == "update_persona_drift" else "notes_text"
             preview = (args.get(preview_key, "") or "").replace("\n", " ")[:80]
-            typer.echo(f"     ↳ phase B {w['tool']}: {preview}")
+            typer.echo(f"     phase B {w['tool']}: {preview}")
 
 
 @weflow_app.command("find")
@@ -443,114 +448,191 @@ def weflow_sessions(
             typer.echo(f"  {kind:8s}  {display!r:40s}  {user}")
 
 
-@openclaw_app.command("login")
-def openclaw_login() -> None:
-    """One-time QR login to Tencent iLink Bot. Saves token to data/openclaw-token.json."""
-    from .openclaw import OpenclawClient, login_interactive, render_qr_to_terminal
-    settings.ensure_dirs()
-    token_path = settings.data_dir / "openclaw-token.json"
-    if token_path.exists():
-        typer.echo(f"[!] token already exists at {token_path}. Re-login will overwrite.")
-        if not typer.confirm("Continue?", default=False):
-            raise typer.Abort()
-    with OpenclawClient() as client:
-        session = login_interactive(client, on_qr=render_qr_to_terminal)
-        session.to_json(token_path)
-    typer.echo(f"[OK] logged in as bot_id={session.bot_id!r}, saved to {token_path}")
+@openclaw_app.command("mcp-test")
+def openclaw_mcp_test() -> None:
+    """End-to-end smoke test: spawn `mcp-serve` as a subprocess, do the MCP
+    initialize handshake over stdio, list tools, then call recall_group_history
+    on the busiest group. This is what OpenClaw will do under the hood - if
+    THIS works and OpenClaw still doesn't see the tools, the bug is on
+    OpenClaw's side (registration/profile/restart), not ours.
+    """
+    import asyncio
+    import json as _json
+    import os
+    from mcp import ClientSession  # type: ignore[import-untyped]
+    from mcp.client.stdio import StdioServerParameters, stdio_client  # type: ignore[import-untyped]
+
+    # Resolve a real group_id BEFORE we start the async session, so database
+    # access errors surface with a normal traceback instead of getting buried
+    # inside an asyncio TaskGroup ExceptionGroup.
+    typer.echo("[0/4] open SQLite ...")
+    try:
+        with get_conn() as conn:
+            db_row = conn.execute(
+                "SELECT group_id FROM messages WHERE group_id IS NOT NULL "
+                "GROUP BY group_id ORDER BY COUNT(*) DESC LIMIT 1"
+            ).fetchone()
+            img_row = conn.execute(
+                "SELECT msg_id, group_id FROM messages "
+                "WHERE type='image' AND media_path IS NOT NULL "
+                "ORDER BY msg_id DESC LIMIT 1"
+            ).fetchone()
+    except Exception as e:
+        typer.echo(f"      [ERR] cannot open/read DB at {settings.db_path}: {type(e).__name__}: {e}")
+        typer.echo("      Check that the MCP server cwd points at this checkout and that the DB is not locked.")
+        raise typer.Exit(2)
+    test_gid = db_row["group_id"] if db_row else None
+    typer.echo(f"      OK; busiest group_id={test_gid!r}")
+    if img_row is not None:
+        typer.echo(f"      latest image row: msg_id={img_row['msg_id']} group_id={img_row['group_id']!r}")
+
+    async def run() -> None:
+        # mcp.client.stdio does NOT inherit parent env by default, so pass it
+        # through explicitly for PATH/HOME/etc. used by the spawned `uv run`.
+        params = StdioServerParameters(
+            command="uv",
+            args=["run", "wechat-oracle", "openclaw", "mcp-serve"],
+            env=dict(os.environ),
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                typer.echo("[1/4] initialize ...")
+                init = await session.initialize()
+                typer.echo(f"      server: {init.serverInfo.name} v{init.serverInfo.version}")
+                typer.echo(f"      protocol: {init.protocolVersion}")
+
+                typer.echo("[2/4] list tools (with raw schemas) ...")
+                tools_resp = await session.list_tools()
+                typer.echo(f"      got {len(tools_resp.tools)} tools.")
+                for t in tools_resp.tools:
+                    in_schema = getattr(t, "inputSchema", None)
+                    out_schema = getattr(t, "outputSchema", None)
+                    typer.echo(f"      -- {t.name} --")
+                    in_str = _json.dumps(in_schema, ensure_ascii=False) if in_schema else "(none)"
+                    out_str = _json.dumps(out_schema, ensure_ascii=False) if out_schema else "(none)"
+                    typer.echo(f"        inputSchema:  {in_str[:300]}")
+                    typer.echo(f"        outputSchema: {out_str[:300]}")
+
+                if test_gid is None:
+                    typer.echo("[3/4] skip recall_group_history call - no groups in DB")
+                else:
+                    typer.echo(f"[3/4] recall_group_history(group_id={test_gid!r}, query='', limit=2) ...")
+                    result = await session.call_tool(
+                        "recall_group_history",
+                        {"group_id": test_gid, "query": "", "limit": 2},
+                    )
+                    for c in result.content:
+                        text = getattr(c, "text", None)
+                        if text:
+                            typer.echo("      " + text.replace("\n", "\n      ")[:300])
+
+                if img_row is None:
+                    typer.echo("[4/4] skip read_image - no image rows with media_path in DB")
+                else:
+                    typer.echo(
+                        f"[4/4] read_image(group_id={img_row['group_id']!r}, "
+                        f"msg_id={img_row['msg_id']}) ..."
+                    )
+                    img_result = await session.call_tool(
+                        "read_image",
+                        {"group_id": img_row["group_id"], "msg_id": int(img_row["msg_id"])},
+                    )
+                    typer.echo(f"      isError={getattr(img_result, 'isError', None)}")
+                    typer.echo(f"      content blocks: {len(img_result.content)}")
+                    for i, c in enumerate(img_result.content):
+                        kind = type(c).__name__
+                        bits = []
+                        for attr in ("type", "mimeType"):
+                            if hasattr(c, attr):
+                                bits.append(f"{attr}={getattr(c, attr)!r}")
+                        if hasattr(c, "data"):
+                            d = c.data
+                            bits.append(f"data_len={len(d) if isinstance(d, str) else '?'}")
+                        if hasattr(c, "text"):
+                            bits.append(f"text={c.text[:80]!r}")
+                        typer.echo(f"      content[{i}]: {kind}  " + "  ".join(bits))
+        typer.echo("\n[OK] our MCP server works end-to-end via stdio.")
+
+    try:
+        asyncio.run(run())
+    except BaseExceptionGroup as eg:  # type: ignore[name-defined]  # 3.11+
+        typer.echo(f"\n[ERR] ExceptionGroup of {len(eg.exceptions)} sub-exception(s):")
+        for i, sub in enumerate(eg.exceptions, 1):
+            typer.echo(f"  ({i}) {type(sub).__name__}: {sub}")
+            inner = getattr(sub, "exceptions", None)
+            if inner:
+                for j, deeper in enumerate(inner, 1):
+                    typer.echo(f"      .{j} {type(deeper).__name__}: {deeper}")
+        raise typer.Exit(2)
+    except Exception as e:
+        typer.echo(f"\n[ERR] {type(e).__name__}: {e}")
+        raise typer.Exit(2)
 
 
-@openclaw_app.command("probe")
-def openclaw_probe(
-    minutes: int = typer.Option(5, "--minutes", "-m", help="Stop after this many minutes"),
-    verbose: bool = typer.Option(True, "--verbose/--quiet", help="Print one line per long-poll round trip (heartbeat)"),
+@openclaw_app.command("mcp-serve")
+def openclaw_mcp_serve() -> None:
+    """Start the MCP server that exposes WeChat-Oracle tools to OpenClaw's
+    wechat-bot agent. Stdio-based - meant to be spawned by OpenClaw's MCP
+    client. Register on the OpenClaw side roughly like:
+
+      openclaw mcp set wechat-oracle \\
+        --command "uv" --args "run wechat-oracle openclaw mcp-serve"
+
+    Exposes the full OpenClaw tool surface: history recall, quote/forward
+    expansion, media reads, and memory/persona read-write tools.
+    """
+    from .mcp_server import run_mcp_server
+    run_mcp_server()
+
+
+@openclaw_app.command("ping")
+def openclaw_ping(
+    message: str = typer.Argument("ping", help="Text to send"),
+    timeout: float = typer.Option(120.0, "--timeout", "-t", help="HTTP timeout in seconds"),
 ) -> None:
-    """Long-poll getupdates and dump every inbound message verbatim. Use this
-    to discover (a) whether group_id is populated in actual messages, and
-    (b) what the group_id looks like for groups your bot is in.
+    """Smoke-test the OpenClaw chat-completions endpoint with the configured
+    agent. Prints HTTP status, latency, and the assistant reply (or error).
 
-    Have someone send a message in a test group while this runs.
+    Note: a real wechat-bot agent with full skills loaded can have prompt
+    sizes in the 10-50K range. First call typically takes 20-40s. Default
+    timeout is 120s; raise with --timeout if your agent is heavier.
     """
     import time as _time
-    from .openclaw import OpenclawClient, OpenclawSession, extract_text_from_msg
-
-    token_path = settings.data_dir / "openclaw-token.json"
-    session = OpenclawSession.from_json(token_path)
-    if not session:
-        typer.echo(f"[ERR] no token at {token_path}; run `openclaw login` first")
+    import sys as _sys
+    import httpx
+    if not settings.openclaw_token:
+        typer.echo("WARNING:  WO_OPENCLAW_TOKEN is empty - set it to the gateway's auth token.")
         raise typer.Exit(1)
-    deadline = _time.time() + minutes * 60
-    typer.echo(f"polling /getupdates as bot_id={session.bot_id!r} for {minutes}m. Ctrl+C to stop early.")
-    typer.echo("--- every long-poll round-trip prints a heartbeat; messages dumped in full ---\n")
-    buf = ""
-    seen = 0
-    rounds = 0
-    with OpenclawClient(session) as client:
-        while _time.time() < deadline:
-            t0 = _time.time()
-            resp = client.get_updates(buf)
-            dt = _time.time() - t0
-            rounds += 1
-            msgs = resp.get("msgs") or []
-            new_buf = resp.get("get_updates_buf") or buf  # truthy-only update; mirrors bridge.mjs
-            buf_changed = new_buf != buf
-            buf = new_buf
-            if verbose:
-                ret = resp.get("ret")
-                typer.echo(
-                    f"[round {rounds}] dt={dt:.1f}s  ret={ret}  msgs={len(msgs)}  "
-                    f"buf_changed={buf_changed}  buf_head={buf[:40]!r}  full_keys={sorted(resp.keys())}"
-                )
-            for m in msgs:
-                seen += 1
-                typer.echo(f"=== msg #{seen} ===")
-                typer.echo(json.dumps(m, ensure_ascii=False, indent=2))
-                typer.echo(f"  -> extracted text: {extract_text_from_msg(m)!r}")
-                gid = m.get("group_id")
-                fuid = m.get("from_user_id")
-                tuid = m.get("to_user_id")
-                ctok = m.get("context_token")
-                typer.echo(
-                    f"  group_id={gid!r}  from_user_id={fuid!r}  to_user_id={tuid!r}  "
-                    f"has_context_token={ctok is not None}"
-                )
-                typer.echo("")
-    typer.echo(f"\nstopped: {rounds} round-trip(s), {seen} message(s). final buf head: {buf[:60]!r}")
-
-
-@openclaw_app.command("send")
-def openclaw_send(
-    text: str = typer.Argument(..., help="Body to send"),
-    to_user: str = typer.Option(None, "--to-user", help="WeChat user id (xxx@im.wechat)"),
-    group_id: str = typer.Option(None, "--group-id", help="Openclaw group id (from a probe session)"),
-    context_token: str = typer.Option(None, "--context-token", help="Optional thread context"),
-) -> None:
-    """Send a single test message. Pass --group-id to test the unconfirmed
-    group send path; pass --to-user for the confirmed-working DM path."""
-    from .openclaw import OpenclawClient, OpenclawSession
-    if not (to_user or group_id):
-        typer.echo("[ERR] pass either --to-user or --group-id"); raise typer.Exit(1)
-    session = OpenclawSession.from_json(settings.data_dir / "openclaw-token.json")
-    if not session:
-        typer.echo("[ERR] no token; run `openclaw login` first"); raise typer.Exit(1)
-    with OpenclawClient(session) as client:
-        try:
-            cid, resp = client.send_text(
-                to_user_id=to_user, group_id=group_id, text=text, context_token=context_token,
-            )
-        except Exception as e:
-            typer.echo(f"[ERR] send failed: {e}")
-            # httpx raises HTTPStatusError on non-2xx; print response body if any
-            r = getattr(e, "response", None)
-            if r is not None:
-                try:
-                    typer.echo(f"  status: {r.status_code}")
-                    typer.echo(f"  body:   {r.text[:1000]}")
-                except Exception:
-                    pass
-            raise typer.Exit(2)
-    typer.echo(f"[OK] HTTP 2xx; client_id={cid!r}")
-    typer.echo(f"  server response body:")
-    typer.echo(json.dumps(resp, ensure_ascii=False, indent=2))
+    url = f"{settings.openclaw_gateway_url.rstrip('/')}/v1/chat/completions"
+    payload = {
+        "model": f"openclaw/{settings.openclaw_agent_id}",
+        "messages": [{"role": "user", "content": message}],
+    }
+    headers = {"Authorization": f"Bearer {settings.openclaw_token}"}
+    typer.echo(f"POST {url}  model={payload['model']!r}")
+    typer.echo(f"(waiting up to {timeout:.0f}s for response - first call to a heavy agent can take 20-40s)")
+    _sys.stdout.flush()
+    t0 = _time.time()
+    try:
+        resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+    except httpx.HTTPError as e:
+        typer.echo(f"[ERR] HTTP error after {_time.time() - t0:.1f}s: {e}")
+        raise typer.Exit(2)
+    dt = _time.time() - t0
+    typer.echo(f"HTTP {resp.status_code}  dt={dt:.2f}s")
+    if resp.status_code != 200:
+        typer.echo(f"body: {resp.text[:600]}")
+        raise typer.Exit(2)
+    body = resp.json()
+    choices = body.get("choices") or []
+    if not choices:
+        typer.echo(f"WARNING:  no choices in response: {body}")
+        raise typer.Exit(2)
+    reply = (choices[0].get("message") or {}).get("content") or ""
+    usage = body.get("usage") or {}
+    typer.echo(f"reply: {reply!r}")
+    if usage:
+        typer.echo(f"usage: {usage}")
 
 
 @app.command("status")

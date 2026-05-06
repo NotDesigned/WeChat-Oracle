@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-wsl
 
 # Local data (DB, media cache, exports)
 data/

@@ -36,7 +36,7 @@ from loguru import logger
 from ..config import settings
 from ..db import get_conn
 from ..models import Message, MsgType
-from .backfill import _MEDIA_TYPES, _WEFLOW_LOCAL_TYPE_MAP
+from .backfill import _WEFLOW_LOCAL_TYPE_MAP
 from .forwarded import (
     FORWARD_LOCAL_TYPE,
     appmsg_subtype,
@@ -44,6 +44,11 @@ from .forwarded import (
     format_appmsg_content,
     parse_quote_reply_xml,
     parse_record_xml,
+)
+from .media_store import (
+    MEDIA_MISSING_TAGS,
+    MEDIA_TYPES,
+    materialize_media_ref,
 )
 from .writer import write_messages
 
@@ -94,10 +99,16 @@ def _api_msg_to_normalized(
     quote_text: str | None = None
     reply_to_wx_msg_id: str | None = None
 
-    if msg_type in _MEDIA_TYPES:
-        media_path = raw.get("mediaLocalPath") or raw.get("mediaUrl")
-        if not media_path:
-            content_text = raw.get("content")
+    if msg_type in MEDIA_TYPES:
+        media_ref = raw.get("mediaLocalPath") or raw.get("mediaUrl")
+        media_path = materialize_media_ref(
+            media_ref, msg_type, group_id, settings.data_dir,
+        )
+        if media_path is None:
+            content_text = (
+                MEDIA_MISSING_TAGS[msg_type]
+                if media_ref and raw.get("mediaLocalPath") else raw.get("content")
+            )
     elif msg_type is MsgType.FORWARD:
         forwarded_items = parse_record_xml(raw.get("rawContent"))
         content_text = "[聊天记录]"

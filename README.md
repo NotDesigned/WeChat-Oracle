@@ -123,6 +123,29 @@ WO_LLM_API_KEY=sk-...
 # WO_AGENT_LURK_MAX_STEPS=4            # lurk 后台学习最多 tool-calling 步数
 ```
 
+Optional OpenClaw `.env` settings:
+
+```env
+WO_AGENT_BACKEND=openclaw
+WO_OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+WO_OPENCLAW_TOKEN=<OpenClaw gateway bearer token>
+WO_OPENCLAW_AGENT_ID=wechat-bot
+```
+
+OpenClaw / MCP runs on Windows from this same checkout and the normal project
+environment:
+
+```powershell
+uv sync
+pwsh scripts\register_mcp.ps1
+```
+
+`scripts\register_mcp.ps1` registers MCP with `cwd` pinned to the repository
+root, so OpenClaw-spawned MCP subprocesses run the same project code as the
+dispatcher. To switch chat turns, slash-command completions, and lurk
+reflection to OpenClaw, set `WO_AGENT_BACKEND=openclaw`, `WO_OPENCLAW_TOKEN`,
+and optionally `WO_OPENCLAW_AGENT_ID`.
+
 ### 3. 建库
 
 ```powershell
@@ -354,7 +377,7 @@ uv run wechat-oracle ingest backfill 群聊_xxx\texts\群聊_xxx.json --format w
 - `weflow` — WeFlow 原生 JSON 导出
 - `jsonl` — 每行一个规范化 `Message`，调试管道用
 
-**媒体处理**：被引用的媒体会复制进 `data/media/<group_id>/<kind>/<filename>`（kind ∈ `images / voices / videos / stickers`）。DB 里 `media_path` 存相对 `data_dir` 的路径。**导入完成后源文件夹可以删**。
+**媒体处理**：被引用的媒体会复制进 `data/media/<group_id>/<kind>/<filename>`（kind ∈ `images / voices / videos / stickers`）。DB 里 `media_path` 存相对 `data_dir` 的路径。backfill 导入完成后源文件夹可以删；live 抓到的 WeFlow cache 文件也会立即归档到同一目录，供 dispatcher / MCP / mm worker 共同读取。
 
 媒体缺失时（朋友只发 .json）：导入照常成功，`media_path` 留空，`content_text` 标 `[图片缺失]` / `[语音缺失]` 等。
 
@@ -521,6 +544,10 @@ reply 触发依赖知道 bot 自己的 wxid。两种来源：(1) `WO_BOT_WXID` �
 | `WO_DATA_DIR` | `data` | 数据根目录 |
 | `WO_DB_PATH` | `data/wechat-oracle.db` | SQLite 文件路径 |
 | `WO_MEDIA_DIR` | `data/media` | 媒体目录 |
+| `WO_AGENT_BACKEND` | `native` | agent 后端：`native`（本项目内 tool-calling）/ `openclaw`（OpenClaw gateway + MCP） |
+| `WO_OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | OpenClaw OpenAI-compatible gateway |
+| `WO_OPENCLAW_TOKEN` | — | OpenClaw gateway bearer token |
+| `WO_OPENCLAW_AGENT_ID` | `wechat-bot` | OpenClaw agent id，模型名会拼成 `openclaw/<agent_id>` |
 | `WO_GROUPS` | `[]` | 监听的群（群名 / 备注 / wxid，逗号或 JSON 数组）；空 = 自动监听 WeFlow `/api/v1/sessions` 当前暴露的所有 `@chatroom` 群聊 |
 | `WO_LOG_LEVEL` | `INFO` | loguru 级别 |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API |
@@ -580,7 +607,7 @@ messages (
     t,              -- unix seconds
     type,           -- text/image/voice/video/link/forward/quote/sticker/system
     content_text,
-    media_path,     -- 相对 data_dir 或绝对（live 走 WeFlow cache）
+    media_path,     -- 相对 data_dir（data/media/...）
     reply_to_wx_msg_id, quote_text,
     transcript,     -- worker mm 写入的 OCR/ASR 文字；NULL=待处理 / ''=处理过没结果 / '<text>'=成功
     source,         -- live / backfill
@@ -649,9 +676,9 @@ uv run wechat-oracle status   # DB 路径 / 总条数 / 按状态分布 / 按群
 
 ---
 
-## 实验记录：openclaw 群聊不可行（结论锁定，2026-05）
+## 实验记录：Tencent iLink Bot 群聊不可行（结论锁定，2026-05）
 
-腾讯通过 OpenClaw 开放了官方的 [iLink Bot HTTP API](https://github.com/hao-ji-xing/openclaw-weixin)，跨平台、零封号风险。本来期望它能替掉 wx4py，但跑下来三层全堵：
+腾讯通过 OpenClaw 开放了官方的 [iLink Bot HTTP API](https://github.com/hao-ji-xing/openclaw-weixin)，跨平台、零封号风险。本来期望它能替掉 wx4py 作为“发回微信群”的回复通道，但跑下来三层全堵：
 
 1. **微信 UI 层**：登录后 bot 只表现为一个 1-on-1 对话窗口，**没有「加入群聊」/「分享到群」入口**——ClawBot 设计上就不是普通联系人。
 2. **SDK 层**：上游 `messaging/inbound.ts` 把 `ChatType` 硬编码成 `"direct"`；`messaging/send.ts` 的 `sendMessageWeixin` 函数签名只接受 `to: string`（→ `to_user_id`），从来不用 `group_id`。
@@ -659,18 +686,7 @@ uv run wechat-oracle status   # DB 路径 / 总条数 / 按状态分布 / 按群
 
 ✅ 唯一确认能用的：**1-on-1 DM**（user → bot → user）。`from_user_id` namespace `@im.wechat`，`to_user_id` namespace `@im.bot`，发送时必须带 `context_token`。
 
-**所以 `WO_REPLY_BACKEND=openclaw` 不存在**——`OpenclawReplier` adapter 已删除。但底层 `openclaw.py` 模块 + `wechat-oracle openclaw {login,probe,send}` 三条 CLI 子命令保留，作为：
-
-- 诊断工具（万一 Tencent 后续放开了群聊，复跑实验只要 5 分钟）
-- 未来如果做「私聊 bot 问知识库」之类 DM-only 场景，HTTP 通道现成
-
-实验复跑命令（仅供后人参考）：
-
-```powershell
-uv run wechat-oracle openclaw login                              # QR 登录
-uv run wechat-oracle openclaw probe --minutes 3                  # 看 DM 字段
-uv run wechat-oracle openclaw send --group-id "<x@chatroom>" "x" # 群发实验
-```
+**所以 `WO_REPLY_BACKEND=openclaw` 不存在**——回复通道仍然是 `wx4py` 或 `stdout`。当前 OpenClaw 只作为 LLM/agent backend，通过 OpenAI-compatible gateway + MCP 工具完成推理和读写记忆，最后仍由 dispatcher 调 replier 发回群。
 
 ## 已知边界 / 限制
 

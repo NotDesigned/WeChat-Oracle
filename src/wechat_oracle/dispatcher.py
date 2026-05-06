@@ -49,10 +49,17 @@ from typing import Callable, ClassVar
 from loguru import logger
 
 from . import prompts
-from .agent.orchestrator import chat_via_agent, chat_via_lurk, lurk_due_groups
+from .agent.backend import get_agent_backend
+from .agent.orchestrator import chat_via_lurk, lurk_due_groups
 from .config import settings
 from .db import get_conn, init_db, transaction
-from .llm import LLMClient, VisionLLM, build_llm_client, build_vision_client
+from .llm import (
+    LLMClient,
+    OpenClawCompletionLLM,
+    VisionLLM,
+    build_llm_client,
+    build_vision_client,
+)
 from .log_utils import append_log, dump_llm_call
 from .replier import Replier, build_replier
 
@@ -378,7 +385,7 @@ class ChatCommand(Command):
         chat='' (the silent signal honored by `_process`) when the agent
         chose stay_silent. Full trace in `agent_run_log`; readable trace
         block lands in dispatcher.log via stdout."""
-        reply, trace_block = chat_via_agent(
+        reply, trace_block = get_agent_backend().chat(
             ctx=ctx, user_question=self.message, trigger_kind="mention",
         )
         if reply is None:
@@ -436,9 +443,10 @@ class AskCommand(Command):
         # bytes directly — same single-pass route as /explain. /ask still
         # honors its "no group history" promise: only the user's question
         # + the one quoted image go to the model, no candidate context.
+        openclaw_mode = (settings.agent_backend or "native").lower() == "openclaw"
         image_path = (
             _resolve_quoted_image_path(ctx.conn, ctx.quoted_msg_id)
-            if ctx.vision is not None else None
+            if (ctx.vision is not None and not openclaw_mode) else None
         )
         if image_path is not None:
             return self._execute_vision(ctx, image_path)
@@ -453,6 +461,18 @@ class AskCommand(Command):
             f"用户引用了一条消息：{ctx.quoted_text.strip()}\n"
             if ctx.quoted_text and ctx.quoted_text.strip() else ""
         )
+        if openclaw_mode and ctx.quoted_msg_id:
+            quoted_msg_id, quoted_type = _resolve_quoted_msg_meta(
+                ctx.conn, ctx.quoted_msg_id,
+            )
+            if quoted_msg_id is not None:
+                hint = _openclaw_quoted_hint(
+                    group_id=ctx.group_id,
+                    msg_id=quoted_msg_id,
+                    msg_type=quoted_type,
+                )
+                if hint:
+                    quoted_line += hint + "\n"
         user = f"当前时间：{now_str}\n{requester_line}{quoted_line}用户问题：{self.question}"
         reply = ctx.llm.complete_text(
             model=ctx.model,
@@ -692,9 +712,10 @@ class ExplainCommand(Command):
         # actual bytes directly — there's no point asking the text model to
         # explain a `[图片]` placeholder. Single-pass: the user has already
         # pointed at the exact message, so no <NEED_IMAGES> selector needed.
+        openclaw_mode = (settings.agent_backend or "native").lower() == "openclaw"
         image_path = (
             _resolve_quoted_image_path(ctx.conn, ctx.quoted_msg_id)
-            if ctx.vision is not None else None
+            if (ctx.vision is not None and not openclaw_mode) else None
         )
         if image_path is not None:
             return self._execute_vision(ctx, image_path, explicit)
@@ -705,6 +726,18 @@ class ExplainCommand(Command):
                 source += f"\n用户补充：{explicit}"
         else:
             source = f"待解释文本：{explicit}"
+        if openclaw_mode and ctx.quoted_msg_id:
+            quoted_msg_id, quoted_type = _resolve_quoted_msg_meta(
+                ctx.conn, ctx.quoted_msg_id,
+            )
+            if quoted_msg_id is not None:
+                hint = _openclaw_quoted_hint(
+                    group_id=ctx.group_id,
+                    msg_id=quoted_msg_id,
+                    msg_type=quoted_type,
+                )
+                if hint:
+                    source += "\n" + hint
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         user = f"当前时间：{now_str}\n{source}"
@@ -1181,7 +1214,9 @@ def _run_vision_on_quoted_image(
 # (resolve_image_paths_by_cand) is no longer imported here — it was only
 # wired into the deleted vision-sentinel two-pass.
 from .agent.media_paths import (
+    openclaw_quoted_hint as _openclaw_quoted_hint,
     resolve_quoted_image_path as _resolve_quoted_image_path,
+    resolve_quoted_msg_meta as _resolve_quoted_msg_meta,
 )
 
 
@@ -1478,12 +1513,19 @@ def _next_unprocessed(
 
 
 def _build_llm_client() -> LLMClient:
-    return build_llm_client(
+    if (settings.agent_backend or "native").lower() == "openclaw":
+        return OpenClawCompletionLLM(
+            gateway_url=settings.openclaw_gateway_url,
+            token=settings.openclaw_token,
+            agent_id=settings.openclaw_agent_id,
+        )
+    native = build_llm_client(
         provider=settings.llm_provider,
         api_key=settings.llm_api_key,
         endpoint=settings.llm_endpoint,
         json_mode=settings.llm_json_mode,
     )
+    return native
 
 
 def _build_vision_client() -> VisionLLM | None:
@@ -1664,7 +1706,7 @@ def _process_agent_only(
         )
 
     try:
-        reply, trace_block = chat_via_agent(
+        reply, trace_block = get_agent_backend().chat(
             ctx=ctx, user_question=user_question, trigger_kind=kind,
         )
     except Exception as e:
@@ -1960,9 +2002,11 @@ def run_dispatcher() -> None:
     worker_threads = max(1, settings.dispatcher_worker_threads)
 
     logger.info(
-        "dispatcher: bot={!r} model={} vision={} agent_max_steps={} workers={} interval={}s replier={} commands={} log={} llm_log={}",
+        "dispatcher: bot={!r} model={} llm={} vision={} agent_backend={} agent_max_steps={} workers={} interval={}s replier={} commands={} log={} llm_log={}",
         settings.bot_name, settings.llm_model,
+        getattr(llm, "name", type(llm).__name__),
         f"{settings.vision_model}" if vision else "off",
+        settings.agent_backend,
         settings.agent_max_steps,
         worker_threads,
         interval,

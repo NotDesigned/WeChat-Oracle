@@ -11,14 +11,15 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "httpx>=0.28.1",
     "loguru>=0.7.3",
+    "mcp>=1.0.0",
     "openai>=1.50.0",
     "pydantic>=2.13.3",
     "pydantic-settings>=2.14.0",
     "pyyaml>=6.0.3",
-    "qrcode[pil]>=8.2",
     "rapidocr-onnxruntime>=1.4.4",
     "typer>=0.25.1",
-    "wx4py",  # UI-automation backend for sending replies; supports WeChat 4.1.x (Qt)
+    # Windows-only: wx4py drives WeChat's GUI for sending replies.
+    "wx4py; sys_platform == 'win32'",  # UI-automation backend for sending replies; supports WeChat 4.1.x (Qt)
 ]
 
 [project.scripts]

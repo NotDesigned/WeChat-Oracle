@@ -16,7 +16,10 @@ Two top-level entry points:
       Silent background-learning pass over new messages since the lurk
       cursor. Never produces a chat reply, only updates `group_memory` /
       `persona_drift`. Returns the trace_block (also appended to
-      dispatcher.log when `log_path` is given).
+      dispatcher.log when `log_path` is given). When
+      `WO_AGENT_BACKEND=openclaw` it delegates to `_chat_via_lurk_openclaw`
+      which forwards the same reflection task through the OpenClaw gateway
+      so memory writes happen via MCP. Native lurk path stays the default.
 
 `lurk_due_groups()` is exposed for the dispatcher main loop's eligibility
 scan.
@@ -40,9 +43,9 @@ from loguru import logger
 from .. import prompts
 from ..config import settings
 from ..db import transaction
-from ..llm import LLMClient
+from ..llm import LLMClient, OpenClawChatCompletions
 from ..log_utils import append_log, dump_llm_call
-from .memory import insert_run_log, link_last_run_id
+from .memory import get_group_memory, insert_run_log, link_last_run_id
 from .persona import assemble_system_prompts
 from .runtime import ToolBudget, run_agent, run_lurk_reflection
 from .tools import GroupScopedTools
@@ -508,6 +511,23 @@ def chat_via_lurk(
         }
     ]
 
+    if (settings.agent_backend or "native").lower() == "openclaw":
+        return _chat_via_lurk_openclaw(
+            conn=conn,
+            group_id=group_id,
+            group_name=group_name,
+            bot_name=bot_name,
+            lurk_system=lurk_system,
+            user_msg=user_msg,
+            audit_observation_trace=audit_observation_trace,
+            oldest_msg_id=oldest_msg_id,
+            newest_msg_id=newest_msg_id,
+            n_msgs=len(rows),
+            started_at=started_at,
+            log_path=log_path,
+            llm_log_path=llm_log_path,
+        )
+
     lurk_tools = GroupScopedTools(
         conn=conn, group_id=group_id, group_name=group_name, bot_name=bot_name,
     )
@@ -579,5 +599,127 @@ def chat_via_lurk(
         group_id, len(rows),
         sum(1 for s in phase_b_trace if s.get("kind") == "tool_call" and s.get("tool", "").startswith("update_")),
         finished_at - started_at,
+    )
+    return trace_block
+
+
+def _chat_via_lurk_openclaw(
+    *,
+    conn: sqlite3.Connection,
+    group_id: str,
+    group_name: str | None,
+    bot_name: str,
+    lurk_system: str,
+    user_msg: str,
+    audit_observation_trace: list[dict[str, Any]],
+    oldest_msg_id: int,
+    newest_msg_id: int,
+    n_msgs: int,
+    started_at: float,
+    log_path: Path | None,
+    llm_log_path: Path | None,
+) -> str:
+    """OpenClaw-backed lurk pass.
+
+    The in-process native lurk loop needs provider-side tool calls. In
+    OpenClaw mode, the wechat-bot agent owns tool use through MCP, so this
+    sends the same reflection task as one chat-completions turn and lets
+    OpenClaw perform any `update_*` calls internally.
+    """
+    group_memory = get_group_memory(conn, group_id).strip()
+    openclaw_contract = f"""
+
+---
+OpenClaw lurk contract:
+- This is a silent background reflection pass for one WeChat group.
+- group_id: {group_id}
+- group_name: {group_name or ""}
+- bot_name: {bot_name}
+- Every WeChat-Oracle MCP tool requires this exact group_id. Never invent,
+  omit, or substitute a different group_id.
+- Read before write; when updating group memory/persona, write back the full
+  merged text.
+- Do not answer the chat. Return an empty assistant message after any useful
+  memory/persona updates are done.
+
+Current group_memory snapshot:
+{group_memory or "(empty)"}
+"""
+    system_prompt = lurk_system + openclaw_contract
+    client = OpenClawChatCompletions(
+        gateway_url=settings.openclaw_gateway_url,
+        token=settings.openclaw_token,
+        agent_id=settings.openclaw_agent_id,
+    )
+    resp = client.complete(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.2,
+        max_tokens=settings.write_max_tokens,
+        label="lurk",
+    )
+    finished_at = time.time()
+    phase_b_trace = [
+        {
+            "step": 0,
+            "kind": "openclaw_lurk_call",
+            "tool": "_openclaw",
+            "args": {
+                "agent_id": settings.openclaw_agent_id,
+                "group_id": group_id,
+                "oldest_msg_id": oldest_msg_id,
+                "newest_msg_id": newest_msg_id,
+                "recent_msgs": n_msgs,
+                "duration_s": round(finished_at - started_at, 3),
+                "usage": resp.usage,
+            },
+            "result": (resp.content.strip() or "(empty / silent)"),
+        }
+    ]
+
+    try:
+        with transaction(conn):
+            run_id = insert_run_log(
+                conn,
+                group_id=group_id,
+                trigger_msg_id=newest_msg_id,
+                trigger_kind="lurk",
+                phase_a_trace=audit_observation_trace,
+                phase_b_trace=phase_b_trace,
+                reply_text=None,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            _upsert_lurk_cursor(
+                conn,
+                group_id=group_id,
+                last_msg_id=newest_msg_id,
+                run_id=run_id,
+            )
+    except Exception:
+        logger.exception("openclaw lurk: failed to write agent_run_log; trace still returned")
+
+    if llm_log_path:
+        dump_llm_call(
+            llm_log_path,
+            label=f"openclaw-lurk  ::  group={group_id}",
+            system=system_prompt,
+            user=user_msg,
+            raw=resp.content.strip() or "(silent)",
+            parsed={"phase_b_trace": phase_b_trace, "usage": resp.usage},
+        )
+
+    trace_block = _format_trace_for_log(audit_observation_trace, phase_b_trace)
+    if log_path:
+        append_log(
+            log_path,
+            int(time.time()),
+            f"openclaw-lurk[{group_id}] msgs={n_msgs} range={oldest_msg_id}..{newest_msg_id}\n{trace_block}",
+        )
+    logger.info(
+        "openclaw lurk :: group_id={} msgs={} dur={:.1f}s",
+        group_id, n_msgs, finished_at - started_at,
     )
     return trace_block

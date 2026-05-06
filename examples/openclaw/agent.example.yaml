@@ -1,0 +1,13 @@
+id: wechat-bot
+name: WeChat Bot
+description: WeChat-Oracle group chat agent
+skills:
+  - ./wechat-bot.SKILL.md
+mcpServers:
+  wechat-oracle:
+    command: uv
+    args:
+      - run
+      - wechat-oracle
+      - openclaw
+      - mcp-serve

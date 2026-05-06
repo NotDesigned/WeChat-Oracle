@@ -8,8 +8,9 @@ Schema contract (CLAUDE.md F1):
   transcript = '<txt>' → success
 
 Path resolution:
-  media_path may be absolute (live, into WeFlow's cache dir) OR relative
-  (backfill, anchored at settings.data_dir). We try both.
+  New live/backfill rows store media_path relative to settings.data_dir under
+  data/media. Older live rows may still contain absolute WeFlow cache paths;
+  run scripts/normalize_media_paths.py to migrate them.
 
 Failure modes (logged, don't kill the worker):
   - file missing on disk → mark transcript='' (we'll never get the bytes back)
@@ -55,8 +56,7 @@ def _next_batch(conn: sqlite3.Connection, limit: int = _BATCH) -> list[sqlite3.R
 
 
 def _resolve_path(media_path: str) -> Path:
-    """Live stores absolute paths into WeFlow's cache; backfill stores
-    relative paths under data_dir. Try both."""
+    """Resolve data_dir-relative media paths, with legacy absolute fallback."""
     p = Path(media_path)
     if p.is_absolute():
         return p
@@ -132,6 +132,16 @@ def _process_one(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
             text = transcribe_voice(path)
         else:
             return f"unsupported:{kind}"
+    except ImportError as e:
+        # Environmental: missing engine deps (e.g. rapidocr_onnxruntime not
+        # installed, faster-whisper missing CUDA). Don't poison transcript —
+        # the row may transcribe fine after `uv sync` rebuilds the venv.
+        # Re-raise so run_mm_worker's outer loop can back off / surface.
+        logger.error(
+            "mm worker: engine unavailable ({}); leaving msg_id={} for retry "
+            "after deps are restored", e, msg_id,
+        )
+        raise
     except Exception as e:
         logger.exception("worker: {} failed on msg_id={} ({})", kind, msg_id, path)
         _save_transcript(conn, msg_id, "")  # mark done so we don't loop
@@ -142,6 +152,9 @@ def _process_one(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
         return "empty"
     preview = text.replace("\n", " ")[:60]
     return f"ok len={len(text)} {preview!r}"
+
+
+_ENGINE_BACKOFF_SLEEP = 600.0  # 10 min after ImportError → don't hammer logs
 
 
 def run_mm_worker() -> None:
@@ -160,11 +173,21 @@ def run_mm_worker() -> None:
                 if not rows:
                     time.sleep(_IDLE_SLEEP)
                     continue
-                for row in rows:
-                    status = _process_one(conn, row)
-                    logger.info(
-                        "msg_id={} type={} → {}",
-                        row["msg_id"], row["type"], status,
+                try:
+                    for row in rows:
+                        status = _process_one(conn, row)
+                        logger.info(
+                            "msg_id={} type={} → {}",
+                            row["msg_id"], row["type"], status,
+                        )
+                except ImportError:
+                    # Engine deps absent — unprocessed rows stay queued.
+                    # Sleep longer so the operator's stderr / process.log
+                    # isn't spammed every batch while they `uv sync`.
+                    logger.warning(
+                        "mm worker: engine deps missing; sleeping {}s before retry",
+                        _ENGINE_BACKOFF_SLEEP,
                     )
+                    time.sleep(_ENGINE_BACKOFF_SLEEP)
         except KeyboardInterrupt:
             logger.info("mm worker stopped by user")

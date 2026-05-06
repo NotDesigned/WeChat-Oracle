@@ -15,7 +15,6 @@ deleted without breaking DB references.
 """
 
 import json
-import shutil
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -24,6 +23,12 @@ from loguru import logger
 
 from ..models import Message, MsgType
 from .forwarded import FORWARD_LOCAL_TYPE, base_local_type, parse_record_xml
+from .media_store import (
+    MEDIA_MISSING_TAGS as _MEDIA_MISSING_TAGS,
+    MEDIA_TYPES as _MEDIA_TYPES,
+    materialize_media_ref,
+    parse_media_ref as _parse_media_ref,
+)
 
 
 def read_normalized_jsonl(path: Path, data_dir: Path) -> Iterator[Message]:
@@ -59,27 +64,6 @@ _WEFLOW_LOCAL_TYPE_MAP: dict[int, MsgType] = {
     10000: MsgType.SYSTEM,
 }
 
-_MEDIA_TYPES = {MsgType.IMAGE, MsgType.VOICE, MsgType.VIDEO, MsgType.STICKER}
-
-# Subdir under `data/media/<group_id>/` for each media kind. Decoupled from the source
-# export's layout so weird ref paths (e.g. WeFlow's `../images/x.jpg`) can't escape.
-_MEDIA_SUBDIR: dict[MsgType, str] = {
-    MsgType.IMAGE: "images",
-    MsgType.VOICE: "voices",
-    MsgType.VIDEO: "videos",
-    MsgType.STICKER: "stickers",
-}
-
-# Tag written into `content_text` when media_path resolves but the file isn't on disk
-# (e.g. friend shared the JSON without the sibling images/voices/ folders).
-_MEDIA_MISSING_TAGS: dict[MsgType, str] = {
-    MsgType.IMAGE: "[图片缺失]",
-    MsgType.VOICE: "[语音缺失]",
-    MsgType.VIDEO: "[视频缺失]",
-    MsgType.STICKER: "[表情缺失]",
-}
-
-
 def _classify(raw: dict[str, Any]) -> MsgType | None:
     """Quotes/replies override the localType-based mapping.
 
@@ -93,41 +77,6 @@ def _classify(raw: dict[str, Any]) -> MsgType | None:
     if lt == FORWARD_LOCAL_TYPE:
         return MsgType.FORWARD
     return _WEFLOW_LOCAL_TYPE_MAP.get(base_local_type(lt))
-
-
-def _parse_media_ref(content: str | None) -> Path | None:
-    """WeFlow stores media file paths in `content` for media-type messages.
-
-    Placeholder strings like "[图片]" (when media export was disabled) are not paths.
-    Returns the raw Path as written in the JSON; relative paths are anchored later.
-    """
-    if not content:
-        return None
-    if content.startswith("[") or content.startswith("<"):
-        return None
-    return Path(content)
-
-
-def _copy_into_data(
-    src_abs: Path,
-    msg_type: MsgType,
-    group_id: str,
-    data_dir: Path,
-) -> str:
-    """Copy `src_abs` into `<data_dir>/media/<group_id>/<kind>/<filename>`; return
-    the path relative to `data_dir` with forward slashes
-    (e.g. `media/<group>/images/abc.jpg`).
-
-    Subdir is derived from `msg_type` rather than the source ref path — WeFlow's refs
-    can be parent-relative (`../images/x.jpg`), and trusting them lets the file escape
-    the per-group folder. Existing targets are skipped (re-import is a no-op).
-    """
-    sub = _MEDIA_SUBDIR[msg_type]
-    target = data_dir / "media" / group_id / sub / src_abs.name
-    if not target.exists():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_abs, target)
-    return f"media/{group_id}/{sub}/{src_abs.name}"
 
 
 def _convert_weflow_message(
@@ -149,10 +98,10 @@ def _convert_weflow_message(
         if ref is None:
             content_text = content
         else:
-            src_abs = ref if ref.is_absolute() else (source_root / ref)
-            if src_abs.exists():
-                media_path = _copy_into_data(src_abs, msg_type, group_id, data_dir)
-            else:
+            media_path = materialize_media_ref(
+                content, msg_type, group_id, data_dir, source_root=source_root,
+            )
+            if media_path is None:
                 content_text = _MEDIA_MISSING_TAGS[msg_type]
     else:
         content_text = content
