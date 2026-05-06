@@ -44,6 +44,7 @@ class OpenClawBackend:
         ctx: "CommandContext",
         user_question: str,
         trigger_kind: str,
+        reflection_enabled: bool | None = None,
     ) -> tuple[str | None, str]:
         if not settings.openclaw_token:
             raise RuntimeError("WO_OPENCLAW_TOKEN is empty; set it before using WO_AGENT_BACKEND=openclaw")
@@ -53,6 +54,7 @@ class OpenClawBackend:
             ctx=ctx,
             user_question=user_question,
             trigger_kind=trigger_kind,
+            reflection_enabled=reflection_enabled,
         )
         client = OpenClawChatCompletions(
             gateway_url=settings.openclaw_gateway_url,
@@ -121,6 +123,7 @@ def _build_messages(
     ctx: "CommandContext",
     user_question: str,
     trigger_kind: str,
+    reflection_enabled: bool | None,
 ) -> tuple[str, str]:
     recent_rows = _fetch_recent_for_agent(
         ctx.conn, ctx.group_id, settings.agent_recent_context_chat
@@ -176,6 +179,24 @@ def _build_messages(
         recent_block=recent_block,
         user_question=user_question,
     )
+    if trigger_kind == "local_ask" and reflection_enabled is False:
+        local_contract = """
+- This is a local operator ask, not a live WeChat trigger. The final answer is
+  shown only in the local CLI/TUI and will not be sent to WeChat.
+- This turn is read-only. Do not call update_group_memory or
+  update_persona_drift. You may call read_group_memory and history/media tools.
+"""
+    elif trigger_kind == "local_task":
+        local_contract = """
+- This is a local operator task, not a live WeChat trigger. The final answer is
+  shown only in the local CLI/TUI and will not be sent to WeChat.
+- The operator explicitly enabled write mode. You may update group_memory or
+  persona_drift only when the request asks for it or the run discovers stable
+  long-term information worth preserving.
+"""
+    else:
+        local_contract = ""
+
     openclaw_contract = f"""
 
 ---
@@ -204,6 +225,7 @@ OpenClaw runtime contract:
   returns a textual reading/OCR summary.
 - {prompts.READ_IMAGE_OCR_FALLBACK}
 - To stay silent, return an empty assistant message.
+{local_contract}
 """
     return persona_prompt + openclaw_contract, user_msg
 

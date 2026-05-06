@@ -16,6 +16,7 @@ The project is designed for a personal Windows machine running WeChat PC. Messag
 - Answers in group chat through wx4py UI automation.
 - Supports slash commands such as `/find`, `/sum`, `/recent`, `/ask`, `/explain`, and `/balance`.
 - Supports free-form agent chat when directly mentioned, replied to, or probability-triggered.
+- Supports Local Ask from the terminal UI or CLI: ask the bot about one selected group without sending anything to WeChat.
 - Runs a silent `lurk` learning path that updates `group_memory` / `persona_drift` without sending group messages.
 - Can use either the native in-process tool loop or an OpenClaw-backed runtime for agent turns.
 
@@ -36,23 +37,26 @@ SQLite WAL database: data/wechat-oracle.db
    |
    +--> dispatcher --> LLM / agent backend --> wx4py reply to WeChat
    |
+   +--> local ask  --> LLM / agent backend --> terminal UI only
+   |
    +--> agent lurk --> memory writes only, no reply
 ```
 
-Production usually runs two long-lived processes:
+Production can be started with one supervisor command:
 
 ```powershell
-uv run wechat-oracle ingest live
-uv run wechat-oracle dispatcher
+uv run wechat-oracle run
 ```
 
-`ingest live` starts the SSE subscriber and an embedded mm worker thread. `dispatcher` polls SQLite, processes explicit commands and agent triggers with per-group ordering and cross-group parallelism, and serializes all wx4py sends through one sender thread so only one GUI operation touches WeChat at a time.
+`run` starts `ingest live` and `dispatcher` together. `ingest live` starts the SSE subscriber and an embedded mm worker thread. `dispatcher` polls SQLite, processes explicit commands and agent triggers with per-group ordering and cross-group parallelism, and serializes all wx4py sends through one sender thread so only one GUI operation touches WeChat at a time.
+
+By default `run` opens a Textual terminal UI: the top area stays fixed with bot configuration, selected Local Ask group, and process status, while the rest of the screen scrolls live logs from both child processes. Press `a` to open a one-shot Local Ask dialog, or `c` to edit the agent backend/model. Saving the config writes `.env` and restarts the dispatcher so group replies use the new backend. Use `uv run wechat-oracle run --plain` to disable the TUI and let child processes write directly to the terminal.
 
 ## Requirements
 
 - Windows 10/11.
 - WeChat PC 4.1.x, Qt version. The wx4py reply path depends on the visible desktop UI.
-- WeFlow desktop with HTTP API enabled.
+- [WeFlow desktop](https://github.com/hicccc77/WeFlow) with HTTP API enabled. This project does not install WeFlow for you; install and start it first, then copy the HTTP API access token into `WO_WEFLOW_TOKEN`.
 - Python 3.12+.
 - [uv](https://docs.astral.sh/uv/).
 - An OpenAI-compatible LLM endpoint, or OpenClaw local gateway for `WO_AGENT_BACKEND=openclaw`.
@@ -65,10 +69,16 @@ Non-reply workflows such as DB initialization, historical import, status checks,
 git clone https://github.com/<your-account>/WeChat-Oracle.git
 cd WeChat-Oracle
 uv sync
-uv run wechat-oracle init-db
+uv run wechat-oracle setup
+uv run wechat-oracle doctor
+uv run wechat-oracle run
 ```
 
-Create `.env` in the repository root. Start with the common settings:
+`setup` writes a minimal `.env`, `doctor` checks the database, WeFlow, the selected agent backend, and the reply path, and `run` starts live ingest plus dispatcher with a small terminal UI. On Windows you can also double-click `scripts\run.bat` after setup.
+
+Before running `setup`, install and start WeFlow, open its settings, enable the HTTP API service, and copy the access token when prompted.
+
+For manual setup, create `.env` in the repository root. Start with the common settings:
 
 ```env
 # WeFlow
@@ -87,6 +97,13 @@ WO_AGENT_BASE_PROBABILITY=0.25
 WO_AGENT_RECENT_CONTEXT_CHAT=100
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
+
+# Optional image reading
+WO_VISION_API_KEY=
+WO_VISION_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
+WO_VISION_MODEL=qwen-vl-plus
+WO_VISION_MAX_IMAGES=3
+WO_VISION_MAX_TOKENS=800
 
 # Optional background learning
 WO_AGENT_LURK_ENABLED=False
@@ -115,7 +132,13 @@ WO_OPENCLAW_AGENT_ID=<your-agent-id>
 WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
 
-Then run:
+Then either run both processes through the supervisor:
+
+```powershell
+uv run wechat-oracle run
+```
+
+Or run them manually in two terminals:
 
 ```powershell
 # Terminal 1: live ingest + OCR/ASR worker
@@ -140,6 +163,9 @@ If `WO_GROUPS` is empty, live ingest monitors every group chat currently exposed
 General CLI:
 
 ```powershell
+uv run wechat-oracle setup
+uv run wechat-oracle doctor
+uv run wechat-oracle run
 uv run wechat-oracle init-db
 uv run wechat-oracle status
 uv run wechat-oracle ingest live
@@ -160,6 +186,8 @@ Agent state:
 ```powershell
 uv run wechat-oracle agent show <group_id>
 uv run wechat-oracle agent show-runs <group_id> -n 10
+uv run wechat-oracle agent ask <group_id-or-name> summarize today
+uv run wechat-oracle agent ask <group_id-or-name> update memory from this topic --write
 uv run wechat-oracle agent lurk <group_id>
 uv run wechat-oracle agent wipe <group_id>
 uv run wechat-oracle agent wipe <group_id> --persona-only
@@ -181,6 +209,16 @@ uv run wechat-oracle openclaw mcp-serve
 ```
 
 `openclaw mcp-serve` is a stdio MCP server entrypoint intended to be spawned by OpenClaw. `openclaw ping` tests the configured OpenClaw chat-completions gateway.
+
+Convenience wrappers:
+
+```powershell
+scripts\run.bat
+scripts\track.bat
+scripts\import.bat <export.json>
+```
+
+`scripts\run.bat` starts `wechat-oracle run`. `scripts\track.bat` is the lower-level live-ingest-only wrapper kept for debugging.
 
 ## Historical Backfill
 
@@ -238,7 +276,7 @@ Reply to an image and send: @Assistant /explain
 
 ## Agent Behavior
 
-There are three separate runtime paths.
+There are four separate runtime paths.
 
 ### 1. Collection Path
 
@@ -264,7 +302,28 @@ The native agent has two phases:
 
 Phase A initial context includes the latest `WO_AGENT_RECENT_CONTEXT_CHAT` messages from the current group. Tools can search older history, expand quote chains, expand forwarded bundles, read OCR/ASR text, read images through a vision model, read voice transcripts, or read group memory.
 
-### 3. Background Learning Path
+### 3. Local Ask Path
+
+The Textual UI and CLI can run an agent turn against a selected group without sending anything to WeChat.
+
+```powershell
+uv run wechat-oracle agent ask <group_id-or-name> summarize today's discussion
+uv run wechat-oracle agent ask <group_id-or-name> summarize Alice in August 2024 and update memory --write
+```
+
+In the TUI, use keyboard shortcuts:
+
+```text
+g  open group picker
+a  open Local Ask dialog for the selected group
+m  edit group_memory / persona_drift for the selected group
+c  edit agent backend / native model / OpenClaw agent id, then restart dispatcher
+w  toggle read-only/write mode
+```
+
+Local Ask defaults to read-only: it may read recent context, search history, inspect media, and read group memory, but it will not update `group_memory` / `persona_drift`. Use `--write` in the CLI or press `w` in the TUI to run a `local_task` that may update memory. Local Ask writes an `agent_run_log` audit row with `trigger_kind='local_ask'` or `trigger_kind='local_task'`; it never writes `command_runs` and never calls wx4py.
+
+### 4. Background Learning Path
 
 `agent lurk <group_id>` and optional auto-lurk read a watermarked batch of new messages and update memory without replying.
 
@@ -347,7 +406,7 @@ Key tables:
 | `group_state` | Live/backfill per-group cursors. |
 | `persona_drift` | Per-group evolvable behavior supplement. |
 | `group_memory` | Per-group freeform long-term memory document. |
-| `agent_run_log` | Agent audit traces. |
+| `agent_run_log` | Agent audit traces for chat, lurk, and Local Ask turns. |
 | `agent_lurk_state` | Lurk cursor, separate from audit logs. |
 
 All write paths for imported messages go through `ingest/writer.py:write_messages()` and rely on `UNIQUE(dedupe_key)` for cross-source deduplication.
@@ -392,13 +451,13 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_VISION_MAX_TOKENS` | `800` | Vision output cap. |
 | `WO_AGENT_BASE_PROBABILITY` | `0.25` | Probability trigger threshold; set `0` for explicit triggers only. |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | Per-group probability cooldown. |
-| `WO_AGENT_MAX_STEPS` | `5` | Native Phase A max rounds. |
+| `WO_AGENT_MAX_STEPS` | `8` | Native Phase A max rounds. |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B max rounds. |
 | `WO_AGENT_REFLECTION_ENABLED` | `True` | Enables chat Phase B memory reflection. |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | Persona YAML directory. |
 | `WO_AGENT_RECENT_CONTEXT_CHAT` | `100` | Initial recent-message window for agent chat. |
 | `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | Hard cap for `group_memory`. |
-| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `12` | Native Phase A tool budget. |
+| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `20` | Native Phase A tool budget. |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Native Phase A per-step tool budget. |
 | `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Native image-read budget. |
 | `WO_AGENT_MAX_VOICE_READS_PER_RUN` | `2` | Native voice-read budget. |

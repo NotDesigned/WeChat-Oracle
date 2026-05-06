@@ -321,6 +321,7 @@ def chat_via_agent(
     ctx: "CommandContext",
     user_question: str,
     trigger_kind: str = "mention",
+    reflection_enabled: bool | None = None,
 ) -> tuple[str | None, str]:
     """Run the multi-turn agent loop for an @<bot> chat trigger.
 
@@ -389,9 +390,13 @@ def chat_via_agent(
         base_phase_b_prompt=phase_b_system_prompt(),
     )
 
+    effective_reflection_enabled = (
+        settings.agent_reflection_enabled
+        if reflection_enabled is None else reflection_enabled
+    )
     write_tools: GroupScopedTools | None = None
     phase_b_system: str | None = None
-    if settings.agent_reflection_enabled:
+    if effective_reflection_enabled:
         write_tools = GroupScopedTools(
             conn=ctx.conn, group_id=ctx.group_id,
             group_name=ctx.group_name, bot_name=ctx.bot_name,
@@ -409,7 +414,7 @@ def chat_via_agent(
         phase_b_system=phase_b_system,
         max_steps=settings.agent_max_steps,
         reflect_max_steps=settings.agent_reflect_max_steps,
-        reflection_enabled=settings.agent_reflection_enabled,
+        reflection_enabled=effective_reflection_enabled,
         temperature=0.5,
         max_tokens=settings.chat_max_tokens,
         write_max_tokens=settings.write_max_tokens,

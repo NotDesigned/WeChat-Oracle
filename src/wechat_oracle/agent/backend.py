@@ -36,6 +36,7 @@ class AgentBackend(Protocol):
         ctx: "CommandContext",
         user_question: str,
         trigger_kind: str,
+        reflection_enabled: bool | None = None,
     ) -> tuple[str | None, str]:
         """Run one chat-trigger turn. Returns (reply_text_or_None, trace_block).
         Same return shape as `orchestrator.chat_via_agent` so call sites are
@@ -44,14 +45,17 @@ class AgentBackend(Protocol):
 
 
 _backend: AgentBackend | None = None
+_backend_name: str | None = None
 
 
 def get_agent_backend() -> AgentBackend:
     """Module-level singleton. Backends are stateless / re-entrant so a single
     instance shared across worker threads is fine."""
-    global _backend
-    if _backend is None:
+    global _backend, _backend_name
+    name = (settings.agent_backend or "native").lower()
+    if _backend is None or _backend_name != name:
         _backend = _build()
+        _backend_name = name
     return _backend
 
 

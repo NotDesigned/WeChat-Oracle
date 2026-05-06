@@ -1283,6 +1283,14 @@ def _clip_one_line(text: str, limit: int) -> str:
     return one[:limit - 1] + "…"
 
 
+def _terminal_print(text: str = "") -> None:
+    """Best-effort operator output; never fail message processing."""
+    try:
+        print(text, flush=True)
+    except (OSError, ValueError, UnicodeEncodeError) as e:
+        logger.debug("terminal output suppressed: {}: {}", type(e).__name__, e)
+
+
 def _llm_balance_url() -> str:
     endpoint = settings.llm_endpoint.rstrip("/")
     if endpoint.endswith("/v1"):
@@ -1545,10 +1553,9 @@ def _send_with_events(
             error=f"{type(e).__name__}: {e}",
         )
         if terminal:
-            print(
+            _terminal_print(
                 f"  send: failed dur={duration_ms/1000:.1f}s "
-                f"error={type(e).__name__}: {e}",
-                flush=True,
+                f"error={type(e).__name__}: {e}"
             )
         return False
     duration_ms = round((time.time() - started) * 1000, 3)
@@ -1560,7 +1567,7 @@ def _send_with_events(
         duration_ms=duration_ms,
     )
     if terminal:
-        print(f"  send: ok dur={duration_ms/1000:.1f}s", flush=True)
+        _terminal_print(f"  send: ok dur={duration_ms/1000:.1f}s")
     return True
 
 
@@ -1580,13 +1587,10 @@ def _print_trigger_terminal(
     group = row["group_name"] or row["group_id"]
     body = _terminal_message_body(row)
     suffix = f" command=/{command}" if command else ""
-    print(
-        f"\nmsg={row['msg_id']} group={group} from={sender} type={row['type']}",
-        flush=True,
-    )
-    print(f"  trigger: {trigger} reason={reason}{suffix}", flush=True)
+    _terminal_print(f"\nmsg={row['msg_id']} group={group} from={sender} type={row['type']}")
+    _terminal_print(f"  trigger: {trigger} reason={reason}{suffix}")
     if body:
-        print(f"  text: {body}", flush=True)
+        _terminal_print(f"  text: {body}")
 
 
 def _read_recent_mcp_events(group_id: str, since_ts: float) -> list[dict[str, object]]:
@@ -1701,7 +1705,7 @@ def _print_openclaw_timing_terminal(
         )
 
     if parts:
-        print(f"  openclaw: {' '.join(parts)}", flush=True)
+        _terminal_print(f"  openclaw: {' '.join(parts)}")
 
 
 def _print_agent_activity_terminal(
@@ -1747,9 +1751,9 @@ def _print_agent_activity_terminal(
             if writes.index(item) == next(i for i, x in enumerate(writes) if x.split()[0] == item.split()[0])
         ]
         if reads:
-            print(f"  tools: {', '.join(reads[:8])}", flush=True)
+            _terminal_print(f"  tools: {', '.join(reads[:8])}")
         if writes:
-            print(f"  memory: {', '.join(writes[:6])}", flush=True)
+            _terminal_print(f"  memory: {', '.join(writes[:6])}")
         return
 
     tool_lines: list[str] = []
@@ -1763,13 +1767,12 @@ def _print_agent_activity_terminal(
         elif "(" in stripped:
             tool_lines.append(_clip_one_line(stripped, 120))
     if tool_lines:
-        print(f"  tools: {'; '.join(tool_lines[:4])}", flush=True)
+        _terminal_print(f"  tools: {'; '.join(tool_lines[:4])}")
     if memory_lines:
-        print(f"  memory: {'; '.join(memory_lines[:3])}", flush=True)
+        _terminal_print(f"  memory: {'; '.join(memory_lines[:3])}")
     if not tool_lines and not memory_lines:
-        print(
-            "  tools: none captured via WeChat-Oracle MCP; see data/openclaw.log for the full OpenClaw turn",
-            flush=True,
+        _terminal_print(
+            "  tools: none captured via WeChat-Oracle MCP; see data/openclaw.log for the full OpenClaw turn"
         )
 
 
@@ -1798,12 +1801,9 @@ def _print_terminal_result(
     chat only prints a one-line summary instead of the Phase trace.
     """
     if parsed.name == "(chat)":
-        print(
-            f"  agent: {result.summary} dur={duration_ms/1000:.1f}s",
-            flush=True,
-        )
+        _terminal_print(f"  agent: {result.summary} dur={duration_ms/1000:.1f}s")
         return
-    print(result.stdout, flush=True)
+    _terminal_print(result.stdout)
 
 
 def _next_unprocessed(
@@ -2013,7 +2013,7 @@ def _process(
 
     if isinstance(parsed, ParseError):
         text = parsed.chat()
-        print(text, flush=True)
+        _terminal_print(text)
         append_log(log_path, row["t"], text)
         _send_with_events(replier, row, requester, text, "parse_error")
         _finalize(conn, msg_id, "ok", f"parse-error: {parsed.reason}")
@@ -2047,11 +2047,10 @@ def _run_command(
         msg = f"⚠️ /{parsed.name} 执行失败：{e}"
         if parsed.name == "(chat)":
             duration_ms = round((time.time() - started) * 1000, 3)
-            print(
-                f"  agent: failed dur={duration_ms/1000:.1f}s error={type(e).__name__}: {e}",
-                flush=True,
+            _terminal_print(
+                f"  agent: failed dur={duration_ms/1000:.1f}s error={type(e).__name__}: {e}"
             )
-        print(msg, flush=True)
+        _terminal_print(msg)
         append_log(log_path, row["t"], msg)
         _send_with_events(replier, row, requester, msg, f"command:{parsed.name}:error")
         _finalize(conn, msg_id, "error", str(e))
@@ -2081,7 +2080,7 @@ def _run_command(
             trace_block=result.stdout,
         )
         if result.chat.strip():
-            print(f"  reply: {_clip_one_line(result.chat, 180)}", flush=True)
+            _terminal_print(f"  reply: {_clip_one_line(result.chat, 180)}")
     if result.chat.strip():
         sent = _send_with_events(
             replier,
@@ -2153,7 +2152,7 @@ def _process_agent_only(
 
     summary = f"agent[{kind}]: " + ("silent" if reply is None else f"{len(reply)} chars")
     duration_ms = round((time.time() - started) * 1000, 3)
-    print(f"  agent: {summary} dur={duration_ms/1000:.1f}s", flush=True)
+    _terminal_print(f"  agent: {summary} dur={duration_ms/1000:.1f}s")
     log_block_parts = [
         f"agent[{kind}] msg_id={msg_id}",
         reply or "(silent)",
@@ -2168,7 +2167,7 @@ def _process_agent_only(
         trace_block=trace_block,
     )
     if reply and reply.strip():
-        print(f"  reply: {_clip_one_line(reply, 180)}", flush=True)
+        _terminal_print(f"  reply: {_clip_one_line(reply, 180)}")
     if reply and reply.strip():
         sent = _send_with_events(
             replier, row, requester, reply, f"agent:{kind}", terminal=True

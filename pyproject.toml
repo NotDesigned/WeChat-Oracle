@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.14.0",
     "pyyaml>=6.0.3",
     "rapidocr-onnxruntime>=1.4.4",
+    "textual>=8.2.5",
     "typer>=0.25.1",
     # Windows-only: wx4py drives WeChat's GUI for sending replies.
     "wx4py; sys_platform == 'win32'",  # UI-automation backend for sending replies; supports WeChat 4.1.x (Qt)

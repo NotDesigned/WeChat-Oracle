@@ -236,8 +236,13 @@ PHASE_A_PENULTIMATE_WARNING = (
 # Placeholders: {step}, {max_steps}
 PHASE_A_LAST_STEP_FORCE = (
     "[runtime] 这是你最后一回合 (step {step}/{max_steps})。"
-    " 工具调用已禁用。基于已有信息直接输出最终回答,"
-    " 或如果实在无法回答就在文字里说清楚为什么 — 不要返回空内容。"
+    " 工具调用已经彻底结束，不能再请求任何工具。"
+    " 禁止输出工具调用格式，包括 DSML/XML/JSON/function_call/tool_calls/invoke/parameter。"
+    " 你现在只能输出一段会直接发到微信群里的自然语言最终回复。"
+    " 如果信息不完整，也必须基于已有信息总结，并明确说「还有哪部分没查到」。"
+    " 例：不要写 <tool_calls>get_message_context...</tool_calls>；"
+    " 应该写「今天大概分三条线：A、B、C；细节我还没展开查完」。"
+    " 不要返回空内容。"
 )
 
 # Inserted when first-step output is empty + no tool calls (one-shot retry).

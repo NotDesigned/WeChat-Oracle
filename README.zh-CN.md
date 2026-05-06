@@ -16,6 +16,7 @@ WeChat Oracle 通过 [WeFlow](https://github.com/hicccc77/WeFlow) 记录微信�
 - 通过 wx4py UI 自动化把回复发回微信群。
 - 支持 `/find`、`/sum`、`/recent`、`/ask`、`/explain`、`/balance` 等 slash 命令。
 - 被直接 @、被引用回复或概率触发时，支持自由形式的 agent 对话。
+- 支持从终端 UI 或 CLI 进行 Local Ask：选择一个群后直接问 bot，但不把回答发到微信。
 - 支持静默的 `lurk` 学习链路，更新 `group_memory` / `persona_drift`，但不在群里发消息。
 - agent turn 可以使用本进程 native tool loop，也可以委托给 OpenClaw runtime。
 
@@ -36,23 +37,26 @@ SQLite WAL database: data/wechat-oracle.db
    |
    +--> dispatcher --> LLM / agent backend --> wx4py reply to WeChat
    |
+   +--> local ask  --> LLM / agent backend --> terminal UI only
+   |
    +--> agent lurk --> memory writes only, no reply
 ```
 
-生产环境通常常驻两个进程：
+生产环境可以用一个 supervisor 命令启动：
 
 ```powershell
-uv run wechat-oracle ingest live
-uv run wechat-oracle dispatcher
+uv run wechat-oracle run
 ```
 
-`ingest live` 启动 SSE 订阅，并内嵌一个 mm worker 线程。`dispatcher` 轮询 SQLite，按群串行、跨群并行地处理显式命令和 agent 触发，并把所有 wx4py 发送操作串行化到一个发送线程，保证同一时间只有一个 GUI 操作触碰微信。
+`run` 会同时启动 `ingest live` 和 `dispatcher`。`ingest live` 启动 SSE 订阅，并内嵌一个 mm worker 线程。`dispatcher` 轮询 SQLite，按群串行、跨群并行地处理显式命令和 agent 触发，并把所有 wx4py 发送操作串行化到一个发送线程，保证同一时间只有一个 GUI 操作触碰微信。
+
+默认情况下，`run` 会打开一个 Textual 终端 UI：上方固定显示 bot 配置、当前 Local Ask 群和进程状态，其余区域滚动显示两个子进程的实时日志。按 `a` 会打开一次性的 Local Ask 输入对话框，按 `c` 可以修改 agent 后端和模型配置。保存配置会写回 `.env`，并重启 dispatcher，让微信群回复也使用新的后端。如果想回到原始输出，可以用 `uv run wechat-oracle run --plain`。
 
 ## 环境要求
 
 - Windows 10/11。
 - 微信 PC 4.1.x Qt 版。wx4py 回复路径依赖可见的桌面 UI。
-- 已启用 HTTP API 的 WeFlow 桌面端。
+- 已启用 HTTP API 的 [WeFlow 桌面端](https://github.com/hicccc77/WeFlow)。本项目不会自动安装 WeFlow；请先安装并启动 WeFlow，在设置里启用 HTTP API 服务，然后把 access token 填入 `WO_WEFLOW_TOKEN`。
 - Python 3.12+。
 - [uv](https://docs.astral.sh/uv/)。
 - OpenAI-compatible LLM endpoint，或用于 `WO_AGENT_BACKEND=openclaw` 的 OpenClaw local gateway。
@@ -65,10 +69,16 @@ uv run wechat-oracle dispatcher
 git clone https://github.com/<your-account>/WeChat-Oracle.git
 cd WeChat-Oracle
 uv sync
-uv run wechat-oracle init-db
+uv run wechat-oracle setup
+uv run wechat-oracle doctor
+uv run wechat-oracle run
 ```
 
-在仓库根目录创建 `.env`。先写公共配置：
+`setup` 会写入最小 `.env`，`doctor` 检查数据库、WeFlow、所选 agent backend 和回复路径，`run` 用一个小型终端 UI 启动 live ingest 与 dispatcher。Windows 上 setup 完成后也可以双击 `scripts\run.bat`。
+
+运行 `setup` 前，请先安装并启动 WeFlow，在 WeFlow 设置里启用 HTTP API 服务，并准备好 access token。
+
+如果要手工配置，在仓库根目录创建 `.env`。先写公共配置：
 
 ```env
 # WeFlow
@@ -87,6 +97,13 @@ WO_AGENT_BASE_PROBABILITY=0.25
 WO_AGENT_RECENT_CONTEXT_CHAT=100
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
+
+# Optional image reading
+WO_VISION_API_KEY=
+WO_VISION_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
+WO_VISION_MODEL=qwen-vl-plus
+WO_VISION_MAX_IMAGES=3
+WO_VISION_MAX_TOKENS=800
 
 # Optional background learning
 WO_AGENT_LURK_ENABLED=False
@@ -115,7 +132,13 @@ WO_OPENCLAW_AGENT_ID=<your-agent-id>
 WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
 
-然后运行：
+然后可以用 supervisor 一起启动：
+
+```powershell
+uv run wechat-oracle run
+```
+
+也可以手动开两个终端：
 
 ```powershell
 # Terminal 1: live ingest + OCR/ASR worker
@@ -140,6 +163,9 @@ uv run wechat-oracle dispatcher
 通用 CLI：
 
 ```powershell
+uv run wechat-oracle setup
+uv run wechat-oracle doctor
+uv run wechat-oracle run
 uv run wechat-oracle init-db
 uv run wechat-oracle status
 uv run wechat-oracle ingest live
@@ -160,6 +186,8 @@ Agent 状态：
 ```powershell
 uv run wechat-oracle agent show <group_id>
 uv run wechat-oracle agent show-runs <group_id> -n 10
+uv run wechat-oracle agent ask <group_id-or-name> 总结今天的群内容
+uv run wechat-oracle agent ask <group_id-or-name> 总结这个话题并更新记忆 --write
 uv run wechat-oracle agent lurk <group_id>
 uv run wechat-oracle agent wipe <group_id>
 uv run wechat-oracle agent wipe <group_id> --persona-only
@@ -181,6 +209,16 @@ uv run wechat-oracle openclaw mcp-serve
 ```
 
 `openclaw mcp-serve` 是给 OpenClaw 拉起的 stdio MCP server 入口。`openclaw ping` 用来测试已配置的 OpenClaw chat-completions gateway。
+
+便捷 wrapper：
+
+```powershell
+scripts\run.bat
+scripts\track.bat
+scripts\import.bat <export.json>
+```
+
+`scripts\run.bat` 启动 `wechat-oracle run`。`scripts\track.bat` 是更底层的 live-ingest-only wrapper，主要留给调试使用。
 
 ## 历史消息回灌
 
@@ -238,7 +276,7 @@ dispatcher 接受 `@<bot> /cmd ...`，也接受群里单独发送的 `/cmd ...`�
 
 ## Agent 行为
 
-系统有三条独立运行链路。
+系统有四条独立运行链路。
 
 ### 1. 采集链路
 
@@ -264,7 +302,28 @@ native agent 分两阶段：
 
 Phase A 初始上下文包含当前群最近 `WO_AGENT_RECENT_CONTEXT_CHAT` 条消息。工具可以搜索更早历史、展开引用链、展开合并转发、读取 OCR/ASR 文本、通过视觉模型读图、读取语音转写，或读取群记忆。
 
-### 3. 后台学习链路
+### 3. Local Ask 本地问答链路
+
+Textual UI 和 CLI 可以对某个选定群运行一次 agent turn，但不会把结果发回微信。
+
+```powershell
+uv run wechat-oracle agent ask <group_id-or-name> 总结今天的群内容
+uv run wechat-oracle agent ask <group_id-or-name> 总结 Alice 在 2024 年 8 月的发言并更新记忆 --write
+```
+
+TUI 使用快捷键：
+
+```text
+g  打开群选择框
+a  打开当前群的 Local Ask 对话框
+m  编辑当前群的 group_memory / persona_drift
+c  修改 agent 后端 / native 模型 / OpenClaw agent id，并重启 dispatcher
+w  切换只读/允许写记忆模式
+```
+
+Local Ask 默认只读：可以读取最近上下文、搜索历史、查看媒体、读取群记忆，但不会更新 `group_memory` / `persona_drift`。CLI 使用 `--write`，或 TUI 按 `w`，才会运行允许写记忆的 `local_task`。Local Ask 会写入 `agent_run_log` 审计行，`trigger_kind` 为 `local_ask` 或 `local_task`；它不会写 `command_runs`，也不会调用 wx4py。
+
+### 4. 后台学习链路
 
 `agent lurk <group_id>` 和可选 auto-lurk 会读取带水位的新增消息批次并更新记忆，但不会回复。
 
@@ -347,7 +406,7 @@ transcript 状态：
 | `group_state` | live/backfill 的群级游标。 |
 | `persona_drift` | 每群可演化的行为补充。 |
 | `group_memory` | 每群自由文本长期记忆文档。 |
-| `agent_run_log` | agent 审计轨迹。 |
+| `agent_run_log` | chat、lurk 和 Local Ask 的 agent 审计轨迹。 |
 | `agent_lurk_state` | lurk 游标，独立于审计日志。 |
 
 所有导入消息的写入路径都走 `ingest/writer.py:write_messages()`，并依赖 `UNIQUE(dedupe_key)` 做跨源去重。
@@ -392,13 +451,13 @@ transcript 状态：
 | `WO_VISION_MAX_TOKENS` | `800` | Vision 输出上限。 |
 | `WO_AGENT_BASE_PROBABILITY` | `0.25` | 概率触发阈值；设为 `0` 表示只响应显式触发。 |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | 每群 probability cooldown。 |
-| `WO_AGENT_MAX_STEPS` | `5` | Native Phase A 最大轮数。 |
+| `WO_AGENT_MAX_STEPS` | `8` | Native Phase A 最大轮数。 |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B 最大轮数。 |
 | `WO_AGENT_REFLECTION_ENABLED` | `True` | 启用 chat Phase B 记忆反思。 |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | Persona YAML 目录。 |
 | `WO_AGENT_RECENT_CONTEXT_CHAT` | `100` | agent chat 初始最近消息窗口。 |
 | `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | `group_memory` 硬字符上限。 |
-| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `12` | Native Phase A tool 总预算。 |
+| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `20` | Native Phase A tool 总预算。 |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Native Phase A 单 step tool 预算。 |
 | `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Native 读图预算。 |
 | `WO_AGENT_MAX_VOICE_READS_PER_RUN` | `2` | Native 读语音预算。 |

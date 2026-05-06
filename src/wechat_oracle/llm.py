@@ -20,6 +20,9 @@ ToolError when unconfigured) and may use a different provider entirely
 from __future__ import annotations
 
 import base64
+import html
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -164,6 +167,8 @@ class OpenAICompatLLM:
             )
             for tc in tcs_raw
         ]
+        if not tool_calls:
+            tool_calls = _parse_dsml_tool_calls(msg.content or "")
         return ToolingResponse(
             content=msg.content,
             tool_calls=tool_calls,
@@ -390,6 +395,71 @@ class ToolingResponse:
     content: str | None
     tool_calls: list[ToolCall]
     assistant_message: dict[str, Any]
+
+
+_DSML_TOOL_BLOCK_RE = re.compile(
+    r"<\s*[^<>\s]*DSML[^<>\s]*tool_calls\s*>(?P<body>.*?)"
+    r"</\s*[^<>\s]*DSML[^<>\s]*tool_calls\s*>",
+    re.S,
+)
+_DSML_INVOKE_RE = re.compile(
+    r"<\s*[^<>\s]*DSML[^<>\s]*invoke\s+[^>]*name=\"(?P<name>[^\"]+)\"[^>]*>"
+    r"(?P<body>.*?)</\s*[^<>\s]*DSML[^<>\s]*invoke\s*>",
+    re.S,
+)
+_DSML_PARAM_RE = re.compile(
+    r"<\s*[^<>\s]*DSML[^<>\s]*parameter\s+[^>]*name=\"(?P<name>[^\"]+)\""
+    r"(?P<attrs>[^>]*)>(?P<value>.*?)</\s*[^<>\s]*DSML[^<>\s]*parameter\s*>",
+    re.S,
+)
+
+
+def _parse_dsml_value(raw: str, attrs: str) -> Any:
+    value = html.unescape(raw.strip())
+    is_string = 'string="true"' in attrs
+    if is_string:
+        return value
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _parse_dsml_tool_calls(content: str) -> list["ToolCall"]:
+    """Parse DeepSeek DSML textual tool calls emitted as assistant content.
+
+    Some OpenAI-compatible DeepSeek endpoints leak tool calls as DSML markup
+    instead of the standard `message.tool_calls` field. Treating that markup
+    as final chat text sends garbage to WeChat, so normalize it at the LLM
+    boundary.
+    """
+    if "DSML" not in content or "tool_calls" not in content:
+        return []
+    calls: list[ToolCall] = []
+    block_match = _DSML_TOOL_BLOCK_RE.search(content)
+    body = block_match.group("body") if block_match else content
+    for idx, invoke in enumerate(_DSML_INVOKE_RE.finditer(body)):
+        name = html.unescape(invoke.group("name").strip())
+        args: dict[str, Any] = {}
+        for param in _DSML_PARAM_RE.finditer(invoke.group("body")):
+            param_name = html.unescape(param.group("name").strip())
+            args[param_name] = _parse_dsml_value(param.group("value"), param.group("attrs"))
+        calls.append(
+            ToolCall(
+                id=f"dsml_call_{idx}",
+                name=name,
+                arguments_json=json.dumps(args, ensure_ascii=False),
+            )
+        )
+    return calls
 
 
 class ToolingLLM(Protocol):

@@ -112,13 +112,13 @@ class Settings(BaseSettings):
     # probability wakeups.
     agent_base_probability: float = 0.25      # 0 = mention-only; small >0 lets bot self-initiate
     agent_cooldown_seconds: int = 30           # min seconds between bot's own utterances per group
-    agent_max_steps: int = 5                   # Phase A read-only loop cap
+    agent_max_steps: int = 8                   # Phase A read-only loop cap
     agent_reflect_max_steps: int = 3           # Phase B write-only loop cap
     agent_reflection_enabled: bool = True      # off → skip Phase B entirely
     agent_personas_dir: Path = Field(default=Path("data/personas"))
     agent_recent_context_chat: int = 100       # initial recent-msg window for Phase A system prompt
     agent_memory_max_chars: int = 100_000      # group_memory hard cap; agent must compact when full
-    agent_max_tool_calls_per_run: int = 12      # Phase A total tool-call budget
+    agent_max_tool_calls_per_run: int = 20      # Phase A total tool-call budget
     agent_max_tool_calls_per_step: int = 4      # Phase A per-LLM-turn tool-call budget
     agent_max_image_reads_per_run: int = 2      # expensive read_image budget
     agent_max_voice_reads_per_run: int = 2      # expensive read_voice budget
@@ -185,3 +185,16 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def reload_settings() -> Settings:
+    """Reload `.env` / WO_* values into the shared settings object.
+
+    Many modules import the `settings` object directly, so replacing the global
+    would leave those references stale. Mutating the existing object keeps
+    long-running supervisor features, such as the TUI config editor, coherent.
+    """
+    fresh = Settings()
+    for name in Settings.model_fields:
+        setattr(settings, name, getattr(fresh, name))
+    return settings

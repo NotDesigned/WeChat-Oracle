@@ -28,8 +28,12 @@ class NativeBackend:
         ctx: "CommandContext",
         user_question: str,
         trigger_kind: str,
+        reflection_enabled: bool | None = None,
     ) -> tuple[str | None, str]:
         from ..orchestrator import chat_via_agent
         return chat_via_agent(
-            ctx=ctx, user_question=user_question, trigger_kind=trigger_kind,
+            ctx=ctx,
+            user_question=user_question,
+            trigger_kind=trigger_kind,
+            reflection_enabled=reflection_enabled,
         )

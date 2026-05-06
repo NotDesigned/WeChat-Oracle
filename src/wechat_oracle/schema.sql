@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS group_memory (
 -- Trace columns are JSON arrays of step dicts:
 -- `[{step:int, kind:'tool_call'|'final', tool?, args?, result?, content?}, ...]`.
 -- `reply_text` is NULL when the agent chose stay_silent. `trigger_kind` is one
--- of 'mention' / 'reply' / 'probability' / 'lurk'.
+-- of 'mention' / 'reply' / 'probability' / 'lurk' / 'local_ask' / 'local_task'.
 CREATE TABLE IF NOT EXISTS agent_run_log (
     run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id        TEXT NOT NULL,

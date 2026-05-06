@@ -203,6 +203,14 @@ def _execute_tool_calls(
     return tool_messages
 
 
+def _looks_like_tool_markup(content: str | None) -> bool:
+    return bool(content and "DSML" in content and "tool_calls" in content)
+
+
+_TOOL_STEPS_EXHAUSTED_REPLY = "我还需要继续查上下文，但这轮工具调用步数已经用完了。你可以让我继续查一次。"
+_PHASE_A_EXHAUSTED_KINDS = {"tool_call_ignored_final", "tool_markup_blocked_final"}
+
+
 def run_phase_a(
     *,
     llm: ToolingLLM,
@@ -289,8 +297,24 @@ def run_phase_a(
                 return None, trace
             continue
 
+        if resp.tool_calls and is_last_step:
+            trace.append({
+                "step": step,
+                "kind": "tool_call_ignored_final",
+                "tools": [c.name for c in resp.tool_calls],
+                "content": resp.content,
+            })
+            return _TOOL_STEPS_EXHAUSTED_REPLY, trace
+
         # No tool calls → final text (possibly empty).
         reply = (resp.content or "").strip() or None
+        if _looks_like_tool_markup(reply):
+            trace.append({
+                "step": step,
+                "kind": "tool_markup_blocked_final",
+                "content": reply,
+            })
+            return _TOOL_STEPS_EXHAUSTED_REPLY, trace
         trace.append({"step": step, "kind": "final", "content": reply})
 
         # Empty-final retry: model output nothing, didn't call any tool, and
@@ -471,16 +495,24 @@ def run_agent(
     )
     phase_b_trace: list[dict[str, Any]] | None = None
     if reflection_enabled and write_tools is not None and phase_b_system:
-        phase_b_trace = run_phase_b(
-            llm=llm,
-            model=model,
-            system_prompt=phase_b_system,
-            phase_a_trace=phase_a_trace,
-            reply_text=reply,
-            write_tools=write_tools,
-            max_steps=reflect_max_steps,
-            max_tokens=write_max_tokens or max_tokens,
-        )
+        last_kind = phase_a_trace[-1].get("kind") if phase_a_trace else None
+        if last_kind in _PHASE_A_EXHAUSTED_KINDS:
+            phase_b_trace = [{
+                "step": 0,
+                "kind": "reflection_skipped",
+                "reason": "phase_a_exhausted_tool_budget",
+            }]
+        else:
+            phase_b_trace = run_phase_b(
+                llm=llm,
+                model=model,
+                system_prompt=phase_b_system,
+                phase_a_trace=phase_a_trace,
+                reply_text=reply,
+                write_tools=write_tools,
+                max_steps=reflect_max_steps,
+                max_tokens=write_max_tokens or max_tokens,
+            )
     return AgentRunResult(
         reply_text=reply,
         phase_a_trace=phase_a_trace,
