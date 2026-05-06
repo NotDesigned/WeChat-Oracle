@@ -207,12 +207,14 @@ def run_local_ask(
             allow_writes=allow_writes,
         )
         try:
-            reply_text, trace_block = get_agent_backend().chat(
+            outcome = get_agent_backend().chat(
                 ctx=ctx,
                 user_question=question + local_instruction,
                 trigger_kind=trigger_kind,
                 reflection_enabled=allow_writes,
             )
+            reply_text = outcome.reply_text
+            trace_block = outcome.trace_block
         except Exception as e:
             append_event(
                 "agent.local_ask.end",
