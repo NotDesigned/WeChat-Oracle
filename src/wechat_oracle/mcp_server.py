@@ -28,8 +28,9 @@ from .agent.media_paths import resolve_path
 from .agent.tools import ToolError
 from .agent.tools_read import (
     ExpandForwardBundleTool,
+    GetMessageContextTool,
     ReadVoiceTool,
-    RecallGroupHistoryTool,
+    SearchGroupMessagesTool,
     ViewQuotedChainTool,
 )
 from .agent.tools_write import (
@@ -151,30 +152,75 @@ def _audit(*audit_args_keys: str) -> Callable[[Callable[..., str]], Callable[...
 
 
 @_mcp.tool(
-    name="recall_group_history",
+    name="search_group_messages",
     description=(
-        "Search messages in a specific WeChat group by substring. Returns up "
-        "to `limit` matches in chronological order. Searches content_text "
-        "and transcript, so OCR/ASR text participates when available."
+        "Search a specific WeChat group's archive with optional substring, "
+        "absolute date range, sender filter, message types, and nearby context. "
+        "Use start_date/end_date for month/day questions such as 2024-04."
     ),
 )
-@_audit("query", "since_days", "sender_wxid", "limit")
-def recall_group_history(
+@_audit(
+    "query", "sender", "sender_wxid", "start_date", "end_date", "types",
+    "limit", "context_before", "context_after", "mode",
+)
+def search_group_messages(
     group_id: str,
-    query: str,
-    since_days: int | None = None,
+    query: str | None = None,
+    sender: str | None = None,
     sender_wxid: str | None = None,
-    limit: int = 20,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    types: list[str] | None = None,
+    limit: int = 30,
+    context_before: int = 0,
+    context_after: int = 0,
+    mode: str = "compact",
 ) -> str:
-    """Search this group's message history."""
-    args: dict[str, Any] = {"query": query, "limit": limit}
-    if since_days is not None:
-        args["since_days"] = since_days
+    """Search this group's message history with structured filters."""
+    args: dict[str, Any] = {
+        "query": query or "",
+        "limit": limit,
+        "context_before": context_before,
+        "context_after": context_after,
+        "mode": mode,
+    }
+    if sender:
+        args["sender"] = sender
     if sender_wxid:
         args["sender_wxid"] = sender_wxid
+    if start_date:
+        args["start_date"] = start_date
+    if end_date:
+        args["end_date"] = end_date
+    if types:
+        args["types"] = types
     with _open_conn() as conn:
-        tool = RecallGroupHistoryTool(conn=conn, group_id=group_id)
+        tool = SearchGroupMessagesTool(conn=conn, group_id=group_id)
         return _tool_result(tool, args)
+
+
+@_mcp.tool(
+    name="get_message_context",
+    description=(
+        "Read nearby messages around one msg_id in chronological order. Use "
+        "after search_group_messages finds a key message."
+    ),
+)
+@_audit("msg_id", "before", "after", "mode")
+def get_message_context(
+    group_id: str,
+    msg_id: int,
+    before: int = 10,
+    after: int = 10,
+    mode: str = "compact",
+) -> str:
+    """Return nearby messages around one direct message row."""
+    with _open_conn() as conn:
+        tool = GetMessageContextTool(conn=conn, group_id=group_id)
+        return _tool_result(
+            tool,
+            {"msg_id": msg_id, "before": before, "after": after, "mode": mode},
+        )
 
 
 @_mcp.tool(
@@ -195,14 +241,14 @@ def read_group_memory(group_id: str) -> str:
 
 
 @_mcp.tool(
-    name="view_quoted",
+    name="view_quoted_chain",
     description=(
         "Walk the quote-reply chain backwards from a message in the given "
         "group. Use when quoted context matters."
     ),
 )
 @_audit("msg_id")
-def view_quoted(group_id: str, msg_id: int) -> str:
+def view_quoted_chain(group_id: str, msg_id: int) -> str:
     """Return a message plus up to 4 quoted ancestors."""
     with _open_conn() as conn:
         tool = ViewQuotedChainTool(conn=conn, group_id=group_id)
@@ -210,14 +256,14 @@ def view_quoted(group_id: str, msg_id: int) -> str:
 
 
 @_mcp.tool(
-    name="expand_forward",
+    name="expand_forward_bundle",
     description=(
         "Expand a merged-forward wrapper message in the given group into its "
         "child records with original sender and timestamp."
     ),
 )
 @_audit("msg_id")
-def expand_forward(group_id: str, msg_id: int) -> str:
+def expand_forward_bundle(group_id: str, msg_id: int) -> str:
     """List children of a type='forward' wrapper message."""
     with _open_conn() as conn:
         tool = ExpandForwardBundleTool(conn=conn, group_id=group_id)
@@ -387,6 +433,12 @@ def run_mcp_server() -> None:
     import os
     import sys
     from pathlib import Path
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
     db_abs = settings.db_path if settings.db_path.is_absolute() else Path.cwd() / settings.db_path
     sys.stderr.write(
         f"[wechat-oracle mcp-serve] cwd={os.getcwd()!r} "

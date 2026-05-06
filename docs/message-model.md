@@ -189,7 +189,8 @@ The agent can extend its view with tools:
 
 | Tool | Purpose |
 |---|---|
-| `recall_group_history` | Search older messages in this group. Searches `messages.content_text`, `messages.transcript`, and flattened `forwarded_records.content`. |
+| `search_group_messages` | Search older messages in this group with optional substring, absolute date range, sender filter, type filter, and nearby context. Searches `messages.content_text`, `messages.transcript`, `messages.quote_text`, and flattened `forwarded_records.content`. |
+| `get_message_context` | Read nearby messages before/after a specific `messages.msg_id`. |
 | `view_quoted_chain` | Walk quote-reply parents up to a small depth. |
 | `expand_forward_bundle` | Show children of a merged-forward wrapper. |
 | `read_image` | Send one image file to the configured vision model. |

@@ -189,7 +189,8 @@ agent 可以用工具扩展视野：
 
 | 工具 | 用途 |
 |---|---|
-| `recall_group_history` | 搜索本群更早消息。字面搜索 `messages.content_text`、`messages.transcript` 和展开后的 `forwarded_records.content`。 |
+| `search_group_messages` | 搜索本群更早消息，支持字面 query、绝对日期范围、sender、类型过滤和前后文。会搜索 `messages.content_text`、`messages.transcript`、`messages.quote_text` 和展开后的 `forwarded_records.content`。 |
+| `get_message_context` | 读取某个 `messages.msg_id` 前后的消息。 |
 | `view_quoted_chain` | 沿引用回复链上溯。 |
 | `expand_forward_bundle` | 展开一个合并转发 wrapper。 |
 | `read_image` | 把一张图片发送给已配置的视觉模型读取。 |

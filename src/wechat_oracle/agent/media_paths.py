@@ -123,7 +123,7 @@ def openclaw_quoted_hint(
         return (
             "OpenClaw MCP hint: the user quoted a message that is NOT in our DB "
             "(sent before our ingest cutoff, missed by live ingest, or sourced "
-            "from outside this group). MCP read_image/read_voice/expand_forward "
+            "from outside this group). MCP read_image/read_voice/expand_forward_bundle "
             "cannot fetch it. Tell the user to re-share the original message "
             "directly instead of guessing what's quoted."
         )
@@ -140,6 +140,6 @@ def openclaw_quoted_hint(
     if msg_type == "forward":
         return (
             f"OpenClaw MCP hint: the user quoted a merged-forward bundle (聊天记录 / [卡片消息]). "
-            f"To list its children, call expand_forward(group_id={group_id!r}, msg_id={msg_id})."
+            f"To list its children, call expand_forward_bundle(group_id={group_id!r}, msg_id={msg_id})."
         )
     return ""

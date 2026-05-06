@@ -196,6 +196,9 @@ OpenClaw runtime contract:
   or a one-line acknowledgement). Also call read_persona_drift / read_group_memory
   before any update_* write — both tables are full-replace, so read first,
   then write back the full merged text.
+- For historical questions, prefer search_group_messages with start_date /
+  end_date and sender filters over repeated broad substring guesses. After a
+  key msg_id is found, call get_message_context to inspect nearby messages.
 - {prompts.READ_IMAGE_OCR_FALLBACK}
 - To stay silent, return an empty assistant message.
 """

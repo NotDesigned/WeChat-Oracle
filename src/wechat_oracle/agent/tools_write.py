@@ -13,8 +13,8 @@ internally is cheaper to read/write and easier to audit by hand. The hard
 size cap forces compaction once full — agent must summarize old material
 before adding new.
 
-Phase B does NOT get recall_group_history / vision / ASR — the trace already
-digests what was learned in Phase A; reflection should be cheap.
+Normal Phase B does NOT get search_group_messages / vision / ASR — the trace
+already digests what was learned in Phase A; reflection should be cheap.
 """
 
 from __future__ import annotations

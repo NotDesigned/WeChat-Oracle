@@ -300,7 +300,7 @@ PHASE_B_USER = (
 LURK_SYSTEM_ADDENDUM = (
     "\n\n当前是 lurk 后台学习，不是群聊回复。你永远不会发消息到群里。"
     "输入是一批新观察到的群消息；如果这些消息暗示了旧上下文，"
-    "可以调用 recall_group_history / view_quoted_chain / expand_forward_bundle 查看老消息。"
+    "可以调用 search_group_messages / get_message_context / view_quoted_chain / expand_forward_bundle 查看老消息。"
     "只把稳定、可复用、以后回答会用到的信息写入 group_memory；"
     "只把长期说话风格调整写入 persona_drift。普通闲聊、一次性情绪、无关噪声不要写。"
 )
@@ -328,7 +328,7 @@ LURK_OBSERVATION_AUDIT_RESULT = "[lurk] compact audit only; full prompt is in ll
 # Placeholder: {max_steps}
 LURK_BUDGET_HINT = (
     "\n\n[runtime] 你最多有 {max_steps} 个 tool-calling 回合。"
-    "可以用历史检索工具补上下文，也可以直接读/写记忆。"
+    "可以用 search_group_messages 和 get_message_context 补上下文，也可以直接读/写记忆。"
     "如果没有值得写入的长期信息，直接输出空文本结束。"
 )
 

@@ -451,7 +451,7 @@ def weflow_sessions(
 @openclaw_app.command("mcp-test")
 def openclaw_mcp_test() -> None:
     """End-to-end smoke test: spawn `mcp-serve` as a subprocess, do the MCP
-    initialize handshake over stdio, list tools, then call recall_group_history
+    initialize handshake over stdio, list tools, then call search_group_messages
     on the busiest group. This is what OpenClaw will do under the hood - if
     THIS works and OpenClaw still doesn't see the tools, the bug is on
     OpenClaw's side (registration/profile/restart), not ours.
@@ -459,8 +459,14 @@ def openclaw_mcp_test() -> None:
     import asyncio
     import json as _json
     import os
+    import sys
     from mcp import ClientSession  # type: ignore[import-untyped]
     from mcp.client.stdio import StdioServerParameters, stdio_client  # type: ignore[import-untyped]
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
 
     # Resolve a real group_id BEFORE we start the async session, so database
     # access errors surface with a normal traceback instead of getting buried
@@ -514,11 +520,11 @@ def openclaw_mcp_test() -> None:
                     typer.echo(f"        outputSchema: {out_str[:300]}")
 
                 if test_gid is None:
-                    typer.echo("[3/4] skip recall_group_history call - no groups in DB")
+                    typer.echo("[3/4] skip search_group_messages call - no groups in DB")
                 else:
-                    typer.echo(f"[3/4] recall_group_history(group_id={test_gid!r}, query='', limit=2) ...")
+                    typer.echo(f"[3/4] search_group_messages(group_id={test_gid!r}, query='', limit=2) ...")
                     result = await session.call_tool(
-                        "recall_group_history",
+                        "search_group_messages",
                         {"group_id": test_gid, "query": "", "limit": 2},
                     )
                     for c in result.content:
@@ -578,7 +584,7 @@ def openclaw_mcp_serve() -> None:
       openclaw mcp set wechat-oracle \\
         --command "uv" --args "run wechat-oracle openclaw mcp-serve"
 
-    Exposes the full OpenClaw tool surface: history recall, quote/forward
+    Exposes the full OpenClaw tool surface: history search, quote/forward
     expansion, media reads, and memory/persona read-write tools.
     """
     from .mcp_server import run_mcp_server

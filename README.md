@@ -210,7 +210,7 @@ For WeFlow exports, the importer:
 
 If a media file referenced by the export is missing, the message is still imported with a missing-media placeholder. OCR/ASR can only run for media files that exist under `data/media`.
 
-Backfilled rows use `source='backfill'`. The dispatcher only wakes on new `source='live'` rows, so importing old messages will not make the bot reply to historical mentions. Backfilled messages are still available to `/find`, `/sum`, `/recent`, agent history recall, and manual or automatic `lurk` learning.
+Backfilled rows use `source='backfill'`. The dispatcher only wakes on new `source='live'` rows, so importing old messages will not make the bot reply to historical mentions. Backfilled messages are still available to `/find`, `/sum`, `/recent`, agent history search, and manual or automatic `lurk` learning.
 
 ## In-Group Commands
 

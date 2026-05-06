@@ -52,7 +52,8 @@ from .runtime import ToolBudget, run_agent, run_lurk_reflection
 from .tools import GroupScopedTools
 from .tools_read import (
     ExpandForwardBundleTool,
-    RecallGroupHistoryTool,
+    GetMessageContextTool,
+    SearchGroupMessagesTool,
     ViewQuotedChainTool,
     register_phase_a_tools,
 )
@@ -226,7 +227,7 @@ def _fetch_lurk_window(
 
     First run has no cursor, so it bootstraps from the latest `limit` rows.
     Later runs only process rows whose autoincrement msg_id is newer than the
-    stored cursor. The agent can still use recall_group_history to inspect
+    stored cursor. The agent can still use search_group_messages to inspect
     older material when the new batch points to it.
     """
     if after_msg_id is None:
@@ -595,7 +596,8 @@ def chat_via_lurk(
     lurk_tools = GroupScopedTools(
         conn=conn, group_id=group_id, group_name=group_name, bot_name=bot_name,
     )
-    lurk_tools.register(RecallGroupHistoryTool(conn=conn, group_id=group_id))
+    lurk_tools.register(SearchGroupMessagesTool(conn=conn, group_id=group_id))
+    lurk_tools.register(GetMessageContextTool(conn=conn, group_id=group_id))
     lurk_tools.register(ViewQuotedChainTool(conn=conn, group_id=group_id))
     lurk_tools.register(ExpandForwardBundleTool(conn=conn, group_id=group_id))
     register_phase_b_tools(lurk_tools)
