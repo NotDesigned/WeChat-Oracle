@@ -201,6 +201,9 @@ class MemoryEditorScreen(ModalScreen[MemoryEditResult | None]):
 
     def action_save(self) -> None:
         self._store_current_text()
+        if self._continuation_ttl_seconds < self._continuation_delay_seconds:
+            self.query_one("#config-editor-help", Static).update("Continuation TTL must be >= delay")
+            return
         self.dismiss(
             MemoryEditResult(
                 group_memory=self._texts["group_memory"],
@@ -554,6 +557,10 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             if config.reply_mention_policy in {"always", "explicit", "never"}
             else "explicit"
         )
+        self._continuation_enabled = bool(config.continuation_enabled)
+        self._continuation_max_followups = int(config.continuation_max_followups)
+        self._continuation_delay_seconds = int(config.continuation_delay_seconds)
+        self._continuation_ttl_seconds = int(config.continuation_ttl_seconds)
         self._llm_model = config.llm_model
         self._openclaw_agent_id = config.openclaw_agent_id
 
@@ -575,6 +582,10 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             yield Button("", id="config-menu-proactive-mode", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-probability", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-mention-policy", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-continuation-enabled", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-continuation-max", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-continuation-delay", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-continuation-ttl", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-native-model", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-openclaw-agent", classes="config-menu-item", compact=True)
             yield Button(
@@ -628,6 +639,34 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                     ConfigMentionPolicyScreen(self._reply_mention_policy),
                     self._on_mention_policy_changed,
                 )
+            case "config-menu-continuation-enabled":
+                self._continuation_enabled = not self._continuation_enabled
+                self._refresh_menu()
+                self._mark_dirty()
+            case "config-menu-continuation-max":
+                self.app.push_screen(
+                    ConfigValueScreen(
+                        title="Continuation max follow-ups",
+                        value=str(self._continuation_max_followups),
+                    ),
+                    self._on_continuation_max_changed,
+                )
+            case "config-menu-continuation-delay":
+                self.app.push_screen(
+                    ConfigValueScreen(
+                        title="Continuation delay seconds",
+                        value=str(self._continuation_delay_seconds),
+                    ),
+                    self._on_continuation_delay_changed,
+                )
+            case "config-menu-continuation-ttl":
+                self.app.push_screen(
+                    ConfigValueScreen(
+                        title="Continuation TTL seconds",
+                        value=str(self._continuation_ttl_seconds),
+                    ),
+                    self._on_continuation_ttl_changed,
+                )
             case "config-menu-native-model":
                 self.app.push_screen(
                     ConfigValueScreen(title="Native 模型", value=self._llm_model),
@@ -666,6 +705,10 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                 openclaw_agent_id=openclaw_agent,
                 agent_base_probability=self._agent_base_probability,
                 reply_mention_policy=self._reply_mention_policy,
+                continuation_enabled=self._continuation_enabled,
+                continuation_max_followups=self._continuation_max_followups,
+                continuation_delay_seconds=self._continuation_delay_seconds,
+                continuation_ttl_seconds=self._continuation_ttl_seconds,
                 native_configured=self._config.native_configured,
                 openclaw_token_configured=self._config.openclaw_token_configured,
                 openclaw_configured=self._config.openclaw_configured,
@@ -706,6 +749,35 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self._refresh_menu()
             self._mark_dirty()
 
+    def _on_continuation_max_changed(self, value: str | None) -> None:
+        parsed = _parse_int(value, minimum=0)
+        if parsed is None:
+            self.query_one("#config-editor-help", Static).update("Continuation max follow-ups must be >= 0")
+            return
+        self._continuation_max_followups = parsed
+        self._refresh_menu()
+        self._mark_dirty()
+
+    def _on_continuation_delay_changed(self, value: str | None) -> None:
+        parsed = _parse_int(value, minimum=5)
+        if parsed is None:
+            self.query_one("#config-editor-help", Static).update("Continuation delay must be >= 5 seconds")
+            return
+        self._continuation_delay_seconds = parsed
+        if self._continuation_ttl_seconds < parsed:
+            self._continuation_ttl_seconds = parsed
+        self._refresh_menu()
+        self._mark_dirty()
+
+    def _on_continuation_ttl_changed(self, value: str | None) -> None:
+        parsed = _parse_int(value, minimum=self._continuation_delay_seconds)
+        if parsed is None:
+            self.query_one("#config-editor-help", Static).update("Continuation TTL must be >= delay")
+            return
+        self._continuation_ttl_seconds = parsed
+        self._refresh_menu()
+        self._mark_dirty()
+
     def _on_llm_model_changed(self, value: str | None) -> None:
         if value is not None:
             self._llm_model = value
@@ -731,6 +803,18 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self.query_one("#config-menu-mention-policy", Button).label = (
             f"@ 策略　{_mention_policy_label(self._reply_mention_policy)}"
         )
+        self.query_one("#config-menu-continuation-enabled", Button).label = (
+            f"Continuation：{'on' if self._continuation_enabled else 'off'}"
+        )
+        self.query_one("#config-menu-continuation-max", Button).label = (
+            f"Follow-ups：{self._continuation_max_followups}"
+        )
+        self.query_one("#config-menu-continuation-delay", Button).label = (
+            f"Follow-up delay：{self._continuation_delay_seconds}s"
+        )
+        self.query_one("#config-menu-continuation-ttl", Button).label = (
+            f"Follow-up TTL：{self._continuation_ttl_seconds}s"
+        )
         self.query_one("#config-menu-native-model", Button).label = (
             f"Native 模型　{_clip(self._llm_model, 52)}"
         )
@@ -749,6 +833,10 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self.query_one("#config-menu-proactive-mode", Button),
             self.query_one("#config-menu-probability", Button),
             self.query_one("#config-menu-mention-policy", Button),
+            self.query_one("#config-menu-continuation-enabled", Button),
+            self.query_one("#config-menu-continuation-max", Button),
+            self.query_one("#config-menu-continuation-delay", Button),
+            self.query_one("#config-menu-continuation-ttl", Button),
             self.query_one("#config-menu-native-model", Button),
             self.query_one("#config-menu-openclaw-agent", Button),
             self.query_one("#config-menu-save", Button),
@@ -1334,6 +1422,7 @@ def status_lines_for_processes(
         agent_config.agent_base_probability, agent_config.proactive_mode
     )
     mention_label = _mention_status_label(agent_config.reply_mention_policy)
+    continuation_label = _continuation_status_label(agent_config)
     return [
         f"[bold #5ccfe6]WeChat Oracle[/] [#245b73]//[/] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         _status_row(
@@ -1344,7 +1433,7 @@ def status_lines_for_processes(
         ),
         _status_row(
             "AMBIENT",
-            f"stance {stance_label} {_SEP} wake {wake_label} {_SEP} lurk {lurk_label}",
+            f"stance {stance_label} {_SEP} wake {wake_label} {_SEP} cont {continuation_label} {_SEP} lurk {lurk_label}",
         ),
         _status_row(
             "WATCH",
@@ -1476,6 +1565,18 @@ def _parse_probability(value: str) -> float | None:
     return probability
 
 
+def _parse_int(value: str | None, *, minimum: int) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return None
+    if parsed < minimum:
+        return None
+    return parsed
+
+
 def _format_probability(value: object) -> str:
     return f"{_normalize_probability(value):g}"
 
@@ -1563,6 +1664,15 @@ def _mention_status_label(policy: str) -> str:
             return _tag("never", _MUTED_STYLE)
         case _:
             return _tag("explicit", _OK_STYLE)
+
+
+def _continuation_status_label(config: AgentRuntimeConfig) -> str:
+    if not config.continuation_enabled:
+        return _tag("off", _MUTED_STYLE)
+    return _tag(
+        f"on {config.continuation_max_followups}x/{config.continuation_delay_seconds}s",
+        _OK_STYLE,
+    )
 
 
 def _wake_status_label(probability: object, proactive_mode: str) -> str:

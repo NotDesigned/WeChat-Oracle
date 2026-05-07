@@ -1392,6 +1392,7 @@ def status() -> None:
 
 
 def main() -> None:
+    _configure_stdio_utf8()
     app()
 
 

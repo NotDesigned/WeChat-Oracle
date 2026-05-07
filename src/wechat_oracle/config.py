@@ -124,6 +124,14 @@ class Settings(BaseSettings):
     agent_max_image_reads_per_run: int = 2      # expensive read_image budget
     agent_max_voice_reads_per_run: int = 2      # expensive read_voice budget
 
+    # Continuation: agent may explicitly schedule a delayed follow-up instead
+    # of trying to cram a multi-step discussion into one message. The scheduled
+    # job stores only intent; dispatcher reruns the agent at send time.
+    agent_continuation_enabled: bool = True
+    agent_continuation_max_followups: int = 2    # source reply + 2 followups = up to 3 utterances
+    agent_continuation_delay_seconds: int = 90
+    agent_continuation_ttl_seconds: int = 600
+
     # Lurk: bot silently reads a watermarked batch of new messages, may use
     # history tools for older context, and decides whether to update
     # group_memory / persona_drift. It never sends a reply.
@@ -194,6 +202,27 @@ class Settings(BaseSettings):
         if policy not in {"always", "explicit", "never"}:
             raise ValueError("WO_REPLY_MENTION_POLICY must be one of: always, explicit, never")
         return policy
+
+    @field_validator("agent_continuation_max_followups")
+    @classmethod
+    def _validate_agent_continuation_max_followups(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("WO_AGENT_CONTINUATION_MAX_FOLLOWUPS must be >= 0")
+        return v
+
+    @field_validator("agent_continuation_delay_seconds")
+    @classmethod
+    def _validate_agent_continuation_delay_seconds(cls, v: int) -> int:
+        if v < 5:
+            raise ValueError("WO_AGENT_CONTINUATION_DELAY_SECONDS must be >= 5")
+        return v
+
+    @field_validator("agent_continuation_ttl_seconds")
+    @classmethod
+    def _validate_agent_continuation_ttl_seconds(cls, v: int) -> int:
+        if v < 5:
+            raise ValueError("WO_AGENT_CONTINUATION_TTL_SECONDS must be >= 5")
+        return v
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

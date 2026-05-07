@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from .. import prompts
+from .backend import AgentChatOutcome
+from .continuation import new_continuation_token
 from ..config import settings
 from ..db import transaction
 from ..llm import LLMClient, OpenClawChatCompletions
@@ -50,6 +52,7 @@ from .memory import insert_run_log, link_last_run_id
 from .persona import assemble_system_prompts
 from .runtime import ToolBudget, run_agent, run_lurk_reflection
 from .tools import GroupScopedTools
+from .tools_control import register_phase_a_control_tools
 from .tools_read import (
     ExpandForwardBundleTool,
     GetMessageContextTool,
@@ -322,7 +325,7 @@ def chat_via_agent(
     user_question: str,
     trigger_kind: str = "mention",
     reflection_enabled: bool | None = None,
-) -> tuple[str | None, str]:
+) -> AgentChatOutcome:
     """Run the multi-turn agent loop for an @<bot> chat trigger.
 
     Returns `(reply_text, trace_block)` where:
@@ -334,6 +337,7 @@ def chat_via_agent(
     Always writes one row to `agent_run_log` regardless of outcome (audit).
     """
     started_at = time.time()
+    continuation_token = ctx.continuation_token or new_continuation_token()
     recent_rows = _fetch_recent_for_agent(
         ctx.conn, ctx.group_id, settings.agent_recent_context_chat
     )
@@ -378,6 +382,16 @@ def chat_via_agent(
         vision_model=ctx.vision_model,
         vision_max_tokens=ctx.vision_max_tokens,
     )
+    if trigger_kind in {"mention", "reply", "probability", "proactive_followup"}:
+        register_phase_a_control_tools(
+            read_tools,
+            continuation_token=continuation_token,
+            source_trigger_msg_id=ctx.trigger_msg_id,
+            source_trigger_kind=trigger_kind,
+            source_job_id=ctx.continuation_job_id,
+            current_sequence=ctx.continuation_sequence,
+            inherited_max_sequence=ctx.continuation_max_sequence,
+        )
 
     # Persona: yaml core + persona_drift table → both system prompts. Yaml
     # missing → built-in defaults; see agent/persona.py.
@@ -427,6 +441,7 @@ def chat_via_agent(
     )
     finished_at = time.time()
 
+    run_id: int | None = None
     try:
         with transaction(ctx.conn):
             run_id = insert_run_log(
@@ -491,7 +506,12 @@ def chat_via_agent(
         len(result.reply_text or ""),
     )
     trace_block = _format_trace_for_log(result.phase_a_trace, result.phase_b_trace)
-    return result.reply_text, trace_block
+    return AgentChatOutcome(
+        reply_text=result.reply_text,
+        trace_block=trace_block,
+        run_id=run_id,
+        continuation_token=continuation_token,
+    )
 
 
 # --- lurk path ------------------------------------------------------------

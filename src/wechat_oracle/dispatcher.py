@@ -51,7 +51,17 @@ from typing import Callable, ClassVar
 from loguru import logger
 
 from . import prompts
-from .agent.backend import get_agent_backend
+from .agent.backend import AgentChatOutcome, get_agent_backend
+from .agent.continuation import (
+    arm_planned_followups,
+    cancel_active_followups_for_group,
+    cancel_planned_followups,
+    claim_followup,
+    complete_followup,
+    due_followups,
+    has_active_followups_for_group,
+    latest_non_bot_message_after,
+)
 from .agent.orchestrator import chat_via_lurk, lurk_due_groups
 from .config import settings
 from .db import get_conn, init_db, transaction
@@ -98,6 +108,7 @@ class ExecResult:
     stdout: str
     chat: str
     summary: str  # short status saved to command_runs.result
+    agent_outcome: AgentChatOutcome | None = None
 
 
 @dataclass
@@ -143,6 +154,13 @@ class CommandContext:
     # auto-discovery hasn't found a value yet — markers degrade to
     # showing the bot's wxid as just another sender.
     bot_wxid: str | None = None
+    # Continuation state. Normal chat runs start at sequence 0; delayed
+    # follow-up runs inherit the job id and sequence so schedule_followup can
+    # enforce the configured thread cap.
+    continuation_token: str | None = None
+    continuation_job_id: int | None = None
+    continuation_sequence: int = 0
+    continuation_max_sequence: int | None = None
 
 
 @dataclass
@@ -407,9 +425,11 @@ class ChatCommand(Command):
             trigger_kind="mention",
         )
         try:
-            reply, trace_block = get_agent_backend().chat(
+            outcome = get_agent_backend().chat(
                 ctx=ctx, user_question=self.message, trigger_kind="mention",
             )
+            reply = outcome.reply_text
+            trace_block = outcome.trace_block
         except Exception as e:
             append_event(
                 "agent.end",
@@ -446,6 +466,7 @@ class ChatCommand(Command):
                 stdout="\n".join(stdout_parts),
                 chat="",
                 summary="agent: silent",
+                agent_outcome=outcome,
             )
         if not reply.strip():
             reply = "（agent 没返回内容，再问一次试试）"
@@ -460,6 +481,7 @@ class ChatCommand(Command):
             stdout="\n".join(stdout_parts),
             chat=reply,
             summary=f"agent ({len(reply)} chars)",
+            agent_outcome=outcome,
         )
 
 
@@ -1465,6 +1487,10 @@ def _classify_trigger(
         return TriggerDecision(
             None, "probability_disabled", probability=p, proactive_mode=proactive_mode
         )
+    if has_active_followups_for_group(conn, row["group_id"]):
+        return TriggerDecision(
+            None, "continuation_pending", probability=p, proactive_mode=proactive_mode
+        )
     # Type gate: an empty random wake-up burns the entire system prompt + recent
     # window for one decision, so only let substantive types in. text/quote
     # carry the user's actual words; image/voice qualify only once OCR/ASR has
@@ -1601,13 +1627,52 @@ def _send_with_events(
     return True
 
 
+def _settle_continuation_after_reply(
+    conn: sqlite3.Connection,
+    *,
+    outcome: AgentChatOutcome | None,
+    source_trigger_msg_id: int | None,
+    source_trigger_kind: str,
+    group_name: str | None = None,
+    source_job_id: int | None = None,
+    sent: bool,
+    reply_had_text: bool,
+) -> None:
+    if outcome is None or not outcome.continuation_token:
+        return
+    try:
+        with transaction(conn):
+            if sent and reply_had_text:
+                arm_planned_followups(
+                    conn,
+                    continuation_token=outcome.continuation_token,
+                    source_run_id=outcome.run_id,
+                    source_trigger_msg_id=source_trigger_msg_id,
+                    source_trigger_kind=source_trigger_kind,
+                    group_name=group_name,
+                    source_job_id=source_job_id,
+                )
+            else:
+                reason = (
+                    "source reply was not sent"
+                    if reply_had_text else "source agent stayed silent"
+                )
+                cancel_planned_followups(
+                    conn,
+                    continuation_token=outcome.continuation_token,
+                    reason=reason,
+                )
+    except Exception:
+        logger.exception("failed to settle continuation token={}", outcome.continuation_token)
+
+
 def _should_mention_reply(reply_kind: str) -> bool:
     policy = settings.reply_mention_policy
     if policy == "always":
         return True
     if policy == "never":
         return False
-    return reply_kind != "agent:probability"
+    return reply_kind not in {"agent:probability", "agent:proactive_followup"}
 
 
 def _mention_terminal_suffix(mention: bool) -> str:
@@ -1987,6 +2052,13 @@ def _process(
                 proactive_mode=decision.proactive_mode,
             )
             _print_trigger_terminal(row, trigger=kind, reason=decision.reason)
+            if kind in {"mention", "reply"}:
+                with transaction(conn):
+                    cancel_active_followups_for_group(
+                        conn,
+                        group_id=row["group_id"],
+                        reason=f"cancelled by explicit {kind} trigger msg_id={msg_id}",
+                    )
         if kind is None:
             _finalize(conn, msg_id, "ok", "(no-trigger)")
             return
@@ -2125,7 +2197,9 @@ def _run_command(
         )
         if result.chat.strip():
             _terminal_print(f"  reply: {_clip_one_line(result.chat, 180)}")
-    if result.chat.strip():
+    sent = False
+    reply_had_text = bool(result.chat.strip())
+    if reply_had_text:
         sent = _send_with_events(
             replier,
             row,
@@ -2136,6 +2210,16 @@ def _run_command(
         )
         if sent:
             _mark_bot_spoke(row["group_id"], now)
+    if parsed.name == "(chat)":
+        _settle_continuation_after_reply(
+            conn,
+            outcome=result.agent_outcome,
+            source_trigger_msg_id=msg_id,
+            source_trigger_kind="mention",
+            group_name=row["group_name"],
+            sent=sent,
+            reply_had_text=reply_had_text,
+        )
     _finalize(conn, msg_id, "ok", result.summary)
     append_event(
         "command.end",
@@ -2184,9 +2268,11 @@ def _process_agent_only(
         )
 
     try:
-        reply, trace_block = get_agent_backend().chat(
+        outcome = get_agent_backend().chat(
             ctx=ctx, user_question=user_question, trigger_kind=kind,
         )
+        reply = outcome.reply_text
+        trace_block = outcome.trace_block
     except Exception as e:
         logger.exception("agent crashed on msg_id={} kind={}", msg_id, kind)
         _finalize(conn, msg_id, "error", f"agent-crash: {e}")
@@ -2216,14 +2302,25 @@ def _process_agent_only(
         ended_at=started + duration_ms / 1000,
         trace_block=trace_block,
     )
-    if reply and reply.strip():
+    sent = False
+    reply_had_text = bool(reply and reply.strip())
+    if reply_had_text:
         _terminal_print(f"  reply: {_clip_one_line(reply, 180)}")
-    if reply and reply.strip():
+    if reply_had_text:
         sent = _send_with_events(
             replier, row, requester, reply, f"agent:{kind}", terminal=True
         )
         if sent:
             _mark_bot_spoke(row["group_id"])
+    _settle_continuation_after_reply(
+        conn,
+        outcome=outcome,
+        source_trigger_msg_id=msg_id,
+        source_trigger_kind=kind,
+        group_name=row["group_name"],
+        sent=sent,
+        reply_had_text=reply_had_text,
+    )
     _finalize(conn, msg_id, "ok", summary)
     append_event(
         "agent.end",
@@ -2234,6 +2331,194 @@ def _process_agent_only(
         reply_chars=len(reply or ""),
         silent=reply is None,
     )
+
+
+def _followup_row(job: sqlite3.Row | dict[str, object]) -> dict[str, object]:
+    return {
+        "msg_id": -int(job["job_id"]),
+        "group_id": job["group_id"],
+        "group_name": job["group_name"],
+        "type": "continuation",
+        "sender_display": settings.bot_name,
+        "sender_wxid": settings.bot_wxid or "",
+        "content_text": job["intent"],
+        "t": int(time.time()),
+    }
+
+
+def _followup_user_question(job: sqlite3.Row | dict[str, object], latest_msg_id: int | None) -> str:
+    kind = str(job["kind"])
+    seq = int(job["sequence"])
+    max_seq = int(job["max_sequence"])
+    latest_line = (
+        f"本轮可参考的新消息截止到 msg_id={latest_msg_id}。"
+        if latest_msg_id is not None else "本轮没有新的群消息要求；这是承诺式履约。"
+    )
+    mode_rule = (
+        "这是 committed 承诺式后续：你之前已经承诺稍后补充。请履约；如果查不到，简短说明查不到什么。"
+        if kind == "committed"
+        else "这是 thread 讨论式后续：只有当前上下文仍在同一话题、且你能补充新信息时才回复；否则调用 stay_silent。"
+    )
+    return (
+        "这是系统触发的 proactive_followup，不是新的 @。不要 @ 群成员。\n"
+        f"{mode_rule}\n"
+        f"后续进度：第 {seq}/{max_seq} 条 follow-up。\n"
+        f"原始 intent：{job['intent']}\n"
+        f"安排原因：{job['reason'] or '(未写)'}\n"
+        f"{latest_line}\n"
+        "如果需要再补一条，只有在本次回复正文里明确承诺后续时，才调用 schedule_followup。"
+    )
+
+
+def _process_followup(
+    conn: sqlite3.Connection,
+    llm: LLMClient,
+    replier: "Replier",
+    job: sqlite3.Row | dict[str, object],
+    log_path: Path,
+    llm_log_path: Path | None,
+    vision: VisionLLM | None = None,
+    bot_wxid: str | None = None,
+) -> None:
+    job_id = int(job["job_id"])
+    fresh = conn.execute(
+        "SELECT * FROM agent_proactive_outbox WHERE job_id=?",
+        (job_id,),
+    ).fetchone()
+    if fresh is None or fresh["status"] != "running":
+        status = fresh["status"] if fresh is not None else "missing"
+        _terminal_print(f"\nfollowup={job_id} skipped status={status}")
+        return
+    job = fresh
+    group_id = str(job["group_id"])
+    row = _followup_row(job)
+    started = time.time()
+    append_event(
+        "continuation.start",
+        job_id=job_id,
+        group_id=group_id,
+        group_name=job["group_name"],
+        kind=job["kind"],
+        sequence=job["sequence"],
+        max_sequence=job["max_sequence"],
+    )
+    _terminal_print(
+        f"\nfollowup={job_id} group={job['group_name'] or group_id} "
+        f"kind={job['kind']} seq={job['sequence']}/{job['max_sequence']}"
+    )
+    _terminal_print(f"  intent: {_clip_one_line(str(job['intent']), 180)}")
+
+    latest_msg_id = latest_non_bot_message_after(
+        conn,
+        group_id=group_id,
+        after_msg_id=job["anchor_msg_id"],
+        bot_wxid=bot_wxid,
+        bot_name=settings.bot_name,
+    )
+    if job["kind"] == "thread" and latest_msg_id is None:
+        complete_followup(
+            conn,
+            job_id,
+            status="cancelled",
+            result="thread follow-up cancelled: no new non-bot message",
+        )
+        _terminal_print("  followup: cancelled no-new-message")
+        return
+
+    if latest_msg_id is not None:
+        conn.execute(
+            "UPDATE agent_proactive_outbox SET latest_msg_id=?, updated_at=? WHERE job_id=?",
+            (latest_msg_id, time.time(), job_id),
+        )
+
+    ctx = CommandContext(
+        conn=conn,
+        llm=llm,
+        model=settings.llm_model,
+        bot_name=settings.bot_name,
+        group_id=group_id,
+        group_name=job["group_name"],
+        requester=None,
+        candidate_limit=settings.dispatcher_candidate_limit,
+        candidate_limit_chat=settings.dispatcher_context_chat,
+        llm_log_path=llm_log_path,
+        vision=vision,
+        vision_model=settings.vision_model,
+        vision_max_images=settings.vision_max_images,
+        vision_max_tokens=settings.vision_max_tokens,
+        trigger_msg_id=latest_msg_id or job["source_trigger_msg_id"] or job["anchor_msg_id"],
+        trigger_t=int(time.time()),
+        bot_wxid=bot_wxid,
+        continuation_token=str(job["continuation_token"]),
+        continuation_job_id=job_id,
+        continuation_sequence=int(job["sequence"]),
+        continuation_max_sequence=int(job["max_sequence"]),
+    )
+    try:
+        outcome = get_agent_backend().chat(
+            ctx=ctx,
+            user_question=_followup_user_question(job, latest_msg_id),
+            trigger_kind="proactive_followup",
+        )
+    except Exception as e:
+        logger.exception("continuation agent crashed on job_id={}", job_id)
+        complete_followup(conn, job_id, status="failed", result=f"agent-crash: {e}")
+        _terminal_print(f"  agent: failed error={type(e).__name__}: {e}")
+        return
+
+    reply = outcome.reply_text
+    duration_ms = round((time.time() - started) * 1000, 3)
+    _terminal_print(
+        f"  agent: followup {'silent' if reply is None else str(len(reply)) + ' chars'} "
+        f"dur={duration_ms/1000:.1f}s"
+    )
+    _print_agent_activity_terminal(
+        group_id=group_id,
+        started_at=started,
+        ended_at=started + duration_ms / 1000,
+        trace_block=outcome.trace_block,
+    )
+
+    reply_had_text = bool(reply and reply.strip())
+    sent = False
+    if reply_had_text:
+        _terminal_print(f"  reply: {_clip_one_line(reply, 180)}")
+        sent = _send_with_events(
+            replier,
+            row,
+            requester=None,
+            text=reply,
+            reply_kind="agent:proactive_followup",
+            terminal=True,
+        )
+        if sent:
+            _mark_bot_spoke(group_id)
+
+    append_log(
+        log_path,
+        int(time.time()),
+        "\n".join([
+            f"agent[proactive_followup] job_id={job_id}",
+            reply or "(silent)",
+            outcome.trace_block,
+        ]),
+    )
+    _settle_continuation_after_reply(
+        conn,
+        outcome=outcome,
+        source_trigger_msg_id=ctx.trigger_msg_id,
+        source_trigger_kind="proactive_followup",
+        group_name=job["group_name"],
+        source_job_id=job_id,
+        sent=sent,
+        reply_had_text=reply_had_text,
+    )
+    if sent and reply_had_text:
+        complete_followup(conn, job_id, status="sent", result=f"sent {len(reply)} chars")
+    elif reply_had_text:
+        complete_followup(conn, job_id, status="failed", result="reply send failed")
+    else:
+        complete_followup(conn, job_id, status="cancelled", result="agent stayed silent")
 
 
 @dataclass
@@ -2344,6 +2629,7 @@ class _GlobalScheduler:
         treats `submitted == 0` for an entire batch as "pool saturated" and
         sleeps."""
         row_dict = dict(row)
+        row_dict["_work_type"] = "message"
         msg_id = int(row_dict["msg_id"])
         group_key = self._group_key(row_dict)
         with self._lock:
@@ -2369,6 +2655,43 @@ class _GlobalScheduler:
             self._executor.submit(self._handle, group_key, next_row)
         return True
 
+    def submit_followup(self, job: sqlite3.Row) -> bool:
+        job_id = int(job["job_id"])
+        group_key = f"group:{job['group_id']}"
+        with self._lock:
+            if self._closed:
+                return False
+
+        with get_conn() as conn:
+            claimed = claim_followup(conn, job_id)
+            if claimed is None:
+                return False
+            work = dict(claimed)
+            work["_work_type"] = "followup"
+            append_event(
+                "continuation.claim",
+                job_id=job_id,
+                group_id=work["group_id"],
+                group_name=work["group_name"],
+                kind=work["kind"],
+                sequence=work["sequence"],
+                max_sequence=work["max_sequence"],
+            )
+
+        next_row: dict[str, object] | None = None
+        with self._lock:
+            if self._closed:
+                self._finalize_abandoned_followup(job_id)
+                return False
+            queue_for_group = self._group_queues.setdefault(group_key, deque())
+            queue_for_group.append(work)
+            if group_key not in self._active_group_ids:
+                self._active_group_ids.add(group_key)
+                next_row = queue_for_group.popleft()
+        if next_row is not None:
+            self._executor.submit(self._handle, group_key, next_row)
+        return True
+
     @staticmethod
     def _group_key(row: dict[str, object]) -> str:
         group_id = row.get("group_id")
@@ -2384,6 +2707,19 @@ class _GlobalScheduler:
                 _finalize(conn, msg_id, "error", "scheduler closed after claim")
         except Exception:
             logger.exception("failed to finalize abandoned claimed msg_id={}", msg_id)
+
+    @staticmethod
+    def _finalize_abandoned_followup(job_id: int) -> None:
+        try:
+            with get_conn() as conn:
+                complete_followup(
+                    conn,
+                    job_id,
+                    status="failed",
+                    result="scheduler closed after claim",
+                )
+        except Exception:
+            logger.exception("failed to finalize abandoned followup job_id={}", job_id)
 
     def close(self) -> None:
         with self._lock:
@@ -2407,27 +2743,49 @@ class _GlobalScheduler:
             self._executor.submit(self._handle, group_key, next_row)
 
     def _handle(self, group_key: str, row: dict[str, object]) -> None:
-        msg_id = int(row["msg_id"])
+        work_type = row.get("_work_type") or "message"
+        msg_id = int(row["msg_id"]) if "msg_id" in row else -int(row["job_id"])
         try:
             try:
                 with get_conn() as conn:
-                    _process(
-                        conn,
-                        self._llm(),
-                        self._replier,
-                        row,
-                        self._log_path,
-                        self._llm_log_path,
-                        vision=self._vision(),
-                        bot_wxid=self._bot_wxid_getter(),
-                    )
+                    if work_type == "followup":
+                        _process_followup(
+                            conn,
+                            self._llm(),
+                            self._replier,
+                            row,
+                            self._log_path,
+                            self._llm_log_path,
+                            vision=self._vision(),
+                            bot_wxid=self._bot_wxid_getter(),
+                        )
+                    else:
+                        _process(
+                            conn,
+                            self._llm(),
+                            self._replier,
+                            row,
+                            self._log_path,
+                            self._llm_log_path,
+                            vision=self._vision(),
+                            bot_wxid=self._bot_wxid_getter(),
+                        )
             except Exception as e:
-                logger.exception("dispatcher crashed on msg_id={}", msg_id)
-                try:
-                    with get_conn() as conn:
-                        _finalize(conn, msg_id, "error", f"crashed: {e}")
-                except Exception:
-                    logger.exception("failed to finalize crashed msg_id={}", msg_id)
+                if work_type == "followup":
+                    job_id = int(row["job_id"])
+                    logger.exception("dispatcher crashed on followup job_id={}", job_id)
+                    try:
+                        with get_conn() as conn:
+                            complete_followup(conn, job_id, status="failed", result=f"crashed: {e}")
+                    except Exception:
+                        logger.exception("failed to finalize crashed followup job_id={}", job_id)
+                else:
+                    logger.exception("dispatcher crashed on msg_id={}", msg_id)
+                    try:
+                        with get_conn() as conn:
+                            _finalize(conn, msg_id, "error", f"crashed: {e}")
+                    except Exception:
+                        logger.exception("failed to finalize crashed msg_id={}", msg_id)
         finally:
             self._complete_one(group_key)
 
@@ -2626,6 +2984,13 @@ def run_dispatcher() -> None:
                 for row in rows:
                     if scheduler.submit(row):
                         submitted += 1
+                due_jobs = due_followups(conn, limit=max(1, worker_threads))
+                submitted_followups = 0
+                for job in due_jobs:
+                    if scheduler.submit_followup(job):
+                        submitted_followups += 1
+                if submitted_followups:
+                    logger.info("continuation scheduler submitted {} job(s)", submitted_followups)
                 # Lazy retry of bot_wxid discovery so reply-to-bot starts working
                 # automatically once WeFlow SSE echoes the first bot reply back.
                 # Cheap (one indexed query) but only if we don't have a value yet.
@@ -2655,7 +3020,7 @@ def run_dispatcher() -> None:
                             submitted_lurks += 1
                     if submitted_lurks:
                         logger.info("lurk scheduler submitted {} group(s)", submitted_lurks)
-                if not rows or submitted == 0:
+                if (not rows or submitted == 0) and submitted_followups == 0:
                     time.sleep(interval)
         except KeyboardInterrupt:
             logger.info("dispatcher stopped by user")

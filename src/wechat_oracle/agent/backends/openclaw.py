@@ -20,6 +20,8 @@ from ...config import settings
 from ...db import transaction
 from ...llm import OpenClawChatCompletions
 from ...log_utils import dump_llm_call
+from ..backend import AgentChatOutcome
+from ..continuation import new_continuation_token
 from ..media_paths import openclaw_quoted_hint, resolve_quoted_msg_meta
 from ..memory import insert_run_log
 from ..orchestrator import (
@@ -45,16 +47,18 @@ class OpenClawBackend:
         user_question: str,
         trigger_kind: str,
         reflection_enabled: bool | None = None,
-    ) -> tuple[str | None, str]:
+    ) -> AgentChatOutcome:
         if not settings.openclaw_token:
             raise RuntimeError("WO_OPENCLAW_TOKEN is empty; set it before using WO_AGENT_BACKEND=openclaw")
 
         started_at = time.time()
+        continuation_token = ctx.continuation_token or new_continuation_token()
         system_prompt, user_msg = _build_messages(
             ctx=ctx,
             user_question=user_question,
             trigger_kind=trigger_kind,
             reflection_enabled=reflection_enabled,
+            continuation_token=continuation_token,
         )
         client = OpenClawChatCompletions(
             gateway_url=settings.openclaw_gateway_url,
@@ -91,7 +95,7 @@ class OpenClawBackend:
 
         try:
             with transaction(ctx.conn):
-                insert_run_log(
+                run_id = insert_run_log(
                     ctx.conn,
                     group_id=ctx.group_id,
                     trigger_msg_id=ctx.trigger_msg_id,
@@ -104,6 +108,7 @@ class OpenClawBackend:
                 )
         except Exception:
             logger.exception("openclaw: failed to write agent_run_log; reply still returned")
+            run_id = None
 
         if ctx.llm_log_path:
             dump_llm_call(
@@ -115,7 +120,12 @@ class OpenClawBackend:
                 parsed={"phase_a_trace": phase_a_trace, "usage": resp.usage},
             )
 
-        return reply_text, _format_trace_for_log(phase_a_trace, [])
+        return AgentChatOutcome(
+            reply_text=reply_text,
+            trace_block=_format_trace_for_log(phase_a_trace, []),
+            run_id=run_id,
+            continuation_token=continuation_token,
+        )
 
 
 def _build_messages(
@@ -124,6 +134,7 @@ def _build_messages(
     user_question: str,
     trigger_kind: str,
     reflection_enabled: bool | None,
+    continuation_token: str,
 ) -> tuple[str, str]:
     recent_rows = _fetch_recent_for_agent(
         ctx.conn, ctx.group_id, settings.agent_recent_context_chat
@@ -197,6 +208,19 @@ def _build_messages(
     else:
         local_contract = ""
 
+    if trigger_kind in {"mention", "reply", "probability", "proactive_followup"}:
+        continuation_contract = f"""
+- If you explicitly promise a later supplement, or want one more continuation
+  only if the current topic keeps moving, call the MCP tool schedule_followup.
+  Use this continuation_token exactly: {continuation_token}
+  Use kind='committed' only when your visible reply promises to come back even
+  if nobody speaks. Use kind='thread' only when the follow-up should happen
+  if the group continues discussing the same topic. Do not use follow-ups to
+  defer simple questions you can answer now.
+"""
+    else:
+        continuation_contract = ""
+
     openclaw_contract = f"""
 
 ---
@@ -225,6 +249,7 @@ OpenClaw runtime contract:
   returns a textual reading/OCR summary.
 - {prompts.READ_IMAGE_OCR_FALLBACK}
 - To stay silent, return an empty assistant message.
+{continuation_contract}
 {local_contract}
 """
     return persona_prompt + openclaw_contract, user_msg

@@ -24,6 +24,12 @@ from typing import Any, Callable, Iterator
 
 from mcp.server.fastmcp import FastMCP, Image
 
+from .agent.continuation import (
+    clamp_delay,
+    clamp_max_followups,
+    plan_followup,
+    progress_for_token,
+)
 from .agent.media_paths import resolve_path
 from .agent.tools import ToolError
 from .agent.tools_read import (
@@ -239,6 +245,46 @@ def read_group_memory(group_id: str) -> str:
             conn=conn, group_id=group_id, session=_write_session(group_id),
         )
         return _tool_result(tool, {})
+
+
+@_mcp.tool(
+    name="schedule_followup",
+    description=(
+        "Schedule one delayed follow-up by intent. Use only when your visible "
+        "reply explicitly promises a later supplement, or when one more reply "
+        "should happen only if the group continues the same topic. Pass the "
+        "continuation_token from the system prompt exactly."
+    ),
+)
+@_audit("kind", "delay_seconds", "intent", "reason", "max_followups")
+def schedule_followup(
+    group_id: str,
+    continuation_token: str,
+    kind: str,
+    intent: str,
+    reason: str,
+    delay_seconds: int = 0,
+    max_followups: int = 0,
+) -> str:
+    with _open_conn() as conn:
+        current_sequence, inherited_max = progress_for_token(conn, continuation_token)
+        max_sequence = clamp_max_followups(max_followups, inherited=inherited_max)
+        return plan_followup(
+            conn,
+            group_id=group_id,
+            group_name=None,
+            continuation_token=continuation_token,
+            kind=kind,
+            delay_seconds=clamp_delay(delay_seconds),
+            intent=intent,
+            reason=reason,
+            source_trigger_msg_id=None,
+            source_trigger_kind=None,
+            source_job_id=None,
+            current_sequence=current_sequence,
+            max_sequence=max_sequence,
+            anchor_msg_id=None,
+        )
 
 
 @_mcp.tool(

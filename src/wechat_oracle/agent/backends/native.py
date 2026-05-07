@@ -29,7 +29,7 @@ class NativeBackend:
         user_question: str,
         trigger_kind: str,
         reflection_enabled: bool | None = None,
-    ) -> tuple[str | None, str]:
+    ) -> "AgentChatOutcome":
         from ..orchestrator import chat_via_agent
         return chat_via_agent(
             ctx=ctx,

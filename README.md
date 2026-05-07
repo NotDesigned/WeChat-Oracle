@@ -98,6 +98,10 @@ WO_REPLY_MENTION_POLICY=explicit
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
 WO_AGENT_PROACTIVE_MODE=reactive
+WO_AGENT_CONTINUATION_ENABLED=True
+WO_AGENT_CONTINUATION_MAX_FOLLOWUPS=2
+WO_AGENT_CONTINUATION_DELAY_SECONDS=90
+WO_AGENT_CONTINUATION_TTL_SECONDS=600
 WO_AGENT_RECENT_CONTEXT_CHAT=100
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
@@ -313,6 +317,13 @@ Direct mention and reply-to-bot triggers run the agent directly. The bot sends a
 - `reactive`: the default. A probability wakeup may join the current topic only when it has useful context.
 - `proactive`: a probability wakeup may also ask one short context-based question, connect an old thread, or start a light related topic when the timing is appropriate.
 
+Continuation follow-ups are separate from probability. When `WO_AGENT_CONTINUATION_ENABLED=True`, the agent may call `schedule_followup` while replying. The system stores only an intent and reruns the agent later with fresh context:
+
+- `committed`: the bot explicitly promised to come back, so the follow-up can run even if nobody speaks meanwhile.
+- `thread`: the bot may continue only if new non-bot messages keep the same topic moving; otherwise the job is cancelled.
+
+Follow-ups use the same per-group dispatcher queue and serialized wx4py sender as normal replies. They respect `WO_AGENT_CONTINUATION_MAX_FOLLOWUPS`, `WO_AGENT_CONTINUATION_DELAY_SECONDS`, `WO_AGENT_CONTINUATION_TTL_SECONDS`, and `WO_REPLY_MENTION_POLICY`.
+
 The native agent has two phases:
 
 - Phase A reads recent context, may call read-only tools, and returns either a chat reply or `stay_silent`.
@@ -428,6 +439,7 @@ Key tables:
 | `group_memory` | Per-group freeform long-term memory document. |
 | `agent_run_log` | Agent audit traces for chat, lurk, and Local Ask turns. |
 | `agent_lurk_state` | Lurk cursor, separate from audit logs. |
+| `agent_proactive_outbox` | Delayed proactive continuation jobs. Stores intent, not pre-generated reply text. |
 
 All write paths for imported messages go through `ingest/writer.py:write_messages()` and rely on `UNIQUE(dedupe_key)` for cross-source deduplication.
 
@@ -471,6 +483,10 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_VISION_MAX_TOKENS` | `800` | Vision output cap. |
 | `WO_AGENT_BASE_PROBABILITY` | `0.25` | Per-message probability wake threshold for eligible ambient messages. |
 | `WO_AGENT_PROACTIVE_MODE` | `reactive` | `off` disables ambient probability wakeups; `reactive` only joins the current topic; `proactive` may ask a short context-based question or start a light related topic. |
+| `WO_AGENT_CONTINUATION_ENABLED` | `True` | Allows the agent to explicitly schedule delayed follow-ups by intent. |
+| `WO_AGENT_CONTINUATION_MAX_FOLLOWUPS` | `2` | Max follow-up messages after the source reply. |
+| `WO_AGENT_CONTINUATION_DELAY_SECONDS` | `90` | Default delay before reevaluating a scheduled follow-up. |
+| `WO_AGENT_CONTINUATION_TTL_SECONDS` | `600` | Expiry window for pending follow-ups. |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | Per-group probability cooldown. |
 | `WO_AGENT_MAX_STEPS` | `8` | Native Phase A max rounds. |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B max rounds. |

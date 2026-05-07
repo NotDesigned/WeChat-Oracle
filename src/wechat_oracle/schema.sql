@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS group_memory (
 -- Trace columns are JSON arrays of step dicts:
 -- `[{step:int, kind:'tool_call'|'final', tool?, args?, result?, content?}, ...]`.
 -- `reply_text` is NULL when the agent chose stay_silent. `trigger_kind` is one
--- of 'mention' / 'reply' / 'probability' / 'lurk' / 'local_ask' / 'local_task'.
+-- of 'mention' / 'reply' / 'probability' / 'proactive_followup' / 'lurk' /
+-- 'local_ask' / 'local_task'.
 CREATE TABLE IF NOT EXISTS agent_run_log (
     run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id        TEXT NOT NULL,
@@ -129,11 +130,42 @@ CREATE TABLE IF NOT EXISTS agent_lurk_state (
     updated_at     REAL
 );
 
--- ----- Legacy memory tables (member_notes / group_notes) — superseded by
--- group_memory above. Kept as inert CREATE IF NOT EXISTS so old installs don't
--- error on init_db; new installs that follow the current code path get them
--- empty and unused. To clean up an old DB:
---   DROP TABLE member_notes; DROP TABLE group_notes;
+-- Delayed proactive continuations. Agent turns may schedule a follow-up by
+-- intent, but no message is pre-generated: dispatcher reruns the agent when
+-- the row becomes due. `planned` rows are created during the source agent run;
+-- they become `pending` only after the source reply is successfully sent.
+CREATE TABLE IF NOT EXISTS agent_proactive_outbox (
+    job_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id               TEXT NOT NULL,
+    group_name             TEXT,
+    kind                   TEXT NOT NULL CHECK(kind IN ('committed', 'thread')),
+    status                 TEXT NOT NULL CHECK(status IN ('planned', 'pending', 'running', 'sent', 'cancelled', 'expired', 'failed')),
+    continuation_token     TEXT NOT NULL,
+    source_run_id          INTEGER REFERENCES agent_run_log(run_id) ON DELETE SET NULL,
+    source_trigger_msg_id  INTEGER,
+    source_trigger_kind    TEXT,
+    source_job_id          INTEGER REFERENCES agent_proactive_outbox(job_id) ON DELETE SET NULL,
+    sequence               INTEGER NOT NULL DEFAULT 1,
+    max_sequence           INTEGER NOT NULL DEFAULT 1,
+    intent                 TEXT NOT NULL,
+    reason                 TEXT NOT NULL DEFAULT '',
+    delay_seconds          INTEGER NOT NULL DEFAULT 90,
+    scheduled_at           REAL NOT NULL,
+    expires_at             REAL NOT NULL,
+    anchor_msg_id          INTEGER,
+    latest_msg_id          INTEGER,
+    created_at             REAL NOT NULL,
+    updated_at             REAL NOT NULL,
+    result                 TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_agent_outbox_due
+    ON agent_proactive_outbox(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_agent_outbox_group_status
+    ON agent_proactive_outbox(group_id, status);
+CREATE INDEX IF NOT EXISTS idx_agent_outbox_token
+    ON agent_proactive_outbox(continuation_token);
+
+-- Legacy memory tables kept as inert compatibility tables for old installs.
 CREATE TABLE IF NOT EXISTS member_notes (
     group_id     TEXT NOT NULL,
     sender_wxid  TEXT NOT NULL,

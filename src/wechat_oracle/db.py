@@ -64,6 +64,47 @@ def _migrate(conn: sqlite3.Connection) -> None:
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_proactive_outbox (
+            job_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id               TEXT NOT NULL,
+            group_name             TEXT,
+            kind                   TEXT NOT NULL CHECK(kind IN ('committed', 'thread')),
+            status                 TEXT NOT NULL CHECK(status IN ('planned', 'pending', 'running', 'sent', 'cancelled', 'expired', 'failed')),
+            continuation_token     TEXT NOT NULL,
+            source_run_id          INTEGER,
+            source_trigger_msg_id  INTEGER,
+            source_trigger_kind    TEXT,
+            source_job_id          INTEGER,
+            sequence               INTEGER NOT NULL DEFAULT 1,
+            max_sequence           INTEGER NOT NULL DEFAULT 1,
+            intent                 TEXT NOT NULL,
+            reason                 TEXT NOT NULL DEFAULT '',
+            delay_seconds          INTEGER NOT NULL DEFAULT 90,
+            scheduled_at           REAL NOT NULL,
+            expires_at             REAL NOT NULL,
+            anchor_msg_id          INTEGER,
+            latest_msg_id          INTEGER,
+            created_at             REAL NOT NULL,
+            updated_at             REAL NOT NULL,
+            result                 TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_outbox_due "
+        "ON agent_proactive_outbox(status, scheduled_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_outbox_group_status "
+        "ON agent_proactive_outbox(group_id, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_outbox_token "
+        "ON agent_proactive_outbox(continuation_token)"
+    )
+
 
 @contextmanager
 def get_conn(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:

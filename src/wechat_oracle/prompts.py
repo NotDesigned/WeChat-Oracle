@@ -211,6 +211,10 @@ PHASE_A_OPS_RULES = (
     "\n"
     "不知道该不该说话就调 stay_silent。群友的对话不必每条都接。\n"
     "\n"
+    "如果你在正文里明确承诺“等下补 / 我再查完回来 / 稍后继续”，必须同时调用 schedule_followup。"
+    " committed 表示即使没人继续说话也要履约；thread 表示只有群里继续讨论同一话题才补。"
+    " 不要用 follow-up 拖延简单问题，能当场答就当场答。follow-up 只保存 intent，到期会重新读上下文再决定。\n"
+    "\n"
     + READ_IMAGE_OCR_FALLBACK
 )
 

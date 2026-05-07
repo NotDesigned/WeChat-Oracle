@@ -98,6 +98,10 @@ WO_REPLY_MENTION_POLICY=explicit
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
 WO_AGENT_PROACTIVE_MODE=reactive
+WO_AGENT_CONTINUATION_ENABLED=True
+WO_AGENT_CONTINUATION_MAX_FOLLOWUPS=2
+WO_AGENT_CONTINUATION_DELAY_SECONDS=90
+WO_AGENT_CONTINUATION_TTL_SECONDS=600
 WO_AGENT_RECENT_CONTEXT_CHAT=100
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
@@ -313,6 +317,13 @@ dispatcher 会分类每条新的 live 消息：
 - `reactive`：默认值。概率唤醒后只在有信息量时接当前话题。
 - `proactive`：概率唤醒后，也可以在时机合适时问一个基于上下文的短问题、牵一条旧线，或发起一个轻量相关话题。
 
+Continuation follow-up 与 probability 分开。`WO_AGENT_CONTINUATION_ENABLED=True` 时，agent 可以在回复时调用 `schedule_followup`：系统只保存 intent，到期后重新读取最新上下文再决定是否发。
+
+- `committed`：bot 在正文中明确承诺稍后补充，即使没人继续说话也可以履约。
+- `thread`：只有群友继续推进同一话题时才补；否则取消。
+
+follow-up 仍走按群串行的 dispatcher 队列和串行 wx4py sender，并受 `WO_AGENT_CONTINUATION_MAX_FOLLOWUPS`、`WO_AGENT_CONTINUATION_DELAY_SECONDS`、`WO_AGENT_CONTINUATION_TTL_SECONDS` 和 `WO_REPLY_MENTION_POLICY` 控制。
+
 native agent 分两阶段：
 
 - Phase A 读取最近上下文，可调用只读工具，最后返回群聊回复或 `stay_silent`。
@@ -428,6 +439,7 @@ transcript 状态：
 | `group_memory` | 每群自由文本长期记忆文档。 |
 | `agent_run_log` | chat、lurk 和 Local Ask 的 agent 审计轨迹。 |
 | `agent_lurk_state` | lurk 游标，独立于审计日志。 |
+| `agent_proactive_outbox` | 延迟 proactive continuation 任务；只存 intent，不存预生成回复文本。 |
 
 所有导入消息的写入路径都走 `ingest/writer.py:write_messages()`，并依赖 `UNIQUE(dedupe_key)` 做跨源去重。
 
@@ -471,6 +483,10 @@ transcript 状态：
 | `WO_VISION_MAX_TOKENS` | `800` | Vision 输出上限。 |
 | `WO_AGENT_BASE_PROBABILITY` | `0.25` | eligible 普通消息的逐条概率唤醒阈值。 |
 | `WO_AGENT_PROACTIVE_MODE` | `reactive` | `off` 关闭普通群聊概率唤醒；`reactive` 只接当前话题；`proactive` 可问一个基于上下文的短问题或发起轻量相关话题。 |
+| `WO_AGENT_CONTINUATION_ENABLED` | `True` | 允许 agent 显式安排延迟 follow-up。 |
+| `WO_AGENT_CONTINUATION_MAX_FOLLOWUPS` | `2` | 源回复之后最多自动补充几条。 |
+| `WO_AGENT_CONTINUATION_DELAY_SECONDS` | `90` | 重新评估 follow-up 的默认延迟。 |
+| `WO_AGENT_CONTINUATION_TTL_SECONDS` | `600` | pending follow-up 的过期时间。 |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | 每群 probability cooldown。 |
 | `WO_AGENT_MAX_STEPS` | `8` | Native Phase A 最大轮数。 |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B 最大轮数。 |

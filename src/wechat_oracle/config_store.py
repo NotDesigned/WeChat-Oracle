@@ -19,6 +19,10 @@ AGENT_CONFIG_KEYS = (
     "WO_AGENT_BACKEND",
     "WO_AGENT_BASE_PROBABILITY",
     "WO_AGENT_PROACTIVE_MODE",
+    "WO_AGENT_CONTINUATION_ENABLED",
+    "WO_AGENT_CONTINUATION_MAX_FOLLOWUPS",
+    "WO_AGENT_CONTINUATION_DELAY_SECONDS",
+    "WO_AGENT_CONTINUATION_TTL_SECONDS",
     "WO_REPLY_MENTION_POLICY",
     "WO_LLM_MODEL",
     "WO_OPENCLAW_AGENT_ID",
@@ -33,6 +37,10 @@ class AgentRuntimeConfig:
     openclaw_agent_id: str
     agent_base_probability: float = 0.25
     reply_mention_policy: str = "explicit"
+    continuation_enabled: bool = True
+    continuation_max_followups: int = 2
+    continuation_delay_seconds: int = 90
+    continuation_ttl_seconds: int = 600
     native_configured: bool = False
     openclaw_token_configured: bool = False
     openclaw_configured: bool = False
@@ -42,6 +50,10 @@ class AgentRuntimeConfig:
             "WO_AGENT_BACKEND": self.backend,
             "WO_AGENT_BASE_PROBABILITY": f"{self.agent_base_probability:g}",
             "WO_AGENT_PROACTIVE_MODE": self.proactive_mode,
+            "WO_AGENT_CONTINUATION_ENABLED": "true" if self.continuation_enabled else "false",
+            "WO_AGENT_CONTINUATION_MAX_FOLLOWUPS": str(self.continuation_max_followups),
+            "WO_AGENT_CONTINUATION_DELAY_SECONDS": str(self.continuation_delay_seconds),
+            "WO_AGENT_CONTINUATION_TTL_SECONDS": str(self.continuation_ttl_seconds),
             "WO_REPLY_MENTION_POLICY": self.reply_mention_policy,
             "WO_LLM_MODEL": self.llm_model,
             "WO_OPENCLAW_AGENT_ID": self.openclaw_agent_id,
@@ -57,6 +69,10 @@ def load_agent_runtime_config() -> AgentRuntimeConfig:
         openclaw_agent_id=current.openclaw_agent_id,
         agent_base_probability=current.agent_base_probability,
         reply_mention_policy=current.reply_mention_policy,
+        continuation_enabled=current.agent_continuation_enabled,
+        continuation_max_followups=current.agent_continuation_max_followups,
+        continuation_delay_seconds=current.agent_continuation_delay_seconds,
+        continuation_ttl_seconds=current.agent_continuation_ttl_seconds,
         native_configured=bool(current.llm_api_key),
         openclaw_token_configured=bool(current.openclaw_token),
         openclaw_configured=bool(current.openclaw_token and current.openclaw_agent_id),
@@ -80,6 +96,9 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
     openclaw_agent_id = config.openclaw_agent_id.strip()
     probability = float(config.agent_base_probability)
     mention_policy = config.reply_mention_policy.strip().lower()
+    continuation_max = int(config.continuation_max_followups)
+    continuation_delay = int(config.continuation_delay_seconds)
+    continuation_ttl = int(config.continuation_ttl_seconds)
     if backend not in {"native", "openclaw"}:
         raise ValueError("后端只能是 native 或 openclaw")
     if not 0.0 <= probability <= 1.0:
@@ -88,6 +107,12 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
         raise ValueError("主动模式只能是 off、reactive 或 proactive")
     if mention_policy not in {"always", "explicit", "never"}:
         raise ValueError("@ 策略只能是 always、explicit 或 never")
+    if continuation_max < 0:
+        raise ValueError("continuation max_followups must be >= 0")
+    if continuation_delay < 5:
+        raise ValueError("continuation delay must be >= 5 seconds")
+    if continuation_ttl < continuation_delay:
+        raise ValueError("continuation TTL must be >= delay")
     if not llm_model:
         raise ValueError("Native 模型不能为空")
     if not openclaw_agent_id:
@@ -96,6 +121,10 @@ def _validated_updates(config: AgentRuntimeConfig) -> dict[str, str]:
         "WO_AGENT_BACKEND": backend,
         "WO_AGENT_BASE_PROBABILITY": f"{probability:g}",
         "WO_AGENT_PROACTIVE_MODE": proactive_mode,
+        "WO_AGENT_CONTINUATION_ENABLED": "true" if config.continuation_enabled else "false",
+        "WO_AGENT_CONTINUATION_MAX_FOLLOWUPS": str(continuation_max),
+        "WO_AGENT_CONTINUATION_DELAY_SECONDS": str(continuation_delay),
+        "WO_AGENT_CONTINUATION_TTL_SECONDS": str(continuation_ttl),
         "WO_REPLY_MENTION_POLICY": mention_policy,
         "WO_LLM_MODEL": llm_model,
         "WO_OPENCLAW_AGENT_ID": openclaw_agent_id,

@@ -19,12 +19,28 @@ reflection uses the same subscription-backed route as chat.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from ..config import settings
 
 if TYPE_CHECKING:
     from ..dispatcher import CommandContext
+
+
+@dataclass(frozen=True)
+class AgentChatOutcome:
+    """Result of one chat-trigger agent turn.
+
+    `continuation_token` links any `schedule_followup` tool calls made during
+    the turn to the source reply. Dispatcher arms those planned jobs only after
+    the reply is actually sent.
+    """
+
+    reply_text: str | None
+    trace_block: str
+    run_id: int | None = None
+    continuation_token: str | None = None
 
 
 class AgentBackend(Protocol):
@@ -37,10 +53,8 @@ class AgentBackend(Protocol):
         user_question: str,
         trigger_kind: str,
         reflection_enabled: bool | None = None,
-    ) -> tuple[str | None, str]:
-        """Run one chat-trigger turn. Returns (reply_text_or_None, trace_block).
-        Same return shape as `orchestrator.chat_via_agent` so call sites are
-        identical regardless of backend."""
+    ) -> AgentChatOutcome:
+        """Run one chat-trigger turn."""
         ...
 
 
