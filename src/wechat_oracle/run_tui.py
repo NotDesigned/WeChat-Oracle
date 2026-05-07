@@ -201,9 +201,6 @@ class MemoryEditorScreen(ModalScreen[MemoryEditResult | None]):
 
     def action_save(self) -> None:
         self._store_current_text()
-        if self._continuation_ttl_seconds < self._continuation_delay_seconds:
-            self.query_one("#config-editor-help", Static).update("Continuation TTL must be >= delay")
-            return
         self.dismiss(
             MemoryEditResult(
                 group_memory=self._texts["group_memory"],
@@ -696,6 +693,9 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             return
         if self._backend == "openclaw" and not self._config.openclaw_token_configured:
             self.query_one("#config-editor-help", Static).update("OpenClaw 缺少 WO_OPENCLAW_TOKEN，不能切换")
+            return
+        if self._continuation_ttl_seconds < self._continuation_delay_seconds:
+            self.query_one("#config-editor-help", Static).update("Continuation TTL must be >= delay")
             return
         self.dismiss(
             AgentRuntimeConfig(
