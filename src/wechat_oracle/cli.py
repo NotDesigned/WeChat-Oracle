@@ -396,7 +396,10 @@ def _looks_like_model_call_log(text: str) -> bool:
 
 def _dashboard_log_line(source: str, text: str) -> str:
     stamp = datetime.now().strftime("%H:%M:%S")
-    return f"{stamp} {_dashboard_source_label(source)} │ {_compact_child_log(text)}"
+    compact = _compact_child_log(source, text)
+    if compact is None:
+        return ""
+    return f"{stamp} {_dashboard_source_label(source)} │ {compact}"
 
 
 class _DashboardLogFormatter:
@@ -413,20 +416,26 @@ class _DashboardLogFormatter:
         self._pending_lines: list[str] = []
 
     def feed(self, text: str) -> list[str]:
+        if not text.strip():
+            return []
         if self._source != "dispatcher":
-            return [_dashboard_log_line(self._source, text)]
-        if text.startswith("msg="):
+            line = _dashboard_log_line(self._source, text)
+            return [line] if line else []
+        if text.startswith("msg=") or text.startswith("followup="):
             out = self.flush()
             self._pending_stamp = datetime.now().strftime("%H:%M:%S")
             self._pending_lines = [text]
             return out
-        if self._pending_lines and text.startswith("  "):
+        if self._pending_lines and (text.startswith("  ") or text.startswith("    ")):
             self._pending_lines.append(text)
-            if text.strip().startswith("send:"):
+            stripped = text.strip()
+            if stripped.startswith("send:") or stripped.startswith("followup:"):
                 return self.flush()
             return []
         out = self.flush()
-        out.append(_dashboard_log_line(self._source, text))
+        line = _dashboard_log_line(self._source, text)
+        if line:
+            out.append(line)
         return out
 
     def flush(self) -> list[str]:
@@ -445,6 +454,9 @@ class _DashboardLogFormatter:
 _EVENT_START_RE = re.compile(
     r"^msg=(?P<msg_id>\d+)\s+group=(?P<group>.*?)\s+from=(?P<sender>.*?)\s+type=(?P<msg_type>\S+)"
 )
+_FOLLOWUP_START_RE = re.compile(
+    r"^followup=(?P<job_id>\d+)\s+(?:group=(?P<group>.*?)\s+)?(?:kind=(?P<kind>\w+)\s+seq=(?P<seq>\S+)|skipped status=(?P<status>\S+))"
+)
 
 
 def _dashboard_event_card(source: str, stamp: str, lines: list[str]) -> str:
@@ -455,35 +467,60 @@ def _dashboard_event_card(source: str, stamp: str, lines: list[str]) -> str:
     match = _EVENT_START_RE.match(start)
     if match:
         header = (
-            f"msg {match.group('msg_id')} · {match.group('group')} · "
-            f"{match.group('sender')} · {match.group('msg_type')}"
+            f"msg {match.group('msg_id')}  {match.group('group')}  "
+            f"{match.group('sender')}  [{match.group('msg_type')}]"
         )
+    elif follow := _FOLLOWUP_START_RE.match(start):
+        if follow.group("status"):
+            header = f"follow-up {follow.group('job_id')} skipped: {follow.group('status')}"
+        else:
+            header = (
+                f"follow-up {follow.group('job_id')}  {follow.group('group') or '?'}  "
+                f"{follow.group('kind')}  {follow.group('seq')}"
+            )
     else:
         header = start
-    body: list[str] = [prefix + f"╭─ {header}"]
-    closing = cont + "╰─"
+    body: list[str] = [prefix + f"┌─ {header}"]
+    closing = cont + "└─"
     for raw in lines[1:]:
         line = raw.strip()
         if line.startswith("trigger:"):
-            body.append(cont + "│ " + line.replace("trigger:", "trigger", 1))
+            body.append(cont + "│ trigger " + line.removeprefix("trigger:").strip())
         elif line.startswith("text:"):
-            body.append(cont + "│ text   " + _clip_dashboard_payload(line.removeprefix("text:").strip(), 220))
+            body.extend(_dashboard_wrap_field(cont, "text", line.removeprefix("text:").strip(), 96))
         elif line.startswith("agent:"):
-            body.append(cont + "│ agent  " + line.removeprefix("agent:").strip())
+            body.append(cont + "│ agent   " + line.removeprefix("agent:").strip())
         elif line.startswith("openclaw:"):
-            body.append(cont + "│ llm    " + line.removeprefix("openclaw:").strip())
+            body.append(cont + "│ llm     " + line.removeprefix("openclaw:").strip())
         elif line.startswith("tools:"):
-            body.append(cont + "│ tools  " + _clip_dashboard_payload(line.removeprefix("tools:").strip(), 220))
+            body.extend(_dashboard_wrap_field(cont, "tools", line.removeprefix("tools:").strip(), 120))
         elif line.startswith("memory:"):
-            body.append(cont + "│ memory " + _clip_dashboard_payload(line.removeprefix("memory:").strip(), 220))
+            body.extend(_dashboard_wrap_field(cont, "memory", line.removeprefix("memory:").strip(), 120))
+        elif line.startswith("intent:"):
+            body.extend(_dashboard_wrap_field(cont, "intent", line.removeprefix("intent:").strip(), 96))
         elif line.startswith("reply:"):
-            body.append(cont + "│ reply  " + _clip_dashboard_payload(line.removeprefix("reply:").strip(), 260))
+            body.extend(_dashboard_wrap_field(cont, "reply", line.removeprefix("reply:").strip(), 120))
         elif line.startswith("send:"):
-            closing = cont + "╰─ send   " + line.removeprefix("send:").strip()
+            closing = cont + "└─ send    " + line.removeprefix("send:").strip()
+        elif line.startswith("followup:"):
+            closing = cont + "└─ " + line
         else:
-            body.append(cont + "│ " + _clip_dashboard_payload(line, 220))
+            body.extend(_dashboard_wrap_field(cont, "", line, 120))
     body.append(closing)
     return "\n".join(body)
+
+
+def _dashboard_wrap_field(cont: str, label: str, text: str, limit: int) -> list[str]:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return [cont + f"│ {label:<7s} {text}"]
+    out = [cont + f"│ {label:<7s} {text[:limit]}…"]
+    remaining = text[limit:]
+    while remaining:
+        chunk = remaining[:limit]
+        remaining = remaining[limit:]
+        out.append(cont + f"│ {'':<7s} {chunk}{'…' if remaining else ''}")
+    return out
 
 
 def _clip_dashboard_payload(text: str, limit: int) -> str:
@@ -498,12 +535,16 @@ _LOGURU_LINE_RE = re.compile(
 )
 
 
-def _compact_child_log(text: str) -> str:
+def _compact_child_log(source: str, text: str) -> str | None:
+    if text.startswith("2026-") and " | DEBUG" in text:
+        return None
     match = _LOGURU_LINE_RE.match(text)
     if not match:
-        return text
+        return _compact_plain_child_log(source, text)
     level = match.group("level")
-    body = _shorten_loguru_body(match.group("body"))
+    body = _shorten_loguru_body(source, match.group("body"))
+    if body is None:
+        return None
     return f"{level:<7s} │ {body}"
 
 
@@ -512,13 +553,76 @@ _LOGURU_BODY_RE = re.compile(
 )
 
 
-def _shorten_loguru_body(body: str) -> str:
+def _shorten_loguru_body(source: str, body: str) -> str | None:
     match = _LOGURU_BODY_RE.match(body)
     if not match:
         return body
     module = match.group("module").replace("wechat_oracle.", "")
     module = module.removeprefix("ingest.")
-    return f"{module}.{match.group('func')}:{match.group('line')}  {match.group('msg')}"
+    msg = match.group("msg")
+    short = _compact_known_message(source, module, match.group("func"), msg)
+    if short is None:
+        return None
+    return short or f"{module}.{match.group('func')}  {msg}"
+
+
+def _compact_plain_child_log(source: str, text: str) -> str | None:
+    if " - " in text and ("wechat_oracle." in text or "wx4py." in text):
+        _, _, body = text.partition(" - ")
+        return _compact_known_message(source, "", "", body) or body
+    return _clip_dashboard_payload(text, 180)
+
+
+def _compact_known_message(source: str, module: str, func: str, msg: str) -> str | None:
+    if source == "live":
+        m = re.search(r"wrote (?P<attempt>\d+) messages \((?P<new>\d+) new, (?P<dup>\d+) duplicates skipped\)(?:; \+(?P<fwd>\d+) forwarded items)?", msg)
+        if m:
+            fwd = f", +{m.group('fwd')} forward" if m.group("fwd") else ""
+            return f"DB write  +{m.group('new')} new, {m.group('dup')} dup{fwd}"
+        m = re.search(r"(?P<group>.+?): \+(?P<n>\d+) new", msg)
+        if m:
+            return f"new message  {m.group('group')}  +{m.group('n')}"
+        m = re.search(r"watching: (?P<group>.+?) \((?P<id>[^)]+)\) - (?P<n>\d+) members loaded", msg)
+        if m:
+            return f"watching  {m.group('group')}  {m.group('n')} members"
+        if "SSE: connecting" in msg:
+            return "SSE connecting"
+        if "WO_GROUPS is empty" in msg:
+            return "watching all WeFlow group sessions"
+        if "mm worker thread started" in msg:
+            return "media worker started"
+        if msg.startswith("mm worker:"):
+            return msg.replace("mm worker:", "media worker")
+        if "loading RapidOCR" in msg:
+            return "OCR model loading"
+        if "run_ocr" in msg or "run_asr" in msg:
+            return _clip_dashboard_payload(msg, 160)
+    if source == "dispatcher":
+        if msg.startswith("dispatcher:"):
+            return _clip_dashboard_payload("dispatcher ready  " + _summarize_dispatcher_ready(msg), 180)
+        if "bot_wxid resolved:" in msg:
+            return msg.replace("bot_wxid resolved:", "bot wxid").replace(" (auto-discovered from messages)", "")
+        if msg.startswith("continuation scheduler submitted"):
+            return msg.replace("continuation scheduler", "continuation")
+        if msg.startswith("lurk scheduler submitted"):
+            return msg.replace("lurk scheduler", "lurk")
+    if source == "mm":
+        if msg.startswith("mm worker:"):
+            return msg.replace("mm worker:", "media worker")
+        if "loading RapidOCR" in msg:
+            return "OCR model loading"
+        if "run_ocr" in msg or "run_asr" in msg:
+            return _clip_dashboard_payload(msg, 160)
+    return ""
+
+
+def _summarize_dispatcher_ready(msg: str) -> str:
+    keep: list[str] = []
+    for key in ("bot=", "model=", "agent_backend=", "workers=", "interval=", "replier="):
+        m = re.search(rf"{key}([^ ]+)", msg)
+        if m:
+            keep.append(f"{key}{m.group(1)}")
+    return " ".join(keep) or msg
 
 
 def _dashboard_source_label(source: str) -> str:
