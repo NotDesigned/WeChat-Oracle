@@ -1131,7 +1131,7 @@ class RunDashboard(App[None]):
         self._log_buffer = log_buffer
         self._agent_config_provider = agent_config_provider or load_agent_runtime_config
         self._agent_config_save = agent_config_save
-        self._rendered_log_count = 0
+        self._last_rendered_log_entry: str | None = None
         self._selected_group: LocalAskGroup | None = None
         self._allow_writes = False
         self._ask_running = False
@@ -1140,7 +1140,7 @@ class RunDashboard(App[None]):
         yield Header(show_clock=True)
         with Vertical():
             yield Static("", id="status")
-            yield RichLog(id="logs", wrap=True, highlight=False, markup=False)
+            yield RichLog(id="logs", max_lines=1000, wrap=True, highlight=False, markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1294,12 +1294,22 @@ class RunDashboard(App[None]):
         except NoMatches:
             return
         lines = list(self._log_buffer)
-        if self._rendered_log_count > len(lines):
+        if not lines:
             log.clear()
-            self._rendered_log_count = 0
-        for line in lines[self._rendered_log_count:]:
+            self._last_rendered_log_entry = None
+            return
+        start = 0
+        if self._last_rendered_log_entry is not None:
+            # Match the exact deque entry, not its text; duplicate log lines are common.
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i] is self._last_rendered_log_entry:
+                    start = i + 1
+                    break
+            else:
+                log.clear()
+        for line in lines[start:]:
             log.write(line)
-        self._rendered_log_count = len(lines)
+        self._last_rendered_log_entry = lines[-1]
 
     def _append_local(self, text: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
