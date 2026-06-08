@@ -926,10 +926,10 @@ def init_db_cmd() -> None:
 
 @ingest_app.command("backfill")
 def ingest_backfill(
-    path: Path = typer.Argument(..., exists=True, readable=True, dir_okay=False),
+    path: Path = typer.Argument(..., exists=True, readable=True, dir_okay=True),
     fmt: str = typer.Option("jsonl", "--format", "-f", help="weflow | jsonl"),
 ) -> None:
-    """Import a historical export file into the messages table."""
+    """Import historical export file(s) into the messages table."""
     init_db()
     settings.ensure_dirs()
     msgs = import_file(path, fmt, settings.data_dir)

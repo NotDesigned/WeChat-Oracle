@@ -110,7 +110,9 @@ def _api_msg_to_normalized(
                 if media_ref and raw.get("mediaLocalPath") else raw.get("content")
             )
     elif msg_type is MsgType.FORWARD:
-        forwarded_items = parse_record_xml(raw.get("rawContent"))
+        forwarded_items = parse_record_xml(
+            raw.get("rawContent"), group_id=group_id, data_dir=settings.data_dir,
+        )
         content_text = "[聊天记录]"
     elif msg_type is MsgType.QUOTE:
         parsed = parse_quote_reply_xml(raw.get("rawContent"))

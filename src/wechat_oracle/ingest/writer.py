@@ -35,8 +35,8 @@ INSERT OR IGNORE INTO messages (
 
 INSERT_FWD_SQL = """
 INSERT OR IGNORE INTO forwarded_records (
-    parent_msg_id, seq, sender_display, t, datatype, content, src_msg_id
-) VALUES (?, ?, ?, ?, ?, ?, ?)
+    parent_msg_id, seq, sender_display, t, datatype, content, src_msg_id, media_path
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -88,11 +88,34 @@ def _write_forwarded_for_batch(
         for it in m.forwarded_items:
             fwd_rows.append((
                 pid, it.seq, it.sender_display, it.t,
-                it.datatype, it.content, it.src_msg_id,
+                it.datatype, it.content, it.src_msg_id, it.media_path,
             ))
     if not fwd_rows:
         return 0
     cur = conn.executemany(INSERT_FWD_SQL, fwd_rows)
+    conn.execute(
+        """
+        UPDATE forwarded_records
+           SET media_path = (
+               SELECT m.media_path
+                 FROM messages m
+                WHERE m.wx_msg_id = forwarded_records.src_msg_id
+                  AND m.type = 'image'
+                  AND m.media_path IS NOT NULL
+                ORDER BY m.msg_id DESC
+                LIMIT 1
+           )
+         WHERE media_path IS NULL
+           AND datatype = 2
+           AND src_msg_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM messages m
+                WHERE m.wx_msg_id = forwarded_records.src_msg_id
+                  AND m.type = 'image'
+                  AND m.media_path IS NOT NULL
+           )
+        """
+    )
     return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 

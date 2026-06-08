@@ -42,8 +42,9 @@ sender wxid + `:\n`):
       <fromusername>...forwarder wxid...</fromusername>
     </msg>
 
-Non-text dataitems (image/video/file/link/nested-forward) get a placeholder
-string in `content`; we don't try to download media or recurse.
+Non-text dataitems keep the WeChat-style placeholder. Link/file cards also
+preserve title + URL when WeFlow exposes them in the record XML; media bytes
+are still not downloaded and nested forwards are not recursively expanded.
 """
 
 from __future__ import annotations
@@ -51,8 +52,10 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
 
-from ..models import ForwardedItem
+from ..models import ForwardedItem, MsgType
+from .media_store import materialize_media_ref
 
 # (appmsg.type << 32) | localType=49.  appmsg.type=19 = RecordMsg (合并转发).
 FORWARD_LOCAL_TYPE = (19 << 32) | 49        # 81604378673
@@ -108,12 +111,81 @@ def _extract_dataitem_timestamp(item: ET.Element) -> int | None:
     return None
 
 
+def _first_child_text(item: ET.Element, names: tuple[str, ...]) -> str:
+    for name in names:
+        value = item.findtext(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+def _format_forwarded_non_text(item: ET.Element, datatype: int) -> str:
+    placeholder = _PLACEHOLDER.get(datatype, "[其他]")
+    title = _first_child_text(
+        item,
+        ("datatitle", "sourcetitle", "datadesc", "filename", "title"),
+    )
+    url = _first_child_text(item, ("dataurl", "url", "link", "cdnurl"))
+    if not title and not url:
+        return placeholder
+    parts = [placeholder]
+    if title:
+        parts.append(title)
+    head = " ".join(parts)
+    return f"{head}\n{url}" if url else head
+
+
 # Strip the leading "wxid_xxx:\n" / "<chatroom>@chatroom_xxx:\n" that WeChat
 # prepends to group-message rawContent before the actual XML body.
 _GROUP_PREFIX = re.compile(r"^[^<\n]+:\s*\n(?=<\?xml|<msg)", re.DOTALL)
 
 
-def parse_record_xml(raw_content: str | None) -> list[ForwardedItem]:
+_MEDIA_REF_FIELDS = (
+    "fullpath",
+    "datapath",
+    "thumbpath",
+    "cdnthumbpath",
+    "cdnthumburl",
+    "cdndataurl",
+    "cdnrawurl",
+)
+
+
+def _materialize_forwarded_media(
+    item: ET.Element,
+    datatype: int,
+    *,
+    group_id: str | None,
+    data_dir: Path | None,
+    source_root: Path | None,
+) -> str | None:
+    if group_id is None or data_dir is None:
+        return None
+    msg_type = {
+        2: MsgType.IMAGE,
+        3: MsgType.VOICE,
+        4: MsgType.VIDEO,
+        8: MsgType.STICKER,
+    }.get(datatype)
+    if msg_type is None:
+        return None
+    for field in _MEDIA_REF_FIELDS:
+        ref = _first_child_text(item, (field,))
+        path = materialize_media_ref(
+            ref, msg_type, group_id, data_dir, source_root=source_root,
+        )
+        if path:
+            return path
+    return None
+
+
+def parse_record_xml(
+    raw_content: str | None,
+    *,
+    group_id: str | None = None,
+    data_dir: Path | None = None,
+    source_root: Path | None = None,
+) -> list[ForwardedItem]:
     """Parse `<recordinfo>` from a forwarded-records appmsg.
 
     Returns [] if the XML is missing/malformed or there's no `<recorditem>`.
@@ -154,8 +226,13 @@ def parse_record_xml(raw_content: str | None) -> list[ForwardedItem]:
 
         if datatype == 1:
             content = (item.findtext("datadesc") or "").strip() or None
+            media_path = None
         else:
-            content = _PLACEHOLDER.get(datatype, "[其他]")
+            content = _format_forwarded_non_text(item, datatype)
+            media_path = _materialize_forwarded_media(
+                item, datatype,
+                group_id=group_id, data_dir=data_dir, source_root=source_root,
+            )
 
         if content is None:
             # text item with no datadesc — skip; nothing useful to index
@@ -168,6 +245,7 @@ def parse_record_xml(raw_content: str | None) -> list[ForwardedItem]:
             datatype=datatype,
             content=content,
             src_msg_id=src_msg_id,
+            media_path=media_path,
         ))
     return items
 

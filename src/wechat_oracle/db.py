@@ -52,6 +52,31 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # back-pointer too — see schema.sql comment)
     if not _has_column("persona_drift", "last_run_id"):
         conn.execute("ALTER TABLE persona_drift ADD COLUMN last_run_id INTEGER")
+    if not _has_column("forwarded_records", "media_path"):
+        conn.execute("ALTER TABLE forwarded_records ADD COLUMN media_path TEXT")
+    conn.execute(
+        """
+        UPDATE forwarded_records
+           SET media_path = (
+               SELECT m.media_path
+                 FROM messages m
+                WHERE m.wx_msg_id = forwarded_records.src_msg_id
+                  AND m.type = 'image'
+                  AND m.media_path IS NOT NULL
+                ORDER BY m.msg_id DESC
+                LIMIT 1
+           )
+         WHERE media_path IS NULL
+           AND datatype = 2
+           AND src_msg_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM messages m
+                WHERE m.wx_msg_id = forwarded_records.src_msg_id
+                  AND m.type = 'image'
+                  AND m.media_path IS NOT NULL
+           )
+        """
+    )
 
     conn.execute(
         """

@@ -48,8 +48,9 @@ class ForwardedItem:
     `t` is `<srcMsgCreateTime>` of the original message in its source group, so
     forwarded items can be older than the parent message they're packaged in.
     `datatype` is the WeChat dataitem type: 1=text (we keep `content`), other
-    values get a placeholder string. Nested forwards (datatype=17) are NOT
-    recursed — placeholder only.
+    values get a placeholder string. `media_path` is used when a non-text
+    child's media bytes are available locally (most commonly datatype=2 image).
+    Nested forwards (datatype=17) are NOT recursed — placeholder only.
     """
     seq: int
     sender_display: str | None
@@ -57,6 +58,7 @@ class ForwardedItem:
     datatype: int
     content: str | None
     src_msg_id: str | None
+    media_path: str | None = None
 
 
 class Message(BaseModel):

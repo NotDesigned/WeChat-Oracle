@@ -61,9 +61,10 @@ backfill 每次读取一个 WeFlow JSON session 导出文件。Backfill 行使�
 | `seq` | 子项在包内的序号。 |
 | `sender_display` | 原作者显示名，来自 `<sourcename>`。没有可逆 wxid。 |
 | `t` | 子项原始消息时间，不是 wrapper 到达当前群的时间。 |
-| `datatype` | WeChat dataitem type。`1` 是文本，其他值转成占位符。 |
-| `content` | 文本子项内容，或 `[图片]`、`[语音]`、`[文件]` 之类占位符。 |
+| `datatype` | WeChat dataitem type。`1` 是文本；非文本值保留类型占位符。 |
+| `content` | 文本子项内容，或 `[图片]`、`[语音]`、`[文件]` 之类占位符；链接/文件卡片在 WeFlow 暴露时会保留标题和 URL。 |
 | `src_msg_id` | 原始 source message id；目前仅作信息字段。 |
+| `media_path` | 子媒体可用时的 data-dir 相对路径；来源可以是 record XML 里的本地文件，也可以是 `src_msg_id` 匹配到的已归档媒体消息。 |
 
 ## 类型归一
 
@@ -136,7 +137,7 @@ mm worker 处理满足这些条件的行：`type IN ('image', 'voice')`、`media
 | `sender_display` | 从 `/api/v1/group-members` 解析；回退到 `senderUsername`。 | 使用导出字段 `senderDisplayName`。 |
 | `media_path` | 使用 `mediaLocalPath` 或 `mediaUrl`；只有本地文件能复制。 | 解析 JSON 文件旁边导出的相对媒体路径。 |
 | quote body | 解析 appmsg subtype `57` 的 `rawContent` XML。 | 优先解析同一份 `rawContent` XML，缺失时回退到 `quotedContent` 和 `replyToMessageId` 等导出字段。 |
-| forward children | 解析 `rawContent` record XML。 | 解析 `rawContent` record XML。 |
+| forward children | 解析 `rawContent` record XML；WeFlow 暴露本地路径时复制子媒体，也会在 `src_msg_id` 匹配到已归档源消息时补齐媒体路径。 | 解析 `rawContent` record XML；导出暴露本地路径时复制子媒体，也会在 `src_msg_id` 匹配到已归档源消息时补齐媒体路径。 |
 
 消费者不能假设两个来源的原始字段形状完全一致。dispatcher 和 agent renderer 会在 LLM 输出边界统一可见形状。
 
@@ -193,7 +194,9 @@ agent 可以用工具扩展视野：
 | `get_message_context` | 读取某个 `messages.msg_id` 前后的消息。 |
 | `view_quoted_chain` | 沿引用回复链上溯。 |
 | `expand_forward_bundle` | 展开一个合并转发 wrapper。 |
+| `read_url` | 抓取链接/卡片消息里的公开 HTTP(S) URL，并在可访问时返回文章正文。 |
 | `read_image` | 把一张图片发送给已配置的视觉模型，返回文字化读图结果。 |
+| `read_forward_child_image` | 按 `parent_msg_id` + 子项 `seq` 读取合并转发里的图片；优先用 `forwarded_records.media_path`，否则用 `src_msg_id` 在本地归档里找源图。 |
 | `load_image` | 仅 OpenClaw MCP：返回原始图片 bytes 作为 MCP image block，让 agent 直接看像素。 |
 | `read_voice` | 返回或即时计算一条语音消息的 ASR 文本。 |
 | `read_group_memory` | 读取当前长期群记忆文档。 |

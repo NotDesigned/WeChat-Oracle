@@ -15,6 +15,7 @@ openclaw mode because tool use happens out-of-process from the dispatcher.
 from __future__ import annotations
 
 import functools
+import inspect
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -35,7 +36,9 @@ from .agent.tools import ToolError
 from .agent.tools_read import (
     ExpandForwardBundleTool,
     GetMessageContextTool,
+    ReadForwardChildImageTool,
     ReadImageTool,
+    ReadUrlTool,
     ReadVoiceTool,
     SearchGroupMessagesTool,
     ViewQuotedChainTool,
@@ -110,11 +113,13 @@ def _audit(*audit_args_keys: str) -> Callable[[Callable[..., str]], Callable[...
 
     def decorator(fn: Callable[..., str]) -> Callable[..., str]:
         tool_name = fn.__name__
+        params = list(inspect.signature(fn).parameters)
+        first_param_is_group_id = bool(params and params[0] == "group_id")
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> str:
             group_id = kwargs.get("group_id")
-            if group_id is None and args:
+            if group_id is None and args and first_param_is_group_id:
                 group_id = args[0]
             audit_args = {k: kwargs[k] for k in audit_args_keys if k in kwargs}
             started = time.time()
@@ -228,6 +233,20 @@ def get_message_context(
             tool,
             {"msg_id": msg_id, "before": before, "after": after, "mode": mode},
         )
+
+
+@_mcp.tool(
+    name="read_url",
+    description=(
+        "Fetch a public http(s) URL, including WeChat public-account article "
+        "links when accessible, and return extracted readable text."
+    ),
+)
+@_audit("url")
+def read_url(url: str, max_chars: int = 12000) -> str:
+    """Fetch and extract readable text from a public URL."""
+    tool = ReadUrlTool()
+    return _tool_result(tool, {"url": url, "max_chars": max_chars})
 
 
 @_mcp.tool(
@@ -382,6 +401,41 @@ def read_image(group_id: str, msg_id: int, prompt: str | None = None) -> str:
             vision_max_tokens=settings.vision_max_tokens,
         )
         args: dict[str, Any] = {"msg_id": msg_id}
+        if prompt:
+            args["prompt"] = prompt
+        return _tool_result(tool, args)
+
+
+@_mcp.tool(
+    name="read_forward_child_image",
+    description=(
+        "Read one image child inside a merged-forward wrapper. First call "
+        "expand_forward_bundle, then pass the wrapper msg_id as parent_msg_id "
+        "and the displayed child index as seq."
+    ),
+)
+@_audit("parent_msg_id", "seq")
+def read_forward_child_image(
+    group_id: str,
+    parent_msg_id: int,
+    seq: int,
+    prompt: str | None = None,
+) -> str:
+    """Return a textual vision-model reading of one forwarded child image."""
+    vision = build_vision_client(
+        provider=settings.vision_provider,
+        api_key=settings.vision_api_key,
+        endpoint=settings.vision_endpoint,
+    )
+    with _open_conn() as conn:
+        tool = ReadForwardChildImageTool(
+            conn=conn,
+            group_id=group_id,
+            vision=vision,
+            vision_model=settings.vision_model,
+            vision_max_tokens=settings.vision_max_tokens,
+        )
+        args: dict[str, Any] = {"parent_msg_id": parent_msg_id, "seq": seq}
         if prompt:
             args["prompt"] = prompt
         return _tool_result(tool, args)

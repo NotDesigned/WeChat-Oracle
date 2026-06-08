@@ -30,6 +30,7 @@ from ..message_render import format_time, one_line, render_message_line
 from .media_paths import resolve_media_path_for_msg
 from .memory import get_group_memory
 from .tools import Tool, ToolError, ToolSpec, truncate_for_llm
+from .url_reader import read_public_url
 
 
 def _fmt_t(t: int | None) -> str:
@@ -593,7 +594,7 @@ class ExpandForwardBundleTool(Tool):
 
         children = self.conn.execute(
             """
-            SELECT id, seq, sender_display, t, datatype, content
+            SELECT id, seq, sender_display, t, datatype, content, src_msg_id, media_path
               FROM forwarded_records
              WHERE parent_msg_id=?
              ORDER BY seq
@@ -611,6 +612,11 @@ class ExpandForwardBundleTool(Tool):
         for c in children:
             sender = c["sender_display"] or "?"
             body = (c["content"] or "").replace("\n", " ").strip() or f"[datatype={c['datatype']}]"
+            if int(c["datatype"]) == 2:
+                body += (
+                    f" (call read_forward_child_image(parent_msg_id={msg_id}, "
+                    f"seq={c['seq']}) to inspect)"
+                )
             lines.append(f"  [{c['seq']}] {_fmt_t(c['t'])} {sender}: {body}")
         return truncate_for_llm("\n".join(lines))
 
@@ -642,6 +648,50 @@ class ReadGroupMemoryTool(Tool):
         if not text:
             return "(empty — nothing learned about this group yet)"
         return text  # NOT truncated: the agent owns this data, gets it whole
+
+
+# --- read_url --------------------------------------------------------------
+
+
+_READ_URL_SPEC = ToolSpec(
+    name="read_url",
+    description=(
+        "Fetch a public http(s) URL, including WeChat public-account article "
+        "links when accessible, and return extracted readable text. Use this "
+        "after a link/card message exposes a URL in context or search results."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Absolute http(s) URL to read.",
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": "Maximum characters returned to the model. Defaults to 12000, capped at 20000.",
+                "minimum": 1000,
+                "maximum": 20000,
+            },
+        },
+        "required": ["url"],
+    },
+)
+
+
+@dataclass
+class ReadUrlTool(Tool):
+    spec = _READ_URL_SPEC
+
+    def call(self, args: dict[str, Any]) -> str:
+        url = args.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ToolError("url must be a non-empty string")
+        max_chars = args.get("max_chars", 12000)
+        if not isinstance(max_chars, int):
+            max_chars = 12000
+        max_chars = max(1000, min(max_chars, 20000))
+        return read_public_url(url.strip(), max_chars=max_chars)
 
 
 # --- read_image ------------------------------------------------------------
@@ -732,6 +782,131 @@ class ReadImageTool(Tool):
         return truncate_for_llm((reply or "").strip() or "(vision model returned empty)")
 
 
+_READ_FORWARD_CHILD_IMAGE_SPEC = ToolSpec(
+    name="read_forward_child_image",
+    description=(
+        "Read one image child inside a merged-forward wrapper. Use this when "
+        "expand_forward_bundle shows child rows like `[0] ...: [图片]`; pass the "
+        "forward wrapper's msg_id as parent_msg_id and the child index as seq. "
+        "Do not call read_image on the forward wrapper itself."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "parent_msg_id": {
+                "type": "integer",
+                "description": "msg_id of the merged-forward wrapper in this group.",
+            },
+            "seq": {
+                "type": "integer",
+                "description": "Child index shown by expand_forward_bundle, starting at 0.",
+                "minimum": 0,
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Optional steering for the vision model.",
+            },
+        },
+        "required": ["parent_msg_id", "seq"],
+    },
+)
+
+
+@dataclass
+class ReadForwardChildImageTool(Tool):
+    spec = _READ_FORWARD_CHILD_IMAGE_SPEC
+    conn: sqlite3.Connection
+    group_id: str
+    vision: VisionLLM | None
+    vision_model: str
+    vision_max_tokens: int | None
+
+    def call(self, args: dict[str, Any]) -> str:
+        if self.vision is None:
+            raise ToolError(
+                "vision model not configured (WO_VISION_API_KEY empty); "
+                "cannot read forwarded child images directly"
+            )
+        parent_msg_id = args.get("parent_msg_id")
+        seq = args.get("seq")
+        if not isinstance(parent_msg_id, int):
+            raise ToolError("parent_msg_id must be an integer")
+        if not isinstance(seq, int) or seq < 0:
+            raise ToolError("seq must be a non-negative integer")
+        prompt = args.get("prompt")
+        if prompt is not None and not isinstance(prompt, str):
+            raise ToolError("prompt must be a string")
+
+        child = self.conn.execute(
+            """
+            SELECT f.datatype, f.src_msg_id, f.content, f.media_path
+              FROM forwarded_records f
+              JOIN messages parent ON parent.msg_id = f.parent_msg_id
+             WHERE f.parent_msg_id=? AND f.seq=? AND parent.group_id=?
+            """,
+            (parent_msg_id, seq, self.group_id),
+        ).fetchone()
+        if child is None:
+            raise ToolError(
+                f"forward child parent_msg_id={parent_msg_id} seq={seq} "
+                "not found in this group"
+            )
+        if int(child["datatype"]) != 2:
+            raise ToolError(
+                f"forward child parent_msg_id={parent_msg_id} seq={seq} "
+                f"is datatype={child['datatype']}, not image"
+            )
+        path = None
+        if child["media_path"]:
+            from .media_paths import resolve_path
+            candidate = resolve_path(child["media_path"])
+            if candidate.exists():
+                path = candidate
+        if path is None:
+            src_msg_id = (child["src_msg_id"] or "").strip()
+            if not src_msg_id:
+                raise ToolError(
+                    f"forward child parent_msg_id={parent_msg_id} seq={seq} "
+                    "has no media_path or source image id"
+                )
+            row = self.conn.execute(
+                """
+                SELECT msg_id, media_path
+                  FROM messages
+                 WHERE wx_msg_id=? AND type='image' AND media_path IS NOT NULL
+                 ORDER BY msg_id DESC
+                 LIMIT 1
+                """,
+                (src_msg_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError(
+                    f"source image for forward child parent_msg_id={parent_msg_id} "
+                    f"seq={seq} is not available in the local archive"
+                )
+            path = resolve_media_path_for_msg(
+                self.conn, int(row["msg_id"]), expected_type="image"
+            )
+            if path is None:
+                raise ToolError(
+                    f"source image msg_id {row['msg_id']} has no usable image file on disk"
+                )
+
+        user_prompt = (prompt or "").strip() or prompts.READ_IMAGE_USER_DEFAULT
+        try:
+            reply = self.vision.complete_with_images(
+                model=self.vision_model,
+                system=prompts.READ_IMAGE_SYSTEM,
+                user=user_prompt,
+                images=[path.read_bytes()],
+                temperature=0.2,
+                max_tokens=self.vision_max_tokens,
+            )
+        except Exception as e:
+            raise ToolError(f"vision call failed: {e}")
+        return truncate_for_llm((reply or "").strip() or "(vision model returned empty)")
+
+
 # --- read_voice ------------------------------------------------------------
 
 
@@ -806,7 +981,13 @@ def register_phase_a_tools(
     tools.register(ViewQuotedChainTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ExpandForwardBundleTool(conn=tools.conn, group_id=tools.group_id))
     tools.register(ReadGroupMemoryTool(conn=tools.conn, group_id=tools.group_id))
+    tools.register(ReadUrlTool())
     tools.register(ReadImageTool(
+        conn=tools.conn, group_id=tools.group_id,
+        vision=vision, vision_model=vision_model,
+        vision_max_tokens=vision_max_tokens,
+    ))
+    tools.register(ReadForwardChildImageTool(
         conn=tools.conn, group_id=tools.group_id,
         vision=vision, vision_model=vision_model,
         vision_max_tokens=vision_max_tokens,

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS forwarded_records (
     datatype        INTEGER NOT NULL,    -- 1=text; others get placeholder content
     content         TEXT,                -- html-unescaped datadesc, or "[图片]" etc.
     src_msg_id      TEXT,                -- fromnewmsgid (informational; not joined)
+    media_path      TEXT,                -- data_dir-relative media path for child media when available
     UNIQUE(parent_msg_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_fwd_records_parent ON forwarded_records(parent_msg_id);

@@ -37,6 +37,14 @@ from .media_store import (
 )
 
 
+def _weflow_json_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    text_dir = path / "texts"
+    source_dir = text_dir if text_dir.is_dir() else path
+    return sorted(source_dir.glob("*.json"))
+
+
 def read_normalized_jsonl(path: Path, data_dir: Path) -> Iterator[Message]:
     """One Message JSON object per line, already in our canonical schema.
 
@@ -144,7 +152,12 @@ def _convert_weflow_message(
         return None
 
     forwarded_items = (
-        parse_record_xml(raw.get("rawContent"))
+        parse_record_xml(
+            raw.get("rawContent"),
+            group_id=group_id,
+            data_dir=data_dir,
+            source_root=source_root,
+        )
         if msg_type is MsgType.FORWARD else []
     )
     if msg_type is MsgType.FORWARD and not content_text:
@@ -176,27 +189,32 @@ def read_weflow(path: Path, data_dir: Path) -> Iterator[Message]:
     Media files are written next to the JSON; `content` is the relative path for media-type
     messages. Referenced media is copied into `<data_dir>/media/<group_id>/...`.
     """
-    data = json.loads(path.read_text(encoding="utf-8"))
-    session = data.get("session", {}) or {}
-    group_id = str(session.get("wxid") or path.stem)
-    group_name = session.get("displayName") or session.get("nickname") or session.get("remark")
-    source_root = path.parent
+    files = _weflow_json_files(path)
+    if not files:
+        raise ValueError(f"no WeFlow JSON files found under {path}")
 
-    skipped = 0
-    missing = 0
-    missing_tags = set(_MEDIA_MISSING_TAGS.values())
-    for raw in data.get("messages", []) or []:
-        msg = _convert_weflow_message(raw, group_id, group_name, source_root, data_dir)
-        if msg is None:
-            skipped += 1
-            continue
-        if msg.content_text in missing_tags:
-            missing += 1
-        yield msg
-    if skipped:
-        logger.info("skipped {} messages with unmapped type in {}", skipped, path.name)
-    if missing:
-        logger.warning("{} media files missing on disk in {}", missing, path.name)
+    for file in files:
+        data = json.loads(file.read_text(encoding="utf-8"))
+        session = data.get("session", {}) or {}
+        group_id = str(session.get("wxid") or file.stem)
+        group_name = session.get("displayName") or session.get("nickname") or session.get("remark")
+        source_root = file.parent
+
+        skipped = 0
+        missing = 0
+        missing_tags = set(_MEDIA_MISSING_TAGS.values())
+        for raw in data.get("messages", []) or []:
+            msg = _convert_weflow_message(raw, group_id, group_name, source_root, data_dir)
+            if msg is None:
+                skipped += 1
+                continue
+            if msg.content_text in missing_tags:
+                missing += 1
+            yield msg
+        if skipped:
+            logger.info("skipped {} messages with unmapped type in {}", skipped, file.name)
+        if missing:
+            logger.warning("{} media files missing on disk in {}", missing, file.name)
 
 
 FORMATS: dict[str, Callable[[Path, Path], Iterator[Message]]] = {

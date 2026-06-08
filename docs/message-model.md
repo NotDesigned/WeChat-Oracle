@@ -61,9 +61,10 @@ Merged-forward wrappers are stored in `messages` as `type='forward'`; their flat
 | `seq` | Child ordinal inside the bundle. |
 | `sender_display` | Original author display name from `<sourcename>`. No reversible wxid is available. |
 | `t` | Original child message time, not the time the wrapper arrived. |
-| `datatype` | WeChat dataitem type. `1` is text; other values become placeholders. |
-| `content` | Text child content or a placeholder such as `[图片]`, `[语音]`, `[文件]`. |
+| `datatype` | WeChat dataitem type. `1` is text; non-text values keep typed placeholders. |
+| `content` | Text child content or a placeholder such as `[图片]`, `[语音]`, `[文件]`; link/file cards preserve title and URL when WeFlow exposes them. |
 | `src_msg_id` | Original source message id when present; informational only. |
+| `media_path` | Data-dir-relative path for child media when the record XML exposes a local file, or when `src_msg_id` matches an archived media message. |
 
 ## Type Normalization
 
@@ -136,7 +137,7 @@ The goal is a shared downstream contract, but the two sources expose different f
 | `sender_display` | Resolved from `/api/v1/group-members`; falls back to `senderUsername`. | Uses export field `senderDisplayName`. |
 | `media_path` | Uses `mediaLocalPath` or `mediaUrl`; only local files can be copied. | Resolves exported relative media paths next to the JSON file. |
 | quote body | Parses `rawContent` XML for appmsg subtype `57`. | Parses the same `rawContent` XML when available, falling back to export fields such as `quotedContent` and `replyToMessageId`. |
-| forward children | Parses `rawContent` record XML. | Parses `rawContent` record XML. |
+| forward children | Parses `rawContent` record XML; child media is copied when WeFlow exposes a local path, and can be linked later by `src_msg_id` if the source message is archived. | Parses `rawContent` record XML; child media is copied when the export exposes a local path, and can be linked later by `src_msg_id` if the source message is archived. |
 
 Consumers must not assume identical raw field shapes across sources. Dispatcher and agent renderers normalize the LLM-visible shape at the output boundary.
 
@@ -193,7 +194,9 @@ The agent can extend its view with tools:
 | `get_message_context` | Read nearby messages before/after a specific `messages.msg_id`. |
 | `view_quoted_chain` | Walk quote-reply parents up to a small depth. |
 | `expand_forward_bundle` | Show children of a merged-forward wrapper. |
+| `read_url` | Fetch a public HTTP(S) URL from a link/card message and return readable article text when accessible. |
 | `read_image` | Send one image file to the configured vision model and return a textual reading. |
+| `read_forward_child_image` | Read an image child inside a merged-forward wrapper by `parent_msg_id` + child `seq`, using `forwarded_records.media_path` or a `src_msg_id` match in the local archive. |
 | `load_image` | OpenClaw MCP only: return the original image bytes as an MCP image block so the agent can inspect pixels directly. |
 | `read_voice` | Return or compute ASR transcript for one voice message. |
 | `read_group_memory` | Read the current long-term group memory document. |

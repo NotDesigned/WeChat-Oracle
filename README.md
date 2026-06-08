@@ -55,7 +55,7 @@ By default `run` opens a Textual terminal UI: the top area stays fixed with bot 
 ## Requirements
 
 - Windows 10/11.
-- WeChat PC 4.1.x, Qt version. The wx4py reply path depends on the visible desktop UI.
+- WeChat PC 4.1.8.107, Qt version, is the recommended runtime for wx4py replies. Newer 4.1.10.x clients may break UI control.
 - [WeFlow desktop](https://github.com/hicccc77/WeFlow) with HTTP API enabled. This project does not install WeFlow for you; install and start it first, then copy the HTTP API access token into `WO_WEFLOW_TOKEN`.
 - Python 3.12+.
 - [uv](https://docs.astral.sh/uv/).
@@ -236,15 +236,16 @@ Backfill imports historical WeFlow exports into the same SQLite archive used by 
 
 ```powershell
 uv run wechat-oracle ingest backfill <export.json> --format weflow
+uv run wechat-oracle ingest backfill <weflow-export-dir> --format weflow
 ```
 
-The command imports one export file at a time. Run it once per exported session file. Re-running the same file is safe: all imported messages go through `ingest/writer.py:write_messages()`, and `UNIQUE(dedupe_key)` skips duplicates.
+The command imports one export file, or all JSON files under a WeFlow export directory's `texts/` folder. Re-running the same file or directory is safe: all imported messages go through `ingest/writer.py:write_messages()`, and `UNIQUE(dedupe_key)` skips duplicates.
 
 Supported formats:
 
 | Format | Input |
 |---|---|
-| `weflow` | WeFlow JSON export with top-level `session` and `messages` fields. |
+| `weflow` | WeFlow JSON export with top-level `session` and `messages` fields, or a WeFlow export directory containing `texts/`. |
 | `jsonl` | One canonical `Message` JSON object per line, mainly useful for pipeline tests or custom importers. |
 
 For WeFlow exports, the importer:
@@ -253,7 +254,7 @@ For WeFlow exports, the importer:
 - Derives `group_name` from `session.displayName`, `session.nickname`, or `session.remark`.
 - Converts WeFlow `localType` values into normalized message types: text, image, voice, video, sticker, link, quote, forward, and system.
 - Preserves quote replies using `reply_to_wx_msg_id` and `quote_text`.
-- Parses merged-forward messages into `forwarded_records`, so `/find`, `/sum`, and agent history tools can search inside forwarded bundles.
+- Parses merged-forward messages into `forwarded_records`, so `/find`, `/sum`, and agent history tools can search inside forwarded bundles. Forwarded child media gets its own `media_path` when WeFlow/export XML exposes a local file, or when `src_msg_id` matches an already archived media message.
 - Copies referenced local media files from the export folder into `data/media/<group_id>/<kind>/` and stores a `data/`-relative `media_path`.
 
 If a media file referenced by the export is missing, the message is still imported with a missing-media placeholder. OCR/ASR can only run for media files that exist under `data/media`.

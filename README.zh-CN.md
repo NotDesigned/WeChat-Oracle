@@ -55,7 +55,7 @@ uv run wechat-oracle run
 ## 环境要求
 
 - Windows 10/11。
-- 微信 PC 4.1.x Qt 版。wx4py 回复路径依赖可见的桌面 UI。
+- 微信 PC 4.1.8.107 Qt 版是当前推荐的 wx4py 回复运行版本；较新的 4.1.10.x 可能导致 UI 控制失效。
 - 已启用 HTTP API 的 [WeFlow 桌面端](https://github.com/hicccc77/WeFlow)。本项目不会自动安装 WeFlow；请先安装并启动 WeFlow，在设置里启用 HTTP API 服务，然后把 access token 填入 `WO_WEFLOW_TOKEN`。
 - Python 3.12+。
 - [uv](https://docs.astral.sh/uv/)。
@@ -253,7 +253,7 @@ uv run wechat-oracle ingest backfill <export.json> --format weflow
 - 从 `session.displayName`、`session.nickname` 或 `session.remark` 得到 `group_name`。
 - 把 WeFlow `localType` 转成标准消息类型：text、image、voice、video、sticker、link、quote、forward、system。
 - 用 `reply_to_wx_msg_id` 和 `quote_text` 保留引用回复关系。
-- 把合并转发消息解析到 `forwarded_records`，因此 `/find`、`/sum` 和 agent 历史工具可以搜索合并转发内部内容。
+- 把合并转发消息解析到 `forwarded_records`，因此 `/find`、`/sum` 和 agent 历史工具可以搜索合并转发内部内容。合并转发子媒体在 WeFlow/导出 XML 暴露本地文件时会写入自己的 `media_path`；如果 `src_msg_id` 匹配到已归档媒体消息，也会补齐路径。
 - 把导出目录里引用到的本地媒体复制到 `data/media/<group_id>/<kind>/`，并在 DB 中保存相对 `data/` 的 `media_path`。
 
 如果导出里引用的媒体文件缺失，消息仍会导入，但会写入一个媒体缺失占位符。OCR/ASR 只能处理已经存在于 `data/media` 下的媒体文件。
